@@ -212,6 +212,62 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// RAII pin keeping a destination `HostTexture` alive against eviction while
+/// a recorded list holds a pending `host_writes` mark for it. Dropping without
+/// [`PendingHostWrite::record`] releases the pin without marking `host_written`.
+pub(crate) struct PendingHostWrite(Arc<crate::resource::HostTexture>);
+
+impl PendingHostWrite {
+    /// The pinned host `ID3D12Resource`, guaranteed to match the pinned copy.
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        &self.0.texture
+    }
+
+    /// Transfers this pin to `list`'s deferred step so `host_written` is set on
+    /// submission and the pin is released when `list` resets or drops.
+    pub(crate) fn record(self, list: &HostList) {
+        use std::sync::atomic::Ordering::Release;
+        let guard = self;
+        list.defer_host(move || {
+            guard
+                .0
+                .pending_host_writes
+                .fetch_or(crate::resource::HOST_WRITTEN, Release);
+            guard.0.host_written.store(true, Release);
+        });
+    }
+}
+
+impl Drop for PendingHostWrite {
+    fn drop(&mut self) {
+        self.0
+            .pending_host_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Atomically acquires `resource`'s current host texture and pins it against
+/// concurrent eviction before any GPU write is recorded into it. If eviction
+/// already claimed the copy with `EVICTED`, detaches it and acquires a fresh
+/// replacement.
+pub(crate) fn prepare_host_write(resource: This) -> Option<PendingHostWrite> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    for _ in 0..16 {
+        let copy = crate::resource::host_copy(resource)?;
+        if copy
+            .pending_host_writes
+            .fetch_update(AcqRel, Acquire, |cur| {
+                (cur & crate::resource::EVICTED == 0).then_some(cur + 1)
+            })
+            .is_ok()
+        {
+            return Some(PendingHostWrite(copy));
+        }
+        crate::resource::detach_if_same(resource, &copy);
+    }
+    None
+}
+
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was. Marked when that
@@ -220,15 +276,16 @@ unsafe impl Sync for Staging {}
 /// (submissions run in the order they are made, which need not be the
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
+#[cfg(test)]
 pub(crate) fn host_writes(list: &HostList, resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+    if let Some(write) = prepare_host_write(resource) {
+        write.record(list);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
     crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -253,13 +310,14 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
+    let (Some(a), Some(to_write), Some(host)) = (
         crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+        prepare_host_write(to),
         host(),
     ) else {
         return;
     };
+    let b = to_write.resource().clone();
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -300,7 +358,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_writes(list, to);
+    to_write.record(list);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -877,5 +935,239 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(test)]
+    struct HeldCom(This);
+    #[cfg(test)]
+    impl Drop for HeldCom {
+        fn drop(&mut self) {
+            crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_title_texture(addr: u64, fill: u8) -> HeldCom {
+        const SIDE: usize = 64;
+        const BYTES: usize = SIDE * SIDE * 4;
+        // SAFETY: `pool(1)` provides a 64 KiB RW page for each 64x64 RGBA8 linear texture.
+        unsafe { std::ptr::write_bytes(addr as *mut u8, fill, BYTES) };
+        let words: [u32; 14] = [3, 0, 0, 0, SIDE as u32, 0, SIDE as u32, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut out = std::ptr::null();
+        let hr = crate::resource::create_at_address(std::ptr::null(), addr, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut out);
+        assert_eq!(hr, crate::object::S_OK);
+        HeldCom(out)
+    }
+
+    #[cfg(test)]
+    fn seed_title_texture(host: &crate::host::Host, tex: This) {
+        let seed_list = host.new_list().unwrap();
+        let host_tex = crate::resource::host_resource(tex).unwrap();
+        upload(&seed_list, tex, &host_tex);
+        seed_list.close();
+        host.execute(&[&seed_list]);
+    }
+
+    #[cfg(test)]
+    fn readback_first_texel(host: &crate::host::Host, tex: This) -> [u8; 4] {
+        let read_list = host.new_list().unwrap();
+        let tex_after = crate::resource::host_resource(tex).unwrap();
+        upload(&read_list, tex, &tex_after);
+        crate::list::ensure_state(&read_list, tex, 0x800);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live host texture; outputs for subresource 0.
+        unsafe {
+            host.device.GetCopyableFootprints(&tex_after.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+        }
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation and copy recording.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: total,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for recording only.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for recording only.
+            pResource: unsafe { std::mem::transmute_copy(&tex_after) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: open host command list and live resources in copy states.
+        unsafe {
+            read_list.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+        }
+        read_list.close();
+        host.execute(&[&read_list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: synchronous execution finished; `readback` covers all rows.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let first = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 4]>().read();
+            readback.Unmap(0, None);
+            first
+        }
+    }
+
+    /// A texture fed from title memory cannot be evicted while a recorded list
+    /// holds a pending `host_writes` mark for it; resetting/dropping an
+    /// unexecuted list releases that pin, while executing the list keeps the
+    /// copied GPU texels over stale title memory.
+    #[test]
+    fn pending_host_write_pins_texture_until_executed_and_unpins_on_reset() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let dst_mem = crate::watch::tests::pool(1);
+        let src_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let src = test_title_texture(src_mem as u64, 0xAA);
+
+        let null = std::ptr::null();
+        let (mut alloc, mut list_drop, mut list_exec) = (null, null, null);
+        let alloc_iid = crate::object::guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = crate::object::guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc), crate::object::S_OK);
+        let _alloc = HeldCom(alloc);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list_drop), crate::object::S_OK);
+        let _l_drop = HeldCom(list_drop);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list_exec), crate::object::S_OK);
+        let _l_exec = HeldCom(list_exec);
+
+        type CloseFn = extern "system" fn(This) -> crate::object::HRESULT;
+        type ResetFn = extern "system" fn(This, This, This) -> crate::object::HRESULT;
+        type CopyResourceFn = extern "system" fn(This, This, This);
+        let close_drop = crate::object::slot::<CloseFn>(list_drop, 0x48);
+        let reset_drop = crate::object::slot::<ResetFn>(list_drop, 0x50);
+        let copy_drop = crate::object::slot::<CopyResourceFn>(list_drop, 0x88);
+        let close_exec = crate::object::slot::<CloseFn>(list_exec, 0x48);
+        let reset_exec = crate::object::slot::<ResetFn>(list_exec, 0x50);
+        let copy_exec = crate::object::slot::<CopyResourceFn>(list_exec, 0x88);
+
+        seed_title_texture(host, dst.0);
+
+        copy_drop(list_drop, dst.0, src.0);
+        assert!(!crate::resource::give_up_now(dst.0), "pending CopyResource must pin dst against eviction");
+        assert_eq!(close_drop(list_drop), crate::object::S_OK);
+        assert_eq!(reset_drop(list_drop, alloc, null), crate::object::S_OK);
+        assert!(crate::resource::give_up_now(dst.0), "resetting unexecuted list must allow eviction again");
+
+        seed_title_texture(host, dst.0);
+
+        copy_exec(list_exec, dst.0, src.0);
+        assert_eq!(close_exec(list_exec), crate::object::S_OK);
+        assert!(!crate::resource::give_up_now(dst.0), "pending L1 CopyResource must block eviction before L1 runs");
+
+        let recorded = crate::list::host_list(list_exec).unwrap();
+        host.execute(&[recorded]);
+        assert_eq!(reset_exec(list_exec, alloc, null), crate::object::S_OK);
+        assert!(!crate::resource::give_up_now(dst.0), "executed host write must keep dst un-evictable after list reset");
+
+        assert_eq!(readback_first_texel(host, dst.0), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    /// Window 2: an eviction candidate snapshot taken before a list pins `dst`
+    /// must not evict `dst` in `give_up`, and the recorded copy must keep its
+    /// host texels on subsequent reads.
+    #[test]
+    fn stale_eviction_snapshot_skips_texture_pinned_after_candidates() {
+        use std::sync::atomic::Ordering::Acquire;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let dst_mem = crate::watch::tests::pool(1);
+        let src_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let src = test_title_texture(src_mem as u64, 0xAA);
+
+        let null = std::ptr::null();
+        let (mut alloc, mut list) = (null, null);
+        let alloc_iid = crate::object::guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = crate::object::guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc), crate::object::S_OK);
+        let _alloc = HeldCom(alloc);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list), crate::object::S_OK);
+        let _list = HeldCom(list);
+
+        type CloseFn = extern "system" fn(This) -> crate::object::HRESULT;
+        type ResetFn = extern "system" fn(This, This, This) -> crate::object::HRESULT;
+        type CopyResourceFn = extern "system" fn(This, This, This);
+        let close = crate::object::slot::<CloseFn>(list, 0x48);
+        let reset = crate::object::slot::<ResetFn>(list, 0x50);
+        let copy = crate::object::slot::<CopyResourceFn>(list, 0x88);
+
+        seed_title_texture(host, dst.0);
+        let snap = crate::resource::owned(dst.0).expect("unpinned texture is an eviction candidate");
+
+        // Record after `candidates()` snapshot was taken.
+        copy(list, dst.0, src.0);
+        let pinned = crate::resource::made_copy(dst.0).unwrap();
+        assert_eq!(crate::resource::give_up_snapshot(&[snap]), (0, 0));
+
+        let still = crate::resource::made_copy(dst.0).expect("stale snapshot must not evict pinned copy");
+        assert!(Arc::ptr_eq(&pinned, &still));
+        assert_eq!(still.pending_host_writes.load(Acquire) & crate::resource::EVICTED, 0);
+
+        assert_eq!(close(list), crate::object::S_OK);
+        let recorded = crate::list::host_list(list).unwrap();
+        host.execute(&[recorded]);
+        assert_eq!(reset(list, alloc, null), crate::object::S_OK);
+        assert_eq!(readback_first_texel(host, dst.0), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    /// Window 1: when `give_up` has already claimed `old` with `EVICTED`
+    /// before clearing `resource(dst).host`, `prepare_host_write` must never
+    /// return `old`; it detaches `old` and atomically acquires + pins a fresh
+    /// replacement `HostTexture`.
+    #[test]
+    fn prepare_host_write_detaches_claimed_evicted_copy_and_pins_replacement() {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        use windows::core::Interface;
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let dst_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let old = crate::resource::host_copy(dst.0).unwrap();
+
+        // Simulate `give_up` claiming `old` via CAS before clearing `resource.host`.
+        assert_eq!(
+            old.pending_host_writes.compare_exchange(0, crate::resource::EVICTED, AcqRel, Acquire),
+            Ok(0)
+        );
+
+        let guard = prepare_host_write(dst.0).expect("must detach EVICTED copy and acquire replacement");
+        assert_ne!(guard.resource().as_raw(), old.texture.as_raw());
+        let current = crate::resource::made_copy(dst.0).unwrap();
+        assert!(!Arc::ptr_eq(&current, &old));
+        assert!(!crate::resource::give_up_now(dst.0), "replacement must be pinned while guard lives");
+
+        drop(guard);
+        assert!(crate::resource::give_up_now(dst.0), "dropping unrecorded guard must unpin replacement");
     }
 }

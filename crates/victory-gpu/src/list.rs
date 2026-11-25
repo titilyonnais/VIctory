@@ -728,10 +728,11 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        if let (Some(dst_write), Some(from)) = (
+            crate::texture::prepare_host_write(dst),
             crate::resource::host_resource(src),
         ) {
+            let to = dst_write.resource().clone();
             let title_src = crate::texture::title_written(&from);
             let Some(list) = (if title_src {
                 host_list_after_read_back(this, None)
@@ -745,7 +746,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
+            dst_write.record(list);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -802,12 +803,13 @@ extern "system" fn copy_texture_region(
         let Some(list) = list_for_texture_copy(this, &src) else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(dst_write) = crate::texture::prepare_host_write(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        let to = dst_write.resource().clone();
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -844,7 +846,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        dst_write.record(list);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1028,11 +1030,12 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        && let (Some(dst_write), Some(from)) = (
+            crate::texture::prepare_host_write(dst),
             crate::resource::host_resource(src),
         )
     {
+        let to = dst_write.resource().clone();
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1043,7 +1046,7 @@ extern "system" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
+        dst_write.record(list);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

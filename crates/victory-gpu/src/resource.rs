@@ -797,6 +797,19 @@ struct Resource {
 /// One per texture memory (decision 0007, "One host texture per texture
 /// memory"): title textures at the same address with the same shape and
 /// element size share it, each viewing it in its own format.
+/// High bit of [`HostTexture::pending_host_writes`]: claimed by `give_up`
+/// during eviction so concurrent `prepare_host_write` callers detach and
+/// recreate the host texture rather than pinning an evicted copy.
+#[cfg(windows)]
+pub(crate) const EVICTED: usize = 1 << (usize::BITS - 1);
+
+/// Sticky bit of [`HostTexture::pending_host_writes`]: set when a deferred
+/// `host_writes` mark commits, preventing `pending_host_writes` from ever
+/// returning to zero so `give_up`'s CAS cannot transiently claim a
+/// `host_written` texture.
+#[cfg(windows)]
+pub(crate) const HOST_WRITTEN: usize = 1 << (usize::BITS - 2);
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -807,6 +820,9 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// Recorded lists holding a pending `host_writes` mark not yet retired
+    /// (dropped on list reset/drop after `host_written` is stored on run).
+    pub(crate) pending_host_writes: std::sync::atomic::AtomicUsize,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -847,6 +863,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            pending_host_writes: 0.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -1091,6 +1108,20 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
+/// Detaches `copy` from `this` if `this` still holds it (used when a
+/// concurrent `give_up` claimed `copy` with [`EVICTED`] before clearing
+/// `resource(this).host`).
+#[cfg(windows)]
+pub(crate) fn detach_if_same(this: This, copy: &std::sync::Arc<HostTexture>) {
+    if this.is_null() {
+        return;
+    }
+    let mut h = resource(this).host.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, copy)) {
+        *h = None;
+    }
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1217,7 +1248,9 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let live = key
+        .and_then(|k| map.get(&k)?.upgrade())
+        .filter(|t| t.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & EVICTED == 0);
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1607,7 +1640,11 @@ fn remade(k: &MemoryKey) {
 /// or resolve wrote it), so a texture made again has them back.
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Acquire;
+    t.key.is_some()
+        && crate::texture::title_written(&t.texture)
+        && t.pending_host_writes.load(Acquire) == 0
+        && !t.host_written.load(Acquire)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1714,13 +1751,33 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
 /// gives up only textures unused for a while, or the least recently used.
 #[cfg(windows)]
 fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
     if gone.is_empty() {
+        return (0, 0);
+    }
+    let mut claimed: Vec<&Owned> = Vec::with_capacity(gone.len());
+    for entry in gone {
+        let t = &entry.0;
+        if !crate::texture::title_written(&t.texture) || t.host_written.load(Acquire) {
+            continue;
+        }
+        if t.pending_host_writes
+            .compare_exchange(0, EVICTED, AcqRel, Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        claimed.push(entry);
+    }
+    if claimed.is_empty() {
         return (0, 0);
     }
     {
         use windows::core::Interface;
-        let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
+        let raws = claimed
+            .iter()
+            .map(|(t, _)| t.texture.as_raw() as usize)
+            .collect();
         crate::descriptor::evict(&raws);
     }
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1728,8 +1785,8 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
-    for (t, owners) in gone {
+    let bytes = claimed.iter().map(|(t, _)| t.bytes).sum();
+    for (t, owners) in &claimed {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
@@ -1740,9 +1797,15 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             given.insert(k, frame);
         }
     }
-    EVICTIONS[0].fetch_add(gone.len() as u64, Relaxed);
+    EVICTIONS[0].fetch_add(claimed.len() as u64, Relaxed);
     EVICTIONS[1].fetch_add(bytes, Relaxed);
-    (gone.len() as u64, bytes)
+    (claimed.len() as u64, bytes)
+}
+
+/// Runs [`give_up`] on a pre-collected candidate snapshot (tests).
+#[cfg(all(windows, test))]
+pub(crate) fn give_up_snapshot(gone: &[Owned]) -> (u64, u64) {
+    give_up(gone, crate::queue::presented())
 }
 
 /// Gives up `this`'s host texture as [`evict`] would (tests); false if it
