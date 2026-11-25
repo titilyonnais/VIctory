@@ -115,6 +115,9 @@ pub(crate) struct World<'a, S> {
     /// Runs a piece (a queue, its segments in order) to completion, the
     /// bottom-of-pipe writes included.
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
+    /// Whether a segment writes title memory after its submission finishes
+    /// (`read_back`), so following segments must run in a later piece.
+    pub(crate) flush_after: &'a dyn Fn(&S) -> bool,
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
 }
@@ -179,8 +182,13 @@ impl<S> Held<S> {
                     moved = true;
                     match items.pop_front().map(|(item, ..)| item) {
                         Some(Item::Segment(s, _)) => {
+                            let flush = (w.flush_after)(&s);
                             piece.push(s);
                             done.segments += 1;
+                            if flush {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
                         Some(Item::FenceWait(..)) | None => {}
@@ -280,7 +288,42 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, flush_after: &|_| false, signal: &mut signal })
+    }
+
+    #[test]
+    fn a_segment_with_flush_after_runs_before_the_next_segment() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("readback", vec![(0x100, 42)]);
+        let mut held = Held::default();
+        held.push(2, Item::Segment("readback", vec![]));
+        held.push(2, Item::Segment("consumer", vec![ge(0x100, 42)]));
+        let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
+        let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
+        let mut run = |q: usize, segments: Vec<&'static str>| {
+            let mut f = fake.borrow_mut();
+            for s in &segments {
+                for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
+                    f.memory.insert(a, v);
+                }
+            }
+            f.log.push(format!("q{q}: {}", segments.join(" ")));
+        };
+        let mut signal = |fence: usize, value: u64| {
+            let mut f = fake.borrow_mut();
+            f.fences.insert(fence, value);
+            f.log.push(format!("signal {fence} {value}"));
+        };
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            flush_after: &|s| *s == "readback",
+            signal: &mut signal,
+        });
+        assert_eq!(fake.borrow().log, ["q2: readback", "q2: consumer"]);
+        assert_eq!((p.pieces, p.segments), (2, 2));
+        assert!(held.blocked(&read).is_empty());
     }
 
     #[test]

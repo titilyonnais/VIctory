@@ -1004,6 +1004,9 @@ struct Deferred {
     back_wanted: Vec<usize>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Guest-memory `[start, end)` ranges written once this list has run
+    /// (`crate::list::read_back`), so later reads run in a later piece.
+    read_backs: Vec<(usize, usize)>,
 }
 
 impl Host {
@@ -2166,6 +2169,29 @@ impl HostList {
     /// The memory values the list waits for before it starts.
     pub(crate) fn waits(&self) -> Vec<crate::hold::ValueWait> {
         self.deferred().waits.clone()
+    }
+
+    /// Records `[start, start + len)` as title memory written once this list
+    /// has run (`crate::list::read_back`).
+    pub(crate) fn note_read_back(&self, start: usize, len: usize) {
+        self.deferred()
+            .read_backs
+            .push((start, start.saturating_add(len)));
+    }
+
+    /// Whether this list has pending read-back writes into title memory.
+    pub(crate) fn has_read_backs(&self) -> bool {
+        !self.deferred().read_backs.is_empty()
+    }
+
+    /// Whether any pending read-back write in this list overlaps
+    /// `[start, start + len)`.
+    pub(crate) fn reads_after_read_back(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        self.deferred()
+            .read_backs
+            .iter()
+            .any(|&(a, b)| a < end && start < b)
     }
 
     /// Whether nothing has been recorded since the list was made or reset

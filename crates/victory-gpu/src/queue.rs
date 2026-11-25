@@ -220,6 +220,7 @@ fn pump(held: &mut Holding, why: Why) {
         read: &read,
         fence: &fence,
         run: &mut run,
+        flush_after: &|s| s.has_read_backs(),
         signal: &mut signal,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {

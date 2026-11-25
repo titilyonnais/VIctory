@@ -3040,6 +3040,349 @@ mod tests {
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
+    /// A texture region read back into a title buffer, then copied from that
+    /// buffer into another texture in the same command list (with a barrier in
+    /// between): the destination texture gets the read-back texels, not the
+    /// sentinel bytes that were in the buffer when the list was recorded or
+    /// submitted.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_back_followed_by_texture_copy_in_one_list_uses_the_read_back_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let (mut src_tex, mut dst_tex, mut init_buf, mut staging_buf, mut verify_buf) =
+            (null, null, null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        };
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut src_tex);
+        created(&texture(4, 4, 28, 1), COPY_SOURCE, &mut dst_tex);
+        created(&buffer(1024), 0, &mut init_buf);
+        created(&buffer(4096), 0, &mut staging_buf);
+        created(&buffer(4096), 0, &mut verify_buf);
+
+        let (init_ptr, _) = buffer_bytes(init_buf).unwrap();
+        // SAFETY: `init_buf` holds 1024 bytes.
+        let init_bytes = unsafe { std::slice::from_raw_parts_mut(init_ptr, 1024) };
+        for row in 0..4 {
+            for col in 0..16 {
+                init_bytes[row * 256 + col] = ((row * 31 + col + 1) % 251) as u8;
+            }
+        }
+        let (staging_ptr, _) = buffer_bytes(staging_buf).unwrap();
+        // SAFETY: `staging_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(staging_ptr, 0x5A, 4096) };
+        let (verify_ptr, _) = buffer_bytes(verify_buf).unwrap();
+        // SAFETY: `verify_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(verify_ptr, 0xCC, 4096) };
+
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let src_loc = Location { resource: src_tex, kind: 0, footprint: rows };
+        let dst_loc = Location { resource: dst_tex, kind: 0, footprint: rows };
+        let init_loc = Location { resource: init_buf, kind: 1, footprint: rows };
+        let staging_loc = Location { resource: staging_buf, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
+        let verify_loc = Location { resource: verify_buf, kind: 1, footprint: rows };
+
+        #[repr(C)]
+        struct TestBarrier {
+            kind: u32,
+            flags: u32,
+            first: This,
+            second: u64,
+            last: u64,
+        }
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type BarrierFn = extern "system" fn(This, u32, *const TestBarrier) -> u32;
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        let copy = slot::<Copy>(list, 0x80);
+        let barrier_fn = slot::<BarrierFn>(list, 0xd0);
+        let close = slot::<Close>(list, 0x48);
+        let reset = slot::<Reset>(list, 0x50);
+        let execute = slot::<Execute>(queue, 0x50);
+
+        // Seed `src_tex` on the host GPU first.
+        copy(list, &src_loc, 0, 0, 0, &init_loc, null.cast());
+        assert_eq!(close(list), S_OK);
+        execute(queue, 1, &list);
+        assert_eq!(reset(list, allocator, null), S_OK);
+
+        // Same command list: read back `src_tex` -> `staging_buf`, barrier `dst_tex`,
+        // then copy `staging_buf` -> `dst_tex`.
+        copy(list, &staging_loc, 0, 0, 0, &src_loc, null.cast());
+        let b = TestBarrier {
+            kind: 0,
+            flags: 0,
+            first: dst_tex,
+            second: 0xffff_ffff | (u64::from(COPY_SOURCE) << 32),
+            last: u64::from(COPY_DEST),
+        };
+        barrier_fn(list, 1, &b);
+        copy(list, &dst_loc, 0, 0, 0, &staging_loc, null.cast());
+        assert_eq!(close(list), S_OK);
+        execute(queue, 1, &list);
+        assert_eq!(reset(list, allocator, null), S_OK);
+
+        // Read back `dst_tex` into `verify_buf` to verify its contents on the host GPU.
+        copy(list, &verify_loc, 0, 0, 0, &dst_loc, null.cast());
+        assert_eq!(close(list), S_OK);
+        execute(queue, 1, &list);
+
+        // SAFETY: `verify_buf` holds 4096 bytes; the verification submission has run.
+        let read = unsafe { std::slice::from_raw_parts(verify_ptr, 1024) };
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(
+                &read[at..at + 16],
+                &init_bytes[at..at + 16],
+                "row {row}: destination texture must match source texture rather than stale 0x5A sentinel bytes"
+            );
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [list, allocator, queue, verify_buf, staging_buf, init_buf, dst_tex, src_tex] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Two command lists submitted in one `ExecuteCommandLists` batch: the
+    /// first reads back a texture into a buffer, the second copies from that
+    /// buffer into another texture. Flushing the piece after the read-back
+    /// ensures the second list reads the updated buffer bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_submission_with_read_back_then_texture_copy_uses_the_read_back_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut src_tex, mut dst_tex, mut init_buf, mut staging_buf, mut verify_buf) =
+            (null, null, null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        };
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut src_tex);
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut dst_tex);
+        created(&buffer(1024), 0, &mut init_buf);
+        created(&buffer(4096), 0, &mut staging_buf);
+        created(&buffer(4096), 0, &mut verify_buf);
+
+        let (init_ptr, _) = buffer_bytes(init_buf).unwrap();
+        // SAFETY: `init_buf` holds 1024 bytes.
+        let init_bytes = unsafe { std::slice::from_raw_parts_mut(init_ptr, 1024) };
+        for row in 0..4 {
+            for col in 0..16 {
+                init_bytes[row * 256 + col] = ((row * 41 + col + 9) % 251) as u8;
+            }
+        }
+        let (staging_ptr, _) = buffer_bytes(staging_buf).unwrap();
+        // SAFETY: `staging_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(staging_ptr, 0x5A, 4096) };
+        let (verify_ptr, _) = buffer_bytes(verify_buf).unwrap();
+        // SAFETY: `verify_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(verify_ptr, 0xCC, 4096) };
+
+        let (mut queue, mut allocator, mut list_a, mut list_b) = (null, null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
+            S_OK
+        );
+        for out in [&mut list_a, &mut list_b] {
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), out),
+                S_OK
+            );
+        }
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let src_loc = Location { resource: src_tex, kind: 0, footprint: rows };
+        let dst_loc = Location { resource: dst_tex, kind: 0, footprint: rows };
+        let init_loc = Location { resource: init_buf, kind: 1, footprint: rows };
+        let staging_loc = Location { resource: staging_buf, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
+        let verify_loc = Location { resource: verify_buf, kind: 1, footprint: rows };
+
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        let copy = slot::<Copy>(list_a, 0x80);
+        let close = slot::<Close>(list_a, 0x48);
+        let reset = slot::<Reset>(list_a, 0x50);
+        let execute = slot::<Execute>(queue, 0x50);
+
+        copy(list_a, &src_loc, 0, 0, 0, &init_loc, null.cast());
+        assert_eq!(close(list_a), S_OK);
+        execute(queue, 1, &list_a);
+        assert_eq!(reset(list_a, allocator, null), S_OK);
+
+        copy(list_a, &staging_loc, 0, 0, 0, &src_loc, null.cast());
+        copy(list_b, &dst_loc, 0, 0, 0, &staging_loc, null.cast());
+        assert_eq!(close(list_a), S_OK);
+        assert_eq!(close(list_b), S_OK);
+        let batch = [list_a, list_b];
+        execute(queue, 2, batch.as_ptr());
+        assert_eq!(reset(list_a, allocator, null), S_OK);
+
+        copy(list_a, &verify_loc, 0, 0, 0, &dst_loc, null.cast());
+        assert_eq!(close(list_a), S_OK);
+        execute(queue, 1, &list_a);
+
+        // SAFETY: `verify_buf` holds 4096 bytes; the verification submission has run.
+        let read = unsafe { std::slice::from_raw_parts(verify_ptr, 1024) };
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(
+                &read[at..at + 16],
+                &init_bytes[at..at + 16],
+                "row {row}: destination texture must match source texture across batched lists"
+            );
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [list_a, list_b, allocator, queue, verify_buf, staging_buf, init_buf, dst_tex, src_tex] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A texture region read back into a title buffer, then copied by
+    /// `CopyBufferRegion` from that buffer into another title buffer in the
+    /// same command list: the destination buffer gets the read-back rows.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_back_followed_by_buffer_copy_in_one_list_uses_the_read_back_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut src_tex, mut init_buf, mut staging_buf, mut copy_dst_buf) =
+            (null, null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        };
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut src_tex);
+        created(&buffer(1024), 0, &mut init_buf);
+        created(&buffer(4096), 0, &mut staging_buf);
+        created(&buffer(4096), 0, &mut copy_dst_buf);
+
+        let (init_ptr, _) = buffer_bytes(init_buf).unwrap();
+        // SAFETY: `init_buf` holds 1024 bytes.
+        let init_bytes = unsafe { std::slice::from_raw_parts_mut(init_ptr, 1024) };
+        for row in 0..4 {
+            for col in 0..16 {
+                init_bytes[row * 256 + col] = ((row * 37 + col + 5) % 251) as u8;
+            }
+        }
+        let (staging_ptr, _) = buffer_bytes(staging_buf).unwrap();
+        // SAFETY: `staging_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(staging_ptr, 0x5A, 4096) };
+        let (dst_ptr, _) = buffer_bytes(copy_dst_buf).unwrap();
+        // SAFETY: `copy_dst_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(dst_ptr, 0x77, 4096) };
+
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let src_loc = Location { resource: src_tex, kind: 0, footprint: rows };
+        let init_loc = Location { resource: init_buf, kind: 1, footprint: rows };
+        let staging_loc = Location { resource: staging_buf, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
+
+        type CopyTex = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type CopyBuf = extern "system" fn(This, This, u64, This, u64, u64);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        let copy_tex = slot::<CopyTex>(list, 0x80);
+        let copy_buf = slot::<CopyBuf>(list, 0x78);
+        let close = slot::<Close>(list, 0x48);
+        let reset = slot::<Reset>(list, 0x50);
+        let execute = slot::<Execute>(queue, 0x50);
+
+        copy_tex(list, &src_loc, 0, 0, 0, &init_loc, null.cast());
+        assert_eq!(close(list), S_OK);
+        execute(queue, 1, &list);
+        assert_eq!(reset(list, allocator, null), S_OK);
+
+        // Same command list: read back `src_tex` -> `staging_buf`, then CopyBufferRegion `staging_buf` -> `copy_dst_buf`.
+        copy_tex(list, &staging_loc, 0, 0, 0, &src_loc, null.cast());
+        copy_buf(list, copy_dst_buf, 0, staging_buf, 512, 1024);
+        assert_eq!(close(list), S_OK);
+        execute(queue, 1, &list);
+
+        // SAFETY: `copy_dst_buf` holds 4096 bytes; the submission has run.
+        let read = unsafe { std::slice::from_raw_parts(dst_ptr, 1024) };
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(
+                &read[at..at + 16],
+                &init_bytes[at..at + 16],
+                "row {row}: destination buffer must match source texture rather than stale 0x5A sentinel bytes"
+            );
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [list, allocator, queue, copy_dst_buf, staging_buf, init_buf, src_tex] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
     /// then waits for a value a graphics list writes at its end, then reads
     /// back the texture that graphics list fills. Submitted first, its first

@@ -130,6 +130,19 @@ struct List {
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
+#[cfg(windows)]
+fn with_state_after_read_back(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
+    let Some(list) = host_list_after_read_back(this, None) else {
+        return;
+    };
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
@@ -200,17 +213,87 @@ pub(crate) extern "system" fn wait64(this: This, address: u64, comparison: u32, 
     wait(this, crate::hold::ValueWait { address, bytes: 8, comparison, reference, mask: u64::MAX });
 }
 
+#[cfg(windows)]
+fn cut_segment<'a>(
+    this: This,
+    current: &crate::host::HostList,
+) -> Option<&'a crate::host::HostList> {
+    let next = next_segment(this)?;
+    CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    current.close();
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+    Some(next)
+}
+
+/// Returns the current host list, cutting onto a fresh segment when the
+/// current one has pending `read_back` writes that `range` (or any read,
+/// when `None`) would observe before submission-time copies run.
+#[cfg(windows)]
+fn host_list_after_read_back<'a>(
+    this: This,
+    range: Option<(usize, usize)>,
+) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    let cut = match range {
+        Some((start, len)) => current.reads_after_read_back(start, len),
+        None => current.has_read_backs(),
+    };
+    if cut {
+        cut_segment(this, current)
+    } else {
+        Some(current)
+    }
+}
+
+#[cfg(windows)]
+fn host_list_after_buffers<'a>(
+    this: This,
+    dst: usize,
+    src: usize,
+    len: usize,
+) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    if current.reads_after_read_back(src, len) || current.reads_after_read_back(dst, len) {
+        cut_segment(this, current)
+    } else {
+        Some(current)
+    }
+}
+
+#[cfg(windows)]
+fn list_for_texture_copy<'a>(
+    this: This,
+    src: &CopyLocation,
+) -> Option<&'a crate::host::HostList> {
+    const FOOTPRINT: u32 = 1;
+    let current = host_list(this)?;
+    if !current.has_read_backs() {
+        return Some(current);
+    }
+    let cut = if src.kind == FOOTPRINT {
+        src.footprint
+            .bytes()
+            .and_then(|bytes| buffer_range(src.resource, src.footprint.offset, bytes).map(|p| (p, bytes)))
+            .is_some_and(|(data, bytes)| current.reads_after_read_back(data as usize, bytes as usize))
+    } else {
+        crate::resource::host_resource(src.resource)
+            .is_some_and(|texture| crate::texture::title_written(&texture))
+    };
+    if cut {
+        cut_segment(this, current)
+    } else {
+        Some(current)
+    }
+}
+
 fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
         let Some(current) = host_list(this) else { return };
         if !current.is_empty() {
-            let Some(next) = next_segment(this) else { return };
-            CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            current.close();
-            // SAFETY: the title passes one of our lists.
-            let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            let Some(next) = cut_segment(this, current) else { return };
             next.defer_wait(wait);
             return;
         }
@@ -632,9 +715,9 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = host_list_after_buffers(this, to as usize, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -645,14 +728,19 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
-            return;
-        };
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::texture::title_written(&from) {
+            let title_src = crate::texture::title_written(&from);
+            let Some(list) = (if title_src {
+                host_list_after_read_back(this, None)
+            } else {
+                host_list(this)
+            }) else {
+                return;
+            };
+            if title_src {
                 crate::texture::upload(list, src, &from);
             }
             ensure_state(list, dst, COPY_DEST);
@@ -666,7 +754,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            let bytes = a.min(b) as usize;
+            if let Some(list) = host_list_after_buffers(this, to as usize, from as usize, bytes) {
+                list.defer_copy(to, from, bytes);
+            }
         }
     }
     #[cfg(not(windows))]
@@ -705,11 +796,10 @@ extern "system" fn copy_texture_region(
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
-        else {
+        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
+            return;
+        };
+        let Some(list) = list_for_texture_copy(this, &src) else {
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -901,6 +991,9 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             b.map(std::ptr::from_ref),
         )
     };
+    for &(at, n) in &rows {
+        list.note_read_back(title as usize + at as usize, n as usize);
+    }
     let (data, title) = (data as usize, title as usize);
     list.defer_after(move || {
         for &(at, n) in &rows {
@@ -1085,9 +1178,9 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
+    if dst != 0
         && src != 0
+        && let Some(list) = host_list_after_buffers(this, dst as usize, src as usize, len as usize)
     {
         let len = len as usize;
         list.defer(move || {
@@ -1394,7 +1487,7 @@ mod state {
         let Some(&values) = (unsafe { values.as_ref() }) else {
             return;
         };
-        with_state(this, |list, s| {
+        super::with_state_after_read_back(this, |list, s| {
             s.clear_unordered(list, cpu, values, float, rects);
         });
     }
@@ -1490,13 +1583,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        super::with_state_after_read_back(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        super::with_state_after_read_back(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1506,7 +1599,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1524,7 +1617,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1535,7 +1628,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        super::with_state_after_read_back(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1614,7 +1707,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_after_read_back(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
