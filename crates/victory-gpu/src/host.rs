@@ -514,10 +514,23 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = std::collections::HashMap<usize, TextureState>;
+
+struct TextureState {
+    first: u32,
+    last: u32,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    write_version: u64,
+    /// The source host copy and its write version when copied into this one.
+    alias_source: Option<(usize, u64)>,
+}
+
+impl TextureState {
+    fn invalidate_aliases(&mut self) {
+        self.write_version += 1;
+        self.alias_source = None;
+    }
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1396,6 +1409,11 @@ impl HostList {
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
+            // Unordered access writes the logical depth copy through its twin.
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = states.get_mut(&(std::sync::Arc::as_ptr(&copy) as usize)) {
+                state.invalidate_aliases();
+            }
             return None;
         }
         let wanted = legal_state(texture, wanted);
@@ -1406,17 +1424,62 @@ impl HostList {
     /// one): the state it leaves, if that is a change. Nothing for the
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        const WRITE_STATES: u32 = (D3D12_RESOURCE_STATE_RENDER_TARGET.0
+            | D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0
+            | D3D12_RESOURCE_STATE_DEPTH_WRITE.0
+            | D3D12_RESOURCE_STATE_COPY_DEST.0
+            | D3D12_RESOURCE_STATE_RESOLVE_DEST.0) as u32;
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 copy.note_used();
-                v.insert((wanted, wanted, copy.clone()));
+                v.insert(TextureState {
+                    first: wanted,
+                    last: wanted,
+                    copy: copy.clone(),
+                    write_version: 0,
+                    alias_source: None,
+                });
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                let state = o.get_mut();
+                if wanted & WRITE_STATES != 0 {
+                    state.invalidate_aliases();
+                }
+                let before = std::mem::replace(&mut state.last, wanted);
                 (before != wanted).then_some(before)
             }
+        }
+    }
+
+    /// Whether this destination still holds this source's latest contents.
+    pub(crate) fn alias_copy_is_current(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        dest: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> bool {
+        let source = std::sync::Arc::as_ptr(source) as usize;
+        let dest = std::sync::Arc::as_ptr(dest) as usize;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&source).zip(states.get(&dest)).is_some_and(|(src, dst)| {
+            dst.alias_source == Some((source, src.write_version))
+        })
+    }
+
+    /// Records a completed alias copy after both textures were tracked.
+    pub(crate) fn record_alias_copy(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        dest: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let source = std::sync::Arc::as_ptr(source) as usize;
+        let dest = std::sync::Arc::as_ptr(dest) as usize;
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(version) = states.get(&source).map(|state| state.write_version)
+            && let Some(state) = states.get_mut(&dest)
+        {
+            state.alias_source = Some((source, version));
         }
     }
 
@@ -1479,13 +1542,13 @@ impl HostList {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
+            .filter_map(|state| {
+                let real = state.copy.state.swap(state.last, Ordering::Relaxed);
+                (real != state.first).then(|| {
                     transition(
-                        &copy.texture,
+                        &state.copy.texture,
                         D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
+                        D3D12_RESOURCE_STATES(state.first as i32),
                     )
                 })
             })

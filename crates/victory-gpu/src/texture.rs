@@ -166,7 +166,8 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Records, once per list, the copy of `from`'s host texture into `to`'s:
+/// Copies `from`'s host texture into `to`'s when the list has yet to
+/// record a copy of the source's current contents:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
 /// the same bytes, or a cast the host refused), `to` (a placed view's)
@@ -177,17 +178,17 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
-        crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+    let (Some(source), Some(dest), Some(host)) = (
+        crate::resource::host_copy(from),
+        crate::resource::host_copy(to),
         host(),
     ) else {
         return;
     };
-    // An odd key: textures' own first uses are keyed by the host texture.
-    if !list.first_use(to as usize | 1) {
+    if list.alias_copy_is_current(&source, &dest) {
         return;
     }
+    let (a, b) = (&source.texture, &dest.texture);
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
     let count = |d: &D3D12_RESOURCE_DESC| {
@@ -254,6 +255,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
+    list.record_alias_copy(&source, &dest);
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
