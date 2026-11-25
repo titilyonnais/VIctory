@@ -315,9 +315,14 @@ impl Uploads {
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls.values() {
+    for (shadow, address, len, uav, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize);
+            let (address, len) = if *uav && shadow.marked() {
+                shadow.page_range(*address, *len)
+            } else {
+                (*address, *len)
+            };
+            add(shadow, address as usize, len as usize);
         }
     }
 }
