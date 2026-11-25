@@ -2392,6 +2392,12 @@ impl Meter {
                 crate::descriptor::USAGE.2.swap(0, Ordering::Relaxed),
                 crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
             );
+            let [same, changed] = crate::texture::RECHECKED.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+            if same + changed > 0 {
+                tracing::info!(
+                    "texture rechecks: {same} found the memory as uploaded, {changed} found it changed unseen and uploaded again (last 5 s)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;

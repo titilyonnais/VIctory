@@ -58,6 +58,82 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     read: Vec<u8>,
+    /// Tracked memory detiled: its [`fingerprint`] then, the looks
+    /// ([`RECHECK_FRAMES`]) that found it so since, and the frame of the
+    /// next look. None: no look due (off, or all done).
+    print: Option<(u64, u8, u64)>,
+}
+
+/// Frames after a tracked texture's memory was detiled at which it is
+/// looked at again (a [`fingerprint`]), each counted from the look before.
+/// The title may fill a texture's memory in ways the change tracking does
+/// not see (`crate::watch`'s shortcuts), with no descriptor write either;
+/// the host texture then kept what the memory held at the first look for
+/// the rest of the run (characters' skin and hair without colour). A
+/// changed memory is detiled again and the looks start over. From
+/// fxceless/victory-fork a803c87. `VICTORY_HEAP_RECHECK=0`: no looks.
+// shortcut: the fingerprint samples the start, middle and end of a large
+// memory; a texture whose other parts change unseen is still missed.
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Looks at tracked textures' memory ([`RECHECK_FRAMES`]) that found it as
+/// detiled, and that found it changed unseen (detiled again), since the
+/// last frame-rate line.
+pub(crate) static RECHECKED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether tracked textures are looked at again after they were detiled
+/// (`VICTORY_HEAP_RECHECK=0`: no).
+fn recheck_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// Bytes [`fingerprint`] takes from each of a large memory's three windows.
+const WINDOW: usize = 16 << 10;
+
+/// The ranges (start, bytes) of a memory of `len` bytes a [`fingerprint`]
+/// takes: all of it up to 48 KiB, else 16 KiB at its start, its middle and
+/// its end (a texture streams in whole mips; the small ones lie first).
+fn print_windows(len: usize) -> [(usize, usize); 3] {
+    if len <= 3 * WINDOW {
+        [(0, len), (0, 0), (0, 0)]
+    } else {
+        [(0, WINDOW), ((len / 2) & !0xfff, WINDOW), (len - WINDOW, WINDOW)]
+    }
+}
+
+/// A fingerprint of `read` (a copy of a texture's memory); never 0.
+fn fingerprint(read: &[u8]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for (from, bytes) in print_windows(read.len()) {
+        hasher.update(&read[from..from + bytes]);
+    }
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+/// [`fingerprint`] of the title memory `[memory, memory + len)`, read
+/// through the copy (pages not there count as zeros, as in the read that
+/// detiles it): only the windows it takes are read.
+fn fingerprint_mapped(memory: *const u8, len: usize) -> u64 {
+    let mut read = vec![0u8; len.min(3 * WINDOW)];
+    let mut to = 0;
+    for (from, bytes) in print_windows(len) {
+        if bytes == 0 {
+            continue;
+        }
+        // SAFETY: `from + bytes <= len`, within the memory.
+        crate::host::copy_mapped(read[to..].as_mut_ptr(), unsafe { memory.add(from) }, bytes, false);
+        to += bytes;
+    }
+    // The windows back to back hash as the same windows taken one by one.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&read);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -303,7 +379,7 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            if t.take(start, start + size).is_empty() && !self.changed_unseen(last) {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
@@ -311,6 +387,9 @@ impl Staging {
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             self.detile(&last.read);
+            // Looked at again from a few frames on (`RECHECK_FRAMES`).
+            last.print = recheck_on()
+                .then(|| (fingerprint(&last.read), 0, crate::frame::current() + RECHECK_FRAMES[0]));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -338,6 +417,42 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
+    }
+
+    /// For tracked memory no change was seen in since it was detiled: if a
+    /// look is due ([`RECHECK_FRAMES`]), whether its [`fingerprint`] differs
+    /// from the one at the detiling (it is then detiled again).
+    fn changed_unseen(&self, last: &mut Last) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((print, looks, due)) = last.print else {
+            return false;
+        };
+        let frame = crate::frame::current();
+        if frame < due {
+            return false;
+        }
+        let size = self.layout.size as usize;
+        if fingerprint_mapped(self.memory, size) == print {
+            RECHECKED[0].fetch_add(1, Relaxed);
+            last.print = RECHECK_FRAMES
+                .get(usize::from(looks) + 1)
+                .map(|wait| (print, looks + 1, frame + wait));
+            return false;
+        }
+        static CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        RECHECKED[1].fetch_add(1, Relaxed);
+        let n = CHANGED.fetch_add(1, Relaxed);
+        if n < 200 || n.is_multiple_of(1000) {
+            tracing::warn!(
+                memory = ?self.memory,
+                bytes = size,
+                looks,
+                changed = n + 1,
+                desc = ?self.layout.desc,
+                "a texture's memory changed with nothing to tell of it: uploaded again"
+            );
+        }
+        true
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -486,6 +601,24 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fingerprint_sees_the_start_middle_and_end_of_a_large_memory() {
+        let len = 1 << 20;
+        let memory = vec![7u8; len];
+        let print = fingerprint(&memory);
+        assert_ne!(print, 0);
+        for (at, seen) in [(0, true), (len / 2 + 5, true), (len - 1, true), (len / 4, false)] {
+            let mut other = memory.clone();
+            other[at] ^= 1;
+            assert_eq!(fingerprint(&other) != print, seen, "byte {at:#x}");
+        }
+        // A small memory is taken whole.
+        let small = vec![1u8; 3 * WINDOW];
+        let mut other = small.clone();
+        other[WINDOW + 3] = 2;
+        assert_ne!(fingerprint(&small), fingerprint(&other));
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
