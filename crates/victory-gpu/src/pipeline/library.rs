@@ -65,6 +65,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the library is kept in, if any.
+pub(super) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -432,9 +437,12 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
+    if super::guard::refused(name) {
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+    }
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return super::guard::making(name, create);
     };
     let _held = NAMES.hold(name);
     // The interface alone under the lock: loads take up to seconds. Its
@@ -451,7 +459,7 @@ pub(crate) fn pipeline(
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
+    let pso = super::guard::making(name, create)?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
