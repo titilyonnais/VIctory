@@ -161,8 +161,102 @@ pub(crate) fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads: the time in which
+/// at least one thread waits ([`Waits`]).
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// The waiting of a title frame, over all threads. The title records its
+/// lists on several threads, and a thread may begin to wait while another
+/// waits: the frame's waits end together. Time counts while any thread
+/// waits, once however many do, and not between waits.
+struct Waits(Mutex<Spent>);
+
+struct Spent {
+    /// The newest frame a wait began in (`u64::MAX`: none yet).
+    frame: u64,
+    /// Time of that frame in which a thread waited, without the waits
+    /// under way.
+    used: Duration,
+    /// Waits under way, and when the first of them began (within `frame`).
+    under_way: u32,
+    since: Option<Instant>,
+    /// As `used` over all frames, since [`Waits::take`].
+    total: Duration,
+}
+
+impl Waits {
+    const fn new() -> Self {
+        Self(Mutex::new(Spent {
+            frame: u64::MAX,
+            used: Duration::ZERO,
+            under_way: 0,
+            since: None,
+            total: Duration::ZERO,
+        }))
+    }
+
+    fn spent(&self) -> std::sync::MutexGuard<'_, Spent> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A wait begins at `now` in title frame `frame`: when it ends at the
+    /// latest. A later frame starts with the whole `budget` (waits of the
+    /// frame before that are still under way count from `now`); a thread
+    /// that names an earlier frame (it read the frame's number, then lost
+    /// the processor) waits on the newest frame's budget.
+    fn begin(&self, frame: u64, now: Instant, budget: Duration) -> Instant {
+        let mut s = self.spent();
+        if s.frame == u64::MAX || frame > s.frame {
+            if let Some(since) = s.since.replace(now) {
+                s.total += now.saturating_duration_since(since);
+            }
+            (s.frame, s.used) = (frame, Duration::ZERO);
+        }
+        if s.under_way == 0 {
+            s.since = Some(now);
+        }
+        s.under_way += 1;
+        s.since.unwrap_or(now) + budget.saturating_sub(s.used)
+    }
+
+    /// A wait that began with [`Waits::begin`] ends at `now`.
+    fn end(&self, now: Instant) {
+        let mut s = self.spent();
+        s.under_way = s.under_way.saturating_sub(1);
+        if s.under_way == 0
+            && let Some(since) = s.since.take()
+        {
+            let waited = now.saturating_duration_since(since);
+            s.used += waited;
+            s.total += waited;
+        }
+    }
+
+    /// The time in which a thread waited since the last call, the waits
+    /// under way up to `now`.
+    fn take(&self, now: Instant) -> Duration {
+        let mut s = self.spent();
+        if let Some(since) = s.since {
+            let waited = now.saturating_duration_since(since);
+            // Counted here; the frame's budget keeps it too, and the
+            // waits under way go on from `now`.
+            s.used += waited;
+            s.total += waited;
+            s.since = Some(now);
+        }
+        std::mem::take(&mut s.total)
+    }
+}
+
+/// The waits of draws for their pipelines.
+static WAITS: Waits = Waits::new();
+
+/// Milliseconds in which a recording thread waited for a pipeline since the
+/// last call (for the frame line): time the title's frame stood still that
+/// no submission's time holds, as the waits are outside the submissions.
+pub(crate) fn take_waited_ms() -> f64 {
+    WAITS.take(Instant::now()).as_secs_f64() * 1000.0
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -219,23 +313,30 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    wait_within(&WAITS, BUDGET, p, frame);
+}
+
+/// Waits for `p` until it is made or the waiting `waits` allows frame
+/// `frame` of `budget` is over.
+fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
+    /// Ends the wait however the function is left.
+    struct Under<'a>(&'a Waits);
+    impl Drop for Under<'_> {
+        fn drop(&mut self) {
+            self.0.end(Instant::now());
+        }
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
-    let started = Instant::now();
+    let end = waits.begin(frame, Instant::now(), budget);
+    let _under = Under(waits);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = end.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -355,6 +456,91 @@ mod tests {
         assert_eq!(enqueue(&r, false), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
         WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
+
+    /// Waits of one frame end together: a thread that begins to wait while
+    /// another waits gets no budget of its own, waits one after the other
+    /// share it, and the next frame has it whole again.
+    #[test]
+    fn waits_of_a_frame_share_its_budget() {
+        let waits = Waits::new();
+        let budget = Duration::from_millis(500);
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        // Three threads begin within the first's wait: all end with it.
+        let first = waits.begin(7, start, budget);
+        assert_eq!(first, start + budget);
+        assert_eq!(waits.begin(7, start + ms(200), budget), first);
+        assert_eq!(waits.begin(7, start + ms(499), budget), first);
+        for _ in 0..3 {
+            waits.end(first);
+        }
+        // The budget is spent: a later wait of the frame ends at once.
+        let later = start + ms(900);
+        assert_eq!(waits.begin(7, later, budget), later);
+        waits.end(later);
+        // A thread that still names the frame before does not bring a
+        // budget back.
+        assert_eq!(waits.begin(6, later, budget), later);
+        waits.end(later);
+        // The next frame: waits one after the other add up.
+        let next = start + ms(2000);
+        assert_eq!(waits.begin(8, next, budget), next + budget);
+        waits.end(next + ms(300));
+        let again = next + ms(1000);
+        assert_eq!(waits.begin(8, again, budget), again + ms(200));
+        // A frame that begins while a wait is under way has its budget
+        // from then on; the wait under way keeps its own end.
+        let third = again + ms(100);
+        assert_eq!(waits.begin(9, third, budget), third + budget);
+        waits.end(again + ms(200));
+        waits.end(third + budget);
+        // Counted once, however many threads waited: 500 ms of frame 7,
+        // 300 + 100 of frame 8 and 500 of frame 9.
+        assert_eq!(waits.take(third + budget), ms(1400));
+        assert_eq!(waits.take(third + budget), Duration::ZERO);
+        // Taken while a wait is under way: counted up to then, the rest
+        // at its end, and the wait's end stays where it was.
+        let fourth = third + ms(5000);
+        let end = waits.begin(10, fourth, budget);
+        assert_eq!(waits.take(fourth + ms(120)), ms(120));
+        assert_eq!(waits.begin(10, fourth + ms(200), budget), end);
+        waits.end(end);
+        waits.end(end);
+        assert_eq!(waits.take(end), ms(380));
+    }
+
+    /// Recording threads that wait for pipelines never made, each beginning
+    /// while the one before still waits: the last, which begins near the
+    /// end of the first's wait, returns with it (it took a whole budget
+    /// from its own start: the frame waited for nearly two).
+    #[test]
+    fn a_thread_that_waits_while_another_does_gets_no_budget_of_its_own() {
+        static WAITS: Waits = Waits::new();
+        let budget = Duration::from_millis(800);
+        let started = Instant::now();
+        let threads: Vec<_> = (0..4u32)
+            .map(|n| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(budget * n / 4);
+                    let p = Pending::new(Vec::new(), None);
+                    let began = Instant::now();
+                    wait_within(&WAITS, budget, &p, 3);
+                    (began.duration_since(started), began.elapsed())
+                })
+            })
+            .collect();
+        let waits: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        eprintln!("staggered waits on an 800 ms budget, (began, waited): {waits:?}");
+        // Every wait is over a budget after the first of them began (or
+        // at once, if it began later than that on a busy machine): the
+        // last, 600 ms in, has 200 ms left to it and not 800.
+        let first = waits.iter().map(|w| w.0).min().unwrap();
+        let slack = Duration::from_millis(250);
+        for (began, waited) in &waits {
+            let over = (*began).max(first + budget) + slack;
+            assert!(*began + *waited <= over, "{waits:?}");
+        }
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

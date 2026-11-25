@@ -253,6 +253,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Milliseconds in which a recording thread waited for a host pipeline
+/// since the last call (see [`make::take_waited_ms`]).
+#[cfg(windows)]
+pub(crate) fn take_waited_ms() -> f64 {
+    make::take_waited_ms()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
