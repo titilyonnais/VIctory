@@ -547,8 +547,21 @@ impl Tracked {
         saved.bytes.clear();
     }
 
+    /// Saves a marked submission's host bytes for a page the title had
+    /// already changed. A title-side snapshot, if one exists, takes precedence.
+    pub(crate) fn save_host(&self, page: usize, bytes: Box<[u8]>) {
+        self.changed
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes
+            .entry(page)
+            .or_insert(bytes);
+    }
+
     /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed).
+    /// since it was taken, if it was armed then (and so changed), or the host
+    /// baseline saved for a page already changed by an earlier submission.
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
