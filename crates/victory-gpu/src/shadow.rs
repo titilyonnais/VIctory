@@ -429,67 +429,48 @@ impl Shadow {
         written
     }
 
-    /// After a submission whose shaders marked the 64 KiB title page at
-    /// `page` as written through views of this copy: the bytes they changed
-    /// go into title memory, and the copy takes the title's others. What
-    /// they changed is what differs from the copy's bytes before the
-    /// submission: title memory where the title has not written the page
-    /// since the copy took it, else what the page held when the title first
-    /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// Prepares `page` of this copy to write back what shaders marked as
+    /// written through its views: unarms the page, skips unarmed pages the
+    /// title already wrote, and snapshots the baseline `[from, to)` (`saved`
+    /// where armed and written by the title, else title memory now) before any
+    /// `watch::writing` opens shared pages.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
+    fn prepare_marked(&self, page: usize) -> Option<MarkedSlice<'_>> {
+        let t = self.tracked.as_ref()?;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
-            return 0;
+            return None;
         }
-        // Our own write below must not save the page for this copy again.
+        // Our own writes below must not save the page for this copy again.
         t.unarm(page / PAGE);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
+            return None;
         }
         let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
+        let (before, was_saved) = match saved {
+            Some(page_bytes) => (page_bytes[from - page..to - page].to_vec(), true),
+            None => {
+                let mut title = vec![0u8; n];
+                if !crate::host::read_into(from as *const u8, &mut title) {
+                    return None;
                 }
-                changed.then_some(title.as_ptr())
+                (title, false)
             }
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-        }
-        written.map_or(0, |_| n)
+        Some(MarkedSlice {
+            copy: self,
+            page,
+            from,
+            to,
+            before,
+            was_saved,
+        })
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -843,8 +824,49 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+struct MarkedSlice<'a> {
+    copy: &'a Shadow,
+    page: usize,
+    from: usize,
+    to: usize,
+    before: Vec<u8>,
+    was_saved: bool,
+}
+
+impl MarkedSlice<'_> {
+    /// Merges shaders' changes against `before` into title memory and keeps
+    /// the host slice equal to title memory; returns `(bytes_written, wrote)`.
+    fn commit(&self) -> Option<(usize, bool)> {
+        let n = self.to - self.from;
+        let start = self.copy.start as usize;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host =
+            unsafe { std::slice::from_raw_parts_mut(self.copy.data.add(self.from - start), n) };
+        if !self.was_saved && *host == self.before[..] {
+            return Some((0, false));
+        }
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into(self.from as *const u8, &mut title) {
+            return None;
+        }
+        let mut changed = false;
+        for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(&self.before) {
+            if *h != *b && *t != *h {
+                *t = *h;
+                changed = true;
+            }
+            *h = *t;
+        }
+        if changed {
+            let _writing = crate::watch::writing(self.from, n);
+            crate::host::write_mapped(self.from as *mut u8, title.as_ptr(), n);
+        }
+        Some((if changed { n } else { 0 }, changed))
+    }
+}
+
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
+/// views goes back, but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
@@ -899,23 +921,58 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
-    for (copy, page) in pages {
-        if withheld
+        marked
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
-        #[cfg(feature = "diagnostics")]
-        {
+            .filter_map(|&n| page_of(&m, n))
+            .filter(|(copy, page)| {
+                !withheld
+                    .iter()
+                    .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && *page < a + n)
+            })
+            .collect()
+    };
+    // Prepare all slices before any `watch::writing` opens shared pages.
+    let prepared: Vec<MarkedSlice<'_>> = pages
+        .iter()
+        .filter_map(|(copy, page)| {
+            #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+            copy.prepare_marked(*page)
+        })
+        .collect();
+    let mut results = Vec::with_capacity(prepared.len());
+    for entry in &prepared {
+        let res = entry.commit();
+        if let Some((written, _)) = res {
+            #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = written;
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
+        results.push(res);
+    }
+    // After all `Writing` guards have dropped, re-take every synced slice's
+    // page (even sub-page copies cover their entire tracked slice in `page`),
+    // unless a later write in this batch overlapped its bytes.
+    for (i, entry) in prepared.iter().enumerate() {
+        let Some((_, wrote_self)) = results[i] else {
+            continue;
+        };
+        let wrote_on_page = wrote_self
+            || prepared
+                .iter()
+                .zip(&results)
+                .any(|(other, res)| other.page == entry.page && res.is_some_and(|(_, w)| w));
+        let overlapped_later = prepared[i + 1..]
+            .iter()
+            .zip(&results[i + 1..])
+            .any(|(l, res)| res.is_some_and(|(_, w)| w) && l.from < entry.to && entry.from < l.to);
+        if (entry.was_saved || wrote_on_page)
+            && !overlapped_later
+            && let Some(t) = &entry.copy.tracked
+        {
+            t.taken(&[entry.page / PAGE]);
+        }
     }
 }
 
@@ -1553,6 +1610,93 @@ pub(crate) mod tests {
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn shared_page_marked_copies_do_not_drop_or_dirty_each_other() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, 4096);
+        register(p + 4096, (p + 4096) as u64, 4096);
+        let (Some(copy_a), Some(copy_b), Some(b)) = (
+            find(p as u64, 4096),
+            find((p + 4096) as u64, 4096),
+            bitmap(false),
+        ) else {
+            unregister(p, p as u64);
+            unregister(p + 4096, (p + 4096) as u64);
+            return;
+        };
+        let base_a = copy_a.marks.expect("tracked A gets mark bits");
+        let base_b = copy_b.marks.expect("tracked B gets mark bits");
+        copy_a.update(p, 4096);
+        copy_b.update(p + 4096, 4096);
+
+        // Both sub-page copies are written via unmarked-range heap UAVs (not armed).
+        copy_a.write_host((p + 10) as u64, &[0xaa]);
+        copy_b.write_host((p + 4096 + 20) as u64, &[0xbb]);
+        let bits = b.data as *mut u32;
+        for n in [base_a as usize, base_b as usize] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], false);
+
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(read(10), 0xaa, "copy A GPU write kept");
+        assert_eq!(read(4096 + 20), 0xbb, "copy B GPU write not dropped");
+        assert_eq!(copy_a.update(p, 4096), 0, "copy A stays taken and guarded");
+        assert_eq!(
+            copy_b.update(p + 4096, 4096),
+            0,
+            "copy B stays taken and guarded"
+        );
+
+        // Page remains guarded: title CPU write + armed marked GPU write merge cleanly.
+        copy_a.writing(p, 4096, true);
+        copy_a.write_host((p + 30) as u64, &[0xcc]);
+        // SAFETY: byte inside our guarded pool.
+        unsafe { ((p + 40) as *mut u8).write_volatile(0x11) };
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base_a as usize / 32) |= 1 << (base_a as usize % 32) };
+        copy_back_marks(&[], false);
+        assert_eq!((read(30), read(40)), (0xcc, 0x11));
+
+        unregister(p, p as u64);
+        unregister(p + 4096, (p + 4096) as u64);
+    }
+
+    #[test]
+    fn subpage_marked_copy_retakes_its_page_across_rounds() {
+        let p = crate::watch::tests::pool(1);
+        let addr = p + 4096;
+        register(addr, addr as u64, 8192);
+        let (Some(copy), Some(b)) = (find(addr as u64, 8192), bitmap(false)) else {
+            unregister(addr, addr as u64);
+            return;
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(addr, 8192);
+
+        // Round 1: marked GPU write on sub-64-KiB copy must re-take its page.
+        copy.write_host((addr + 10) as u64, &[0xaa]);
+        let bits = b.data as *mut u32;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+
+        // Round 2: refresh only a sub-slice `[addr + 4096, addr + 8192)` then
+        // write `[addr + 20]` via marked UAV (unarmed).
+        assert_eq!(copy.update(addr + 4096, 4096), 0);
+        copy.write_host((addr + 20) as u64, &[0xbb]);
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((addr + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(20)), (0xaa, 0xbb));
+        unregister(addr, addr as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
