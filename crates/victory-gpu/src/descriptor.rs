@@ -196,18 +196,44 @@ pub(crate) fn sync_heaps() {
 /// `host::HostHeap::mirror`) is made, so it reads from the next list on;
 /// the bitmap is cleared. With `VICTORY_HEAP_USAGE=0` (or no such heap) the
 /// marks are ignored.
+///
+/// Bitmaps are pooled: one made per list was never given back fast enough
+/// (hundreds of lists a frame, 256 KiB each), and the run ran out of memory
+/// within minutes. A bitmap goes back to the pool once its list ran and its
+/// marks were read, which clears it.
 #[cfg(windows)]
 pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
+    type Pooled = (windows::Win32::Graphics::Direct3D12::ID3D12Resource, usize);
+    static POOL: std::sync::Mutex<Vec<Pooled>> = std::sync::Mutex::new(Vec::new());
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
-    crate::host::name(&bitmap, || "heap slots read".into());
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+    let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let (bitmap, data) = match pooled {
+        Some((bitmap, data)) => (bitmap, data as *mut u8),
+        None => {
+            let (bitmap, data) =
+                crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
+            crate::host::name(&bitmap, || "heap slots read".into());
+            // SAFETY: our mapped buffer of at least `words` dwords.
+            unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+            (bitmap, data)
+        }
+    };
     // SAFETY: a live buffer.
     let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
     let data = data as usize;
+    let back = bitmap.clone();
     list.defer_after(move || {
+        // Cleared below as its marks are read: back to the pool after.
+        let _give_back = GiveBack(Some((back.clone(), data)));
+        struct GiveBack(Option<Pooled>);
+        impl Drop for GiveBack {
+            fn drop(&mut self) {
+                if let Some(b) = self.0.take() {
+                    POOL.lock().unwrap_or_else(|e| e.into_inner()).push(b);
+                }
+            }
+        }
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let on = heap_usage_on() && heap != 0;
