@@ -28,6 +28,27 @@
 //! for minutes, while each title frame could wait out its 500 ms for
 //! them (`make`). Stores and serialising keep the lock: the size asked for
 //! must still be right when the bytes are written.
+//!
+//! The library's file is mapped, not read into memory ([`Blob`];
+//! Marvisak/VIctory#2129): the host reads the bytes it was made from for as
+//! long as it lives, and read into a buffer they were the process's own
+//! memory for the whole run (1,352 MB in a world run on
+//! fxceless/victory-fork). Mapped, the pages are the file's: only those the
+//! host reads are in memory, and the system can drop them without writing
+//! them anywhere. A save serialises the new library straight into a
+//! mapping of its staging file, not into a second buffer as big.
+//!
+//! The mapped file's handle stays open for as long as the mapping lives. A
+//! save renames the new library over the file this run has mapped, and with
+//! the handle closed Windows gives up the old file's contents: pages of the
+//! mapping not in memory at that moment read as zeros from then on, which
+//! the host reads as stored pipelines (device removals right after a save,
+//! on the fork). With the handle open they keep reading the old file
+//! (`a_replaced_library_file_still_reads_from_the_disk`). A save goes to
+//! [`NEXT_FILE`] first and from there over the library: where a system
+//! refuses to replace a mapped file, the new library waits there and takes
+//! its place at the next start.
+//! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -50,10 +71,161 @@ pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the library's file is mapped ([`Blob`]) and saved through a
+/// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
+fn mapped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_none_or(|v| v != "0"))
+}
+
+/// A whole file mapped into memory: read-only (the library's file) or
+/// writable (the file a save fills). Unmapped when dropped.
+struct Mapped {
+    at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+    /// The file, for a mapping made by [`Mapped::open`]: open until after
+    /// the view is unmapped (fields drop after `drop`), so that a file a
+    /// rename took the name from keeps its contents for the view (see the
+    /// module's notes).
+    _file: Option<std::fs::File>,
+}
+
+// SAFETY: a view of a file, read (or, for a save's, written) by one holder.
+unsafe impl Send for Mapped {}
+
+impl Mapped {
+    /// Maps `file` (`len` bytes, not zero) for reading, or for reading and
+    /// writing.
+    fn map(file: &std::fs::File, len: usize, write: bool) -> Option<Mapped> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE,
+        };
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: a file we hold open; the view keeps the mapping alive
+        // after its handle is closed.
+        let at = unsafe {
+            let mapping = CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                if write { PAGE_READWRITE } else { PAGE_READONLY },
+                0,
+                0,
+                std::ptr::null(),
+            );
+            if mapping.is_null() {
+                return None;
+            }
+            let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ };
+            let at = MapViewOfFile(mapping, access, 0, 0, 0);
+            CloseHandle(mapping);
+            at
+        };
+        (!at.Value.is_null()).then_some(Mapped { at, len, _file: None })
+    }
+
+    /// The file at `path`, mapped for reading and held open; `None` if it is
+    /// not there, is empty or cannot be mapped.
+    fn open(path: &std::path::Path) -> Option<Mapped> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Others may read it, and rename or delete it (a save renames the
+        // new library over it), but not write it: a write in place would
+        // change the bytes under the host while it reads them. Opening it
+        // to write or truncate fails with a sharing violation meanwhile.
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_DELETE: u32 = 4;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let mut mapped = Mapped::map(&file, len, false)?;
+        mapped._file = Some(file);
+        Some(mapped)
+    }
+
+    /// A new file of `len` bytes at `path` (replacing what is there),
+    /// mapped for writing.
+    fn create(path: &std::path::Path, len: usize) -> Option<Mapped> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        file.set_len(len as u64).ok()?;
+        Mapped::map(&file, len, true)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the view holds `len` readable bytes until dropped.
+        unsafe { std::slice::from_raw_parts(self.at.Value.cast(), self.len) }
+    }
+
+    /// Only for a view made by [`Mapped::create`].
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: a writable view of `len` bytes, ours alone.
+        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: our view.
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.at) };
+    }
+}
+
+/// The bytes a library is made from: the host reads them for as long as
+/// the library lives, so they are kept beside it.
+enum Blob {
+    /// No file (an empty library).
+    None,
+    /// The file read into memory (`VICTORY_LIBRARY_MAP=0`, or a file that
+    /// could not be mapped).
+    Held(Vec<u8>),
+    /// The file itself, mapped.
+    Mapped(Mapped),
+}
+
+impl Blob {
+    /// The library file in `dir`: a library a save left beside it
+    /// ([`NEXT_FILE`]) takes its place first.
+    fn of(dir: &std::path::Path) -> Blob {
+        let path = dir.join(LIBRARY_FILE);
+        let next = dir.join(NEXT_FILE);
+        if next.exists() && std::fs::rename(&next, &path).is_err() {
+            tracing::warn!("the host pipeline library saved last could not take the old one's place");
+        }
+        if mapped()
+            && let Some(file) = Mapped::open(&path)
+        {
+            return Blob::Mapped(file);
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
+            _ => Blob::None,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Blob::None => &[],
+            Blob::Held(bytes) => bytes,
+            Blob::Mapped(file) => file.bytes(),
+        }
+    }
+}
+
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    _blob: Blob,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -112,6 +284,12 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library saved last, while it has not yet replaced [`LIBRARY_FILE`]:
+/// every save is renamed here first, then over the library
+/// ([`replace_library`]). Where the second rename is refused (a system that
+/// refuses to replace a mapped file), the next start renames it over the
+/// library first ([`Blob::of`]).
+const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
@@ -123,14 +301,13 @@ fn library() -> Option<&'static Mutex<Library>> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
+            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
+                && !l._blob.bytes().is_empty()
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, &tag(l._blob.bytes()));
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -142,19 +319,20 @@ fn library() -> Option<&'static Mutex<Library>> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    if !blob.is_empty() {
+    if !blob.bytes().is_empty() {
         let started = std::time::Instant::now();
-        match make(&blob) {
+        match make(blob.bytes()) {
             Ok(library) => {
                 let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(bytes = blob.len(), ms, "host pipeline library loaded");
+                let (bytes, mapped) = (blob.bytes().len(), matches!(blob, Blob::Mapped(_)));
+                tracing::info!(bytes, mapped, ms, "host pipeline library loaded");
                 return Some(Library {
                     library,
                     _blob: blob,
@@ -168,10 +346,13 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
+    // The rejected bytes are let go (a mapped file is unmapped) before the
+    // empty library is made: nothing reads them any more.
+    drop(blob);
     let library = make(&[]).ok()?;
     Some(Library {
         library,
-        _blob: Vec::new(),
+        _blob: Blob::None,
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -302,24 +483,35 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline library not saved");
+        return;
+    }
+    let (staged, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
+        // SAFETY: a plain query.
+        let size = unsafe { l.library.GetSerializedSize() };
+        // The pre-build's list is kept beside the bytes it holds for (also
+        // when a run adds pipelines): hashed while they are at hand.
+        let want_tag = !l.prebuilt.is_empty();
+        let mut hashed = None;
+        let serialize = |out: &mut [u8]| {
+            // SAFETY: bytes of the size the library asks for, under its lock.
+            unsafe { l.library.Serialize(out) }?;
+            if want_tag {
+                hashed = Some(tag(out));
+            }
+            Ok(())
         };
-        match bytes {
-            Ok(bytes) => {
+        match stage_library(dir, size, serialize) {
+            Ok(staged) => {
                 l.added = 0;
                 l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                let prebuilt = hashed.map(|tag| list(&tag, &l.prebuilt));
+                (staged, prebuilt)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -328,8 +520,9 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+    let bytes = staged.len();
+    let written = staged
+        .publish(dir)
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -339,7 +532,7 @@ pub(crate) fn save(now: bool) {
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -358,20 +551,125 @@ pub(crate) fn save(now: bool) {
 /// `path`: a reader never sees a part. Serialised so concurrent worker and
 /// shutdown saves do not race on the same staging file or target rename.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::AtomicU64;
-    static WRITING: Mutex<()> = Mutex::new(());
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp-{}-{n}", std::process::id()));
-    let tmp = path.with_file_name(name);
+    let tmp = staging(path);
     let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
 }
+
+/// Held while files are renamed into place ([`write_atomically`],
+/// [`Staged::publish`]).
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// A temporary file beside `path`, of a name no other write uses.
+fn staging(path: &std::path::Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    path.with_file_name(name)
+}
+/// A serialised library on its way to the library's place.
+enum Staged {
+    /// Written through a mapping into this staging file, of these bytes.
+    File(PathBuf, usize),
+    /// In a buffer, to write out (`VICTORY_LIBRARY_MAP=0`, or a staging
+    /// file that could not be mapped).
+    Bytes(Vec<u8>),
+}
+
+impl Staged {
+    fn len(&self) -> usize {
+        match self {
+            Staged::File(_, n) => *n,
+            Staged::Bytes(bytes) => bytes.len(),
+        }
+    }
+
+    /// Puts the library in its place in `dir` ([`replace_library`]); no
+    /// staging file is left if that fails.
+    fn publish(self, dir: &std::path::Path) -> std::io::Result<()> {
+        let tmp = match self {
+            Staged::File(tmp, _) => tmp,
+            Staged::Bytes(bytes) => {
+                let tmp = staging(&dir.join(LIBRARY_FILE));
+                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                tmp
+            }
+        };
+        let res = {
+            let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+            replace_library(dir, &tmp)
+        };
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    }
+}
+
+/// The library's `size` serialised bytes (`serialize` fills them): written
+/// through a mapping of a staging file in `dir` where it can (the bytes are
+/// then the file's pages, not more of the process's own memory), else in a
+/// buffer. Called with the library's lock held: the size asked for must
+/// still be right when the bytes are written.
+fn stage_library(
+    dir: &std::path::Path,
+    size: usize,
+    serialize: impl FnOnce(&mut [u8]) -> windows::core::Result<()>,
+) -> std::io::Result<Staged> {
+    let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
+    if mapped() {
+        let tmp = staging(&dir.join(LIBRARY_FILE));
+        if let Some(mut file) = Mapped::create(&tmp, size) {
+            let written = serialize(file.bytes_mut()).map_err(failed);
+            drop(file);
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            return Ok(Staged::File(tmp, size));
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let mut bytes = zeroed(size)?;
+    serialize(&mut bytes).map_err(failed)?;
+    Ok(Staged::Bytes(bytes))
+}
+
+/// `n` zero bytes, asked for fallibly: a library is gigabytes, and a host
+/// without the memory leaves the save for later instead of aborting.
+#[allow(clippy::slow_vector_initialization)] // `vec!` would abort instead.
+fn zeroed(n: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(n)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+    bytes.resize(n, 0);
+    Ok(bytes)
+}
+
+/// Puts the written library `tmp` in the library's place in `dir`: renamed
+/// over [`NEXT_FILE`], then from there over the library's file, as a start
+/// does ([`Blob::of`]). So a pending file is always the newest library
+/// saved. This run may have the library's file mapped: Windows replaces a
+/// mapped file it opened for sharing, and the mapping goes on reading the
+/// old one (its handle is held). Where a system refuses, the new library
+/// waits as [`NEXT_FILE`] for the next start.
+fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
+    let next = dir.join(NEXT_FILE);
+    std::fs::rename(tmp, &next)?;
+    // Saved either way: if refused, the next start takes it.
+    let _ = std::fs::rename(&next, dir.join(LIBRARY_FILE));
+    Ok(())
+}
+
 
 /// Title pipelines created, and their distinct keys.
 static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
@@ -648,10 +946,10 @@ mod tests {
                 }
             }
         }
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, Blob::None).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
         (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
+        let again = open(&device, Blob::Held(made.serialized())).expect("the library again");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
@@ -682,11 +980,248 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
-        assert!(library._blob.is_empty());
+        assert!(matches!(library._blob, Blob::None));
     }
+
+    /// A library made from its mapped file keeps the mapping (and the
+    /// file) for as long as it lives, and a save replacing the file while
+    /// it lives leaves it reading the old one.
+    #[test]
+    fn a_library_keeps_its_mapped_file_open() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        if !mapped() {
+            return; // `VICTORY_LIBRARY_MAP=0`
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let empty = open(&device, Blob::None).expect("an empty library");
+        // SAFETY: a buffer of the size the library asks for.
+        let bytes = unsafe {
+            let mut bytes = vec![0u8; empty.library.GetSerializedSize()];
+            empty.library.Serialize(&mut bytes).map(|()| bytes)
+        }
+        .unwrap();
+        std::fs::write(dir.path().join(LIBRARY_FILE), &bytes).unwrap();
+        let blob = Blob::of(dir.path());
+        assert!(matches!(blob, Blob::Mapped(_)), "mapped by default");
+        let library = open(&device, blob).expect("the library");
+        let Blob::Mapped(mapped) = &library._blob else {
+            panic!("the library holds its mapped file");
+        };
+        assert!(mapped._file.is_some(), "the file stays open while the library lives");
+        assert_eq!(mapped.bytes(), &bytes[..]);
+        let staged = stage_library(dir.path(), 4096, |out| {
+            out.fill(9);
+            Ok(())
+        })
+        .unwrap();
+        staged.publish(dir.path()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), [9u8; 4096]);
+        assert_eq!(mapped.bytes(), &bytes[..], "the mapping still reads the old library");
+    }
+
+    /// A mapped file reads as the file's bytes, a save writes the library
+    /// through a mapping of a staging file and renames it over the mapped
+    /// one, the mapping still reads the old library, and the next start
+    /// reads the new one.
+    #[test]
+    fn the_library_file_is_mapped_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
+        std::fs::write(&path, b"").unwrap();
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
+        let old: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &old).unwrap();
+        let blob = Blob::of(dir.path());
+        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        assert_eq!(blob.bytes(), &old[..]);
+        // A save while the old file is mapped.
+        let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+        let staged = stage_library(dir.path(), new.len(), |out| {
+            out.copy_from_slice(&new);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(staged, Staged::File(..)) || !mapped(), "written through a mapping");
+        staged.publish(dir.path()).unwrap();
+        // The mapping still reads the old library; no staging file is left.
+        assert_eq!(blob.bytes(), &old[..]);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from(LIBRARY_FILE)], "{left:?}");
+        drop(blob);
+        // The next start reads the new one.
+        assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
+        assert!(!dir.path().join(NEXT_FILE).exists());
+        // A serialisation that fails leaves the library as it was.
+        let refused = stage_library(dir.path(), 64, |_| Err(windows::core::Error::from_hresult(windows::core::HRESULT(-1))));
+        assert!(refused.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), new);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no staging file left");
+    }
+
+    /// A save that cannot replace the library's file waits as the pending
+    /// file, which the next start puts in the library's place.
+    #[test]
+    fn a_library_that_cannot_replace_the_old_one_waits_for_the_next_start() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, next) = (dir.path().join(LIBRARY_FILE), dir.path().join(NEXT_FILE));
+        let save = |byte: u8| {
+            stage_library(dir.path(), 4096, |out| {
+                out.fill(byte);
+                Ok(())
+            })
+            .and_then(|staged| staged.publish(dir.path()))
+        };
+        save(1).unwrap();
+        // Opened without delete sharing, a file cannot be renamed over.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        save(2).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), [2u8; 4096], "waits as the pending file");
+        drop(held);
+        assert_eq!(Blob::of(dir.path()).bytes(), [2u8; 4096]);
+        assert!(!next.exists());
+    }
+
+    /// A save buffer the host cannot give is an error, not an abort.
+    #[test]
+    fn a_save_buffer_the_host_cannot_give_is_an_error() {
+        let refused = zeroed(usize::MAX / 2).expect_err("no such memory");
+        assert_eq!(refused.kind(), std::io::ErrorKind::OutOfMemory);
+        assert_eq!(zeroed(100).unwrap(), [0u8; 100]);
+    }
+
+    /// The bytes at `at` of the pattern the test below writes.
+    fn pattern(at: usize, out: &mut [u8]) {
+        for (i, word) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = ((at / 4 + i) as u32).wrapping_mul(2_654_435_761).wrapping_add(1);
+            *word = v.to_le_bytes();
+        }
+    }
+
+    /// A file of `len` bytes (whole MiB) of [`pattern`], written past the
+    /// system's cache: none of its pages is in memory afterwards. False
+    /// where the folder's file system does not take such writes.
+    fn write_uncached(path: &std::path::Path, len: usize) -> bool {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
+        const UNCACHED: u32 = 0x2000_0000 | 0x8000_0000;
+        const CHUNK: usize = 1 << 20;
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(UNCACHED)
+            .open(path)
+        else {
+            return false;
+        };
+        // Such writes want a buffer on a sector boundary.
+        let mut store = vec![0u8; CHUNK + 4096];
+        let start = store.as_ptr().align_offset(4096);
+        for at in (0..len).step_by(CHUNK) {
+            let chunk = &mut store[start..start + CHUNK];
+            pattern(at, chunk);
+            if file.write_all(chunk).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The library's file is replaced by a save while it is mapped, and
+    /// pages of the mapping that were not in memory then are read after:
+    /// with the file's handle held they still read as the old file (closed,
+    /// they read as zeros, which the host would take for pipelines and
+    /// remove the device).
+    #[test]
+    fn a_replaced_library_file_still_reads_from_the_disk() {
+        const LEN: usize = 8 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        assert!(write_uncached(&path, LEN), "uncached writes in the temporary folder");
+        let mapped = Mapped::open(&path).expect("the file, mapped");
+        // A save: the new library, renamed over the mapped one.
+        stage_library(dir.path(), LEN, |out| {
+            out.fill(0xEE);
+            Ok(())
+        })
+        .and_then(|staged| staged.publish(dir.path()))
+        .unwrap();
+        assert!(!dir.path().join(NEXT_FILE).exists(), "replaced in place");
+        // Every page of the old mapping, read for the first time now.
+        let mut expected = vec![0u8; 4096];
+        for (page, bytes) in mapped.bytes().chunks(4096).enumerate() {
+            pattern(page * 4096, &mut expected);
+            assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
+        }
+    }
+
+    /// While the library's file is mapped, no one may write it in place or
+    /// truncate it (the bytes would change under the host); reading it,
+    /// and a save renaming a new library over it, still work.
+    #[test]
+    fn a_mapped_library_file_cannot_be_written_meanwhile() {
+        const SHARING_VIOLATION: i32 = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let old = vec![0x5Au8; 3 * 4096];
+        std::fs::write(&path, &old).unwrap();
+        let mapped = Mapped::open(&path).expect("the file, mapped");
+        let write = std::fs::OpenOptions::new().write(true).open(&path);
+        assert_eq!(write.err().and_then(|e| e.raw_os_error()), Some(SHARING_VIOLATION), "written in place");
+        let truncate = std::fs::OpenOptions::new().write(true).truncate(true).open(&path);
+        assert_eq!(truncate.err().and_then(|e| e.raw_os_error()), Some(SHARING_VIOLATION), "truncated");
+        assert_eq!(std::fs::read(&path).unwrap(), old, "others still read it");
+        stage_library(dir.path(), 4096, |out| {
+            out.fill(1);
+            Ok(())
+        })
+        .and_then(|staged| staged.publish(dir.path()))
+        .unwrap();
+        assert!(!dir.path().join(NEXT_FILE).exists(), "replaced in place");
+        assert_eq!(std::fs::read(&path).unwrap(), [1u8; 4096]);
+        assert_eq!(mapped.bytes(), &old[..]);
+    }
+
+    /// The process's own memory a library file costs: read into memory and
+    /// mapped (every page read once).
+    /// `cargo test --release -p victory-gpu --lib library_file_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn library_file_memory() {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        fn private() -> f64 {
+            let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+            // SAFETY: a plain query into our own counters.
+            unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), size_of_val(&c) as u32) };
+            c.PrivateUsage as f64 / f64::from(1u32 << 20)
+        }
+        const LEN: usize = 256 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, vec![7u8; LEN]).unwrap();
+        let sum = |b: &[u8]| b.iter().step_by(4096).map(|&x| u64::from(x)).sum::<u64>();
+        let before = private();
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(sum(&read), 7 * (LEN / 4096) as u64);
+        let held = private() - before;
+        drop(read);
+        let before = private();
+        let mapped = Mapped::open(&path).unwrap();
+        assert_eq!(sum(mapped.bytes()), 7 * (LEN / 4096) as u64);
+        let mapped_cost = private() - before;
+        drop(mapped);
+        eprintln!("256 MiB library file: {held:.1} MiB private read into memory, {mapped_cost:.1} MiB mapped");
+    }
+
 
     #[test]
     fn concurrent_write_atomically_never_fails_or_truncates() {
