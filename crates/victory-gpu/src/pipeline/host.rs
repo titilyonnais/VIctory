@@ -262,6 +262,9 @@ pub(crate) struct Stage {
     /// written-pages bitmap (`crate::memory`), if it reads or writes there.
     pub(crate) memory: Option<u32>,
     pub(crate) memory_dirty: Option<u32>,
+    /// Our root parameter of the heap-usage bitmap
+    /// (`crate::descriptor::usage_bitmap`), if it marks heap slots.
+    pub(crate) heap_used: Option<u32>,
     /// Our root parameter of the heap's view addresses (`crate::memory`).
     pub(crate) view_addresses: Option<u32>,
 }
@@ -414,6 +417,7 @@ impl HostPipeline {
                 root_uavs: Vec::new(),
                 memory: None,
                 memory_dirty: None,
+                heap_used: None,
                 view_addresses: None,
             };
             let dwords = t.user_data_dwords();
@@ -467,6 +471,7 @@ impl HostPipeline {
                 (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
                 (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
                 (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+                (t.heap_usage, D3D12_ROOT_PARAMETER_TYPE_UAV, 1, &mut stage.heap_used),
             ] {
                 if used {
                     *out = Some(params.len() as u32);

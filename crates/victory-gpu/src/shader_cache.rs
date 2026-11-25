@@ -205,6 +205,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_uavs,
         memory,
         memory_writes,
+        heap_usage,
         view_addresses,
         heap,
         heap_writes,
@@ -256,7 +257,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*heap_usage) << 5,
     );
     out
 }
@@ -330,6 +332,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_uavs,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
+        heap_usage: memory & 32 != 0,
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
@@ -362,6 +365,7 @@ mod tests {
             root_uavs: vec![4],
             memory: true,
             memory_writes: true,
+            heap_usage: true,
             view_addresses: true,
             heap: true,
             heap_writes: true,

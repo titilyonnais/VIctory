@@ -82,6 +82,9 @@ pub(crate) struct State {
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
+    /// The heap-usage bitmap made for this list and its view heap
+    /// (`crate::descriptor::usage_bitmap`).
+    heap_usage: Option<(usize, u64)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
@@ -738,6 +741,29 @@ impl State {
                         } else {
                             l.SetGraphicsRootUnorderedAccessView(param, dirty);
                         }
+                    }
+                }
+            }
+        }
+        for stage in &p.stages {
+            if let Some(param) = stage.heap_used {
+                let heap = self.heaps[0];
+                let gpu = match self.heap_usage {
+                    Some((h, gpu)) if h == heap => Some(gpu),
+                    _ => crate::descriptor::usage_bitmap(list, heap),
+                };
+                let Some(gpu) = gpu else {
+                    once!("a shader marking heap slots dropped: no usage bitmap");
+                    not_run("heap usage without a bitmap");
+                    return false;
+                };
+                self.heap_usage = Some((heap, gpu));
+                // SAFETY: an open list; the bitmap lives with the list.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
                     }
                 }
             }

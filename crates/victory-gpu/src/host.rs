@@ -2382,6 +2382,13 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
+            let (marked, made) = crate::descriptor::take_usage();
+            tracing::info!(
+                "heap usage: {marked} heap slots marked read by shaders, {made} placed-texture views made for them (last 5 s); not made: {:?}, no heap {}; placed textures that failed to make: {}",
+                crate::descriptor::host::PLACED_WHY.each_ref().map(|a| a.swap(0, Ordering::Relaxed)),
+                crate::descriptor::USAGE.2.swap(0, Ordering::Relaxed),
+                crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
+            );
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;

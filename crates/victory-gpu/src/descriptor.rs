@@ -189,6 +189,95 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Per list: the heap-usage bitmap shaders that take views from the view
+/// heap `heap` mark the slots they read in (`victory_shader::emit`,
+/// `HostShader::heap_usage`), as its host GPU address. After the list ran,
+/// each marked slot whose view the host left null (a placed texture, see
+/// `host::HostHeap::mirror`) is made, so it reads from the next list on;
+/// the bitmap is cleared. With `VICTORY_HEAP_USAGE=0` (or no such heap) the
+/// marks are ignored.
+#[cfg(windows)]
+pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
+    crate::host::name(&bitmap, || "heap slots read".into());
+    // SAFETY: our mapped buffer of at least `words` dwords.
+    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+    list.keep(&bitmap);
+    let data = data as usize;
+    list.defer_after(move || {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        let on = heap_usage_on() && heap != 0;
+        if heap == 0 {
+            USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut used = Vec::new();
+        for (w, mark) in marks.iter_mut().enumerate() {
+            if *mark == 0 {
+                continue;
+            }
+            let mut bits = std::mem::take(mark);
+            while on && bits != 0 {
+                used.push((w * 32) as u32 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
+        if used.is_empty() {
+            return;
+        }
+        let made = make_used(heap, &used);
+        USAGE.0.fetch_add(used.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        USAGE.1.fetch_add(made, std::sync::atomic::Ordering::Relaxed);
+    });
+    Some(gpu)
+}
+
+/// Heap slots marked read, and views made for them, since the last call.
+#[cfg(windows)]
+pub(crate) fn take_usage() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (USAGE.0.swap(0, Relaxed), USAGE.1.swap(0, Relaxed))
+}
+#[cfg(windows)]
+pub(crate) static USAGE: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+
+#[cfg(windows)]
+fn heap_usage_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+}
+
+/// Makes the views of slots `used` of the title view heap `heap` that the
+/// host left null for later (placed textures); how many it made.
+#[cfg(windows)]
+fn make_used(heap: usize, used: &[u32]) -> u64 {
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        USAGE.2.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    // SAFETY: registered heaps are live (removed when dropped).
+    let h = unsafe { &*(heap as *const Heap) };
+    let (Some(Some(host)), Some(step)) = (h.host.get(), increment(h.desc.kind)) else {
+        USAGE.2.fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    };
+    let step = u64::from(step);
+    let mut made = 0;
+    for &index in used {
+        if host.make_placed(index, h.start + u64::from(index) * step) {
+            made += 1;
+        }
+    }
+    drop(heaps);
+    made
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

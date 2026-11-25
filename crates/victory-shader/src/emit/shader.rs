@@ -99,6 +99,8 @@ pub(crate) struct Shader {
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
+    /// The heap-usage bitmap's handle, once a heap slot is marked.
+    pub heap_used: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
     pub flags: u64,
@@ -161,6 +163,7 @@ impl Shader {
             root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
+            heap_used: None,
             view_addresses: None,
             flags: 0,
             nonuniform_handles: 0,
@@ -399,6 +402,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the heap-usage bitmap (`u1` in [`MEMORY_SPACE`], a raw
+    /// buffer), made in the entry block.
+    pub fn heap_used_handle(&mut self) -> V {
+        if let Some(h) = self.heap_used {
+            return h;
+        }
+        let r = self.m.i32(1);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.heap_used = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -489,6 +517,7 @@ impl Shader {
             || !self.root_uavs.is_empty()
             || self.memory.is_some()
             || self.memory_dirty.is_some()
+            || self.heap_used.is_some()
             || self.view_addresses.is_some()
         {
             let empty = self.m.md_str("");
@@ -581,7 +610,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.heap_used.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -595,6 +624,7 @@ impl Shader {
                     .iter()
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
+                    .chain(self.heap_used.map(|_| (MEMORY_SPACE, 1)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
