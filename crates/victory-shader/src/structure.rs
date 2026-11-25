@@ -1109,9 +1109,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1125,6 +1129,31 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// Whether SCC value `scc` is clear wherever it is read: the instruction
+    /// before an `s_cbranch_execnz` that closes a loop wrote it as "the EXEC
+    /// it leaves is not empty" (`s_andn2_wrexec`, say), and the wave leaves
+    /// `do { .. } while (EXEC)` with EXEC empty. (From the victory-fork
+    /// tree, issue #1528: blend-shape skinning selects after such a loop.)
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        let exec = writer.write(Reg::S(EXEC));
+        let back = match block.exit {
+            Exit::Branch { taken, .. } => self.index[taken] <= self.index[b],
+            _ => false,
+        };
+        back && i + 2 == block.insts.len()
+            && exec.is_some()
+            && last.name() == "s_cbranch_execnz"
+            && last.read(Reg::S(EXEC)) == exec
+            && (!self.p.wave64 || last.read(Reg::S(EXEC + 1)) == writer.write(Reg::S(EXEC + 1)))
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
