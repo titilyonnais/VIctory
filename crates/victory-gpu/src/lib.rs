@@ -21,6 +21,8 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+#[cfg(windows)]
+mod copy_pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
@@ -70,6 +72,8 @@ mod texback;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod workers;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;

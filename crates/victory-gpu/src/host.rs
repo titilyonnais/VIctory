@@ -2532,19 +2532,30 @@ impl Batch {
             .any(|&(a, b)| a < at + len && at < b)
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Does the refreshes; returns the bytes copied. Their copies of pages
+    /// no shader writes are made together at the end, on several threads
+    /// ([`crate::copy_pool`]); the time per range counts only finding them.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let started = std::time::Instant::now();
+        let (total, pieces) = crate::copy_pool::queued(|| self.update_all());
+        crate::copy_pool::run(pieces);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        total
+    }
+
+    /// [`Batch::flush`]'s updates, one per copy.
+    fn update_all(&mut self) -> usize {
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = started;
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
             // Kept: the union with what was current if they touch, else
@@ -3659,8 +3670,121 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
-}
 
+    /// A world frame's refreshes, on a made-up heap shaped like the world's
+    /// (#400): 36 submissions, each after the title wrote 256 scattered
+    /// pages of a 174 MB tracked heap, each declaring 24 ranges of it (of
+    /// 64 views) as written by marking shaders, refreshed through `Batch`
+    /// as `Host::execute` does (ranges armed, then one flush). Times the
+    /// flushes with the copies on one thread and on the workers
+    /// (`crate::copy_pool`), and checks every title write reached the copy.
+    /// Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture world_frame_refreshes`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn world_frame_refreshes() {
+        use crate::watch::PAGE;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const HEAP: usize = 174 << 20;
+        const SUBMISSIONS: usize = 36;
+        const DECLARED: usize = 24;
+        const VIEWS: usize = 64;
+        const TITLE_PAGES: usize = 256;
+        const FRAMES: usize = 6;
+        let p = crate::watch::tests::pool(HEAP / PAGE);
+        crate::shadow::register(p, p as u64, HEAP as u64);
+        let Some(copy) = crate::shadow::find(p as u64, HEAP as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // Views of the heap: 256-byte aligned, 64 KiB to 32 MiB.
+        let views: Vec<(usize, usize)> = (0..VIEWS)
+            .map(|_| {
+                let len = (64 << 10) << next(10);
+                let at = next((HEAP - len) / 256) * 256;
+                (p + at, len)
+            })
+            .collect();
+        let mut batch = Batch::default();
+        batch.add(&copy, p, HEAP);
+        batch.flush();
+        let mut stamp = 1u64;
+        let mut frame = |serial: bool| -> (Duration, usize) {
+            crate::copy_pool::SERIAL.store(serial, Ordering::Relaxed);
+            let (mut took, mut copied) = (Duration::ZERO, 0);
+            for _ in 0..SUBMISSIONS {
+                let writes: Vec<usize> = (0..TITLE_PAGES)
+                    .map(|_| p + next(HEAP / PAGE) * PAGE + next(PAGE / 8) * 8)
+                    .collect();
+                for &at in &writes {
+                    // SAFETY: 8 aligned bytes of our pool.
+                    unsafe { (at as *mut u64).write_volatile(stamp) };
+                    stamp += 1;
+                }
+                let declared: Vec<(usize, usize)> =
+                    (0..DECLARED).map(|_| views[next(VIEWS)]).collect();
+                let mut batch = Batch::default();
+                for &(at, len) in &declared {
+                    batch.add(&copy, at, len);
+                    copy.writing(at, len, true);
+                }
+                let started = Instant::now();
+                copied += batch.flush();
+                took += started.elapsed();
+                // Every title write inside a declared range is in the copy.
+                for &at in &writes {
+                    if declared.iter().any(|&(a, n)| a <= at && at + 8 <= a + n) {
+                        // SAFETY: 8 aligned bytes of our pool.
+                        let title = unsafe { (at as *const u64).read_volatile() };
+                        let host = copy.read_host(at as u64, 2);
+                        assert_eq!(
+                            u64::from(host[0]) | u64::from(host[1]) << 32,
+                            title,
+                            "{at:#x}"
+                        );
+                    }
+                }
+                for &(at, len) in &declared {
+                    copy.copy_back(at, len, &[]);
+                }
+            }
+            (took, copied)
+        };
+        let mut report = |serial: bool| {
+            frame(serial);
+            let mut ms: Vec<f64> = (0..FRAMES)
+                .map(|_| {
+                    let (took, copied) = frame(serial);
+                    println!(
+                        "  {}: {:.1} ms, {} MB copied",
+                        if serial { "one thread" } else { "workers" },
+                        took.as_secs_f64() * 1e3,
+                        copied >> 20
+                    );
+                    took.as_secs_f64() * 1e3
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            ms[FRAMES / 2]
+        };
+        let serial = report(true);
+        let workers = report(false);
+        println!("refresh per frame, median: one thread {serial:.1} ms, workers {workers:.1} ms");
+        crate::copy_pool::SERIAL.store(false, Ordering::Relaxed);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}
 
 #[cfg(test)]
 mod withholding {

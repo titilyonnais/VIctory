@@ -557,26 +557,32 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 /// at most: the title's own threads need the rest), here when that is
 /// fewer than two.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    // On the host's persistent workers (`crate::workers`, shared with the
+    // refresh copies): a thread made per call lost its warm [`Scratch`]
+    // when it ended (#2786: 1.6 ms a batch, 0.06 on kept threads).
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
-    if threads < 2 {
-        (0..n).for_each(f);
+    crate::workers::run(threads, n, f);
+}
+
+/// Sorts `spans` and merges those that overlap or touch, dropping empty
+/// ones.
+fn merge_spans(spans: &mut Vec<(usize, usize)>) {
+    spans.retain(|&(a, b)| a < b);
+    if spans.len() <= 1 {
         return;
     }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
-                }
-            });
+    spans.sort_unstable();
+    let mut write = 0;
+    for read in 1..spans.len() {
+        let (a, b) = spans[read];
+        if a <= spans[write].1 {
+            spans[write].1 = spans[write].1.max(b);
+        } else {
+            write += 1;
+            spans[write] = (a, b);
         }
-    });
+    }
+    spans.truncate(write + 1);
 }
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
@@ -667,14 +673,13 @@ impl Staging {
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
-            let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
-                }
+            // Overlapping and adjacent spans merged: each byte is read once.
+            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&i| span(i)).collect();
+            merge_spans(&mut spans);
+            for (a, b) in spans {
+                // SAFETY: inside the buffer of the texture's size.
+                crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
+                bytes += b - a;
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
@@ -1026,6 +1031,33 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_spans_coalesces_overlapping_and_adjacent_intervals() {
+        let mut s = vec![(100, 200), (50, 50), (0, 64), (64, 100), (300, 400), (350, 380), (380, 450), (0, 64)];
+        merge_spans(&mut s);
+        assert_eq!(s, vec![(0, 200), (300, 450)]);
+        let mut empty = vec![(10, 10), (20, 10)];
+        merge_spans(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    /// The shared workers keep their scratch buffers from one call to the
+    /// next (#2786): a thread made per call faulted in a fresh one each time.
+    #[test]
+    fn in_parallel_reuses_the_workers_scratch() {
+        use std::collections::HashSet;
+        let first: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        let second: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        for set in [&first, &second] {
+            crate::workers::pool().run(4, 64, |_| {
+                let s = Scratch::take(64 * 1024);
+                set.lock().unwrap().insert(s.0.as_ptr() as usize);
+            });
+        }
+        let (first, second) = (first.into_inner().unwrap(), second.into_inner().unwrap());
+        assert!(second.iter().any(|p| first.contains(p)), "first {first:?}, second {second:?}");
+    }
 
     fn layout(w: u32, h: u32, mips: u32) -> victory_formats::texture::Layout {
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};

@@ -652,9 +652,25 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut sync_before = |a: usize, b: usize| {
-            let Some(before) = &mut before else { return };
-            let (a, b) = (a - start, b - start);
+        // Copies `[a, b)` (`copy`) or takes zeros written there, into the
+        // snapshot over it. A copy with no snapshot over it (none is kept
+        // where nothing is busy, nor for marked ranges) may be queued
+        // (`crate::copy_pool`): nothing reads those bytes before the flush
+        // makes it.
+        let mut sync_before = |a: usize, b: usize, copy: bool| -> usize {
+            let (ra, rb) = (a - start, b - start);
+            let covered = before.as_ref().is_some_and(|before| {
+                before
+                    .0
+                    .iter()
+                    .any(|(at, bytes)| *at < rb && ra < *at + bytes.len())
+            });
+            if copy && !covered {
+                return self.copy_queued(a, b);
+            }
+            let copied = if copy { self.copy(a, b) } else { 0 };
+            let Some(before) = &mut before else { return copied };
+            let (a, b) = (ra, rb);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
                 if s < e {
@@ -663,16 +679,16 @@ impl Shadow {
                     bytes[s - *at..e - *at].copy_from_slice(host);
                 }
             }
+            copied
         };
         let mut copied = 0;
         for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += sync_before(a, b, true);
         }
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
-            sync_before(a, b);
+            sync_before(a, b, false);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
@@ -680,8 +696,7 @@ impl Shadow {
         for (a, b) in t.untracked(from, to) {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += sync_before(a, b, true);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -703,13 +718,25 @@ impl Shadow {
     fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy_queued(from, to);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::WholeBytes, (to - from) as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
+        to - from
+    }
+
+    /// As [`Shadow::copy`], queued where the caller collects a
+    /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
+    /// nothing reads back before they are made.
+    fn copy_queued(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        crate::copy_pool::copy(at, from as *const u8, to - from);
         to - from
     }
 
