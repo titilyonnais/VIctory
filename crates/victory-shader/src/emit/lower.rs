@@ -6403,6 +6403,20 @@ impl<'a> Lower<'a> {
                 }
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A 64-bit source (a register pair) truncated to f32, as the
+                // host's `fptrunc`: MODE's 64-bit round mode is nearest even
+                // unless the title set toward zero, which has no DXIL form.
+                if self.mode16 == Some(3) {
+                    return Err("a 64-bit to 32-bit conversion toward zero");
+                }
+                self.s.flags |= flags::FLOAT64;
+                let x = self.src64(inst, 0)?;
+                let double = self.s.m.double();
+                let bits = self.s.m.cast(c, Cast::Bitcast, x, double);
+                let r = self.s.m.cast(c, Cast::FpTrunc, bits, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;

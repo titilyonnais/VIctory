@@ -2386,3 +2386,32 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+/// `v_cvt_f32_f64`: the pair v1:v2 read as binary64, truncated to f32 bits
+/// in v0 with MODE's default round mode (nearest even). The host does the
+/// conversion with `fptrunc`, so Rust's `as f32` is the expectation.
+#[test]
+fn a_64_bit_value_converts_to_f32_round_to_nearest() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let cases = [
+        [0x0000_0000, 0x3FF0_0000, 0, 0], // 1.0
+        [0x0000_0000, 0xC004_0000, 0, 0], // -2.5
+        [0x9999_999A, 0x3FB9_9999, 0, 0], // 0.1
+        [0x1000_0000, 0x3FF0_0000, 0, 0], // 1 + 2^-24: a tie, to even (1.0)
+        [0x0000_0001, 0x0000_0000, 0, 0], // the smallest subnormal: 0
+        [0xFFFF_FFFF, 0x000F_FFFF, 0, 0], // just below f32's smallest: 0
+        [0xFFFF_FFFF, 0x7FEF_FFFF, 0, 0], // f64 max: inf
+        [0x0000_0000, 0x7FF0_0000, 0, 0], // +inf
+        [0x0000_0000, 0xFFF0_0000, 0, 0], // -inf
+        [0x0000_0000, 0x7FF8_0000, 0, 0], // a quiet NaN
+    ];
+    run_cases(&shader, &cases, |backend, i, [lo, hi, _, _], got| {
+        let v = f64::from_bits(u64::from(hi) << 32 | u64::from(lo));
+        let want = v as f32;
+        if want.is_nan() {
+            assert_eq!(got & 0x7F80_0000, 0x7F80_0000, "{backend}: case {i} is a NaN");
+            assert_ne!(got & 0x007F_FFFF, 0, "{backend}: case {i} keeps a payload");
+        } else {
+            assert_eq!(got, want.to_bits(), "{backend}: case {i} {v:e}");
+        }
+    });
+}
