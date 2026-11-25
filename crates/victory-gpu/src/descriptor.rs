@@ -306,6 +306,11 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // Nothing can find the heap by now. The table's lock is taken
+        // inside the heaps' lock (`memory::bind`), never the other way
+        // round, so it is taken here after the heaps' lock is let go.
+        drop(heaps);
+        crate::memory::release(at);
     }
 }
 
@@ -1011,6 +1016,35 @@ pub(crate) mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A released view heap takes its title memory page table with it, also
+    /// when no heap is made at its address afterwards (else the table, its
+    /// 16.8 MiB mapping and the copies it names live on).
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1000,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let key = h as usize;
+        assert!(heap(h).host().is_some(), "a host heap");
+        let list = host.new_list().unwrap();
+        assert!(crate::memory::bind(&list, key).is_some(), "a page table");
+        assert!(crate::memory::has_table(key));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::memory::has_table(key), "released with its heap");
     }
 
     #[test]

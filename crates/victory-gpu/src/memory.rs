@@ -119,6 +119,20 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// View heap `key` was released: its page table goes with it (lists that
+/// name it hold the table), and a heap made later at its address starts
+/// with none of its state.
+#[cfg(windows)]
+pub(crate) fn release(key: usize) {
+    shared().retain(|(k, _)| *k != key);
+}
+
+/// Whether view heap `key` has a page table.
+#[cfg(test)]
+pub(crate) fn has_table(key: usize) -> bool {
+    shared().iter().any(|(k, _)| *k == key)
+}
+
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
 /// away; None if it is gone or has no host heap.
 fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {
