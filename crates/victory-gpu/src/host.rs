@@ -978,6 +978,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines `bind_pipeline` kept (by address), so a pipeline
+    /// the list binds again is not kept again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2034,11 +2037,20 @@ impl HostList {
         }
     }
 
-    /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        let mut deferred = self.deferred();
+        if !deferred.bound.insert(p.pso.as_raw() as usize) {
+            return;
+        }
+        deferred.kept.push(p.pso.clone().into());
+        deferred.kept.push(p.root.clone().into());
+        drop(deferred);
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        if !pipelines.contains(&p.name) {
+            pipelines.insert(p.name.clone());
         }
     }
 
