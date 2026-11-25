@@ -8,8 +8,9 @@
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
 //! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
-//! memory), inflates zlib data and/or unpacks BCPack data, and writes the
+//! compressed source in flight. Each request reads its source (memory, or a
+//! file opened for overlapped reads, so the workers read one file in
+//! parallel), inflates zlib data and/or unpacks BCPack data, and writes the
 //! destination (an address, or physical pages). Completion is what stays
 //! in order: a status entry is written once every request enqueued before
 //! it on its queue has finished, with the first failure (in queue order)
@@ -17,15 +18,19 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, STATUS_PENDING};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, ReadFile};
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+};
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -113,7 +118,8 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 
 type Factory = *const Object;
 
-/// Opens `path` for reading; the file object owns the handle.
+/// Opens `path` for reading; the file object owns the handle. The handle is
+/// overlapped, so the workers' reads of one file run at once.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
@@ -128,7 +134,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -143,7 +149,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let file = unsafe { OwnedHandle::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
     put(out, file)
 }
@@ -257,7 +263,9 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    /// Opened with `FILE_FLAG_OVERLAPPED`: reads carry their own offset and
+    /// do not move its file pointer.
+    file: OwnedHandle,
     /// As the title named it (diagnostics).
     path: String,
 }
@@ -327,6 +335,8 @@ struct Scheduler {
     work: Condvar,
     /// A request finished (for full queues and `close`).
     finished: Condvar,
+    /// Workers started, on the scheduler's first use.
+    worker_count: OnceLock<usize>,
 }
 
 /// Priority weights per class (low, normal, high and real-time), as the
@@ -343,11 +353,12 @@ struct Lanes {
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
-    /// A start waited for staging space since the last finish.
+    /// A start waited for staging space since the last finish that freed
+    /// some.
     starved: bool,
-    /// Weighted round robin: each class's virtual time (bytes × cost), and
-    /// the time of the last start; within a class, the lane clock of the
-    /// last start.
+    /// Weighted round robin: each class's virtual time (bytes started ×
+    /// cost), and the time of the last start; within a class, the lane
+    /// clock of the last start.
     clock: [u64; 3],
     now: u64,
     lane_now: [u64; 3],
@@ -402,7 +413,6 @@ unsafe impl Send for Job {}
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
             Some(Scheduler {
@@ -424,32 +434,125 @@ fn scheduler() -> Option<&'static Scheduler> {
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
+                worker_count: OnceLock::new(),
             })
         })
         .as_ref()?;
-    STARTED.call_once(|| {
+    scheduler.worker_count.get_or_init(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let started = (0..workers)
             .filter(|i| {
+                let Some(worker) = Worker::new() else {
+                    return false;
+                };
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || work(scheduler, worker))
                     .is_ok()
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        started
     });
-    Some(scheduler)
+    scheduler.running()
 }
 
 impl Scheduler {
+    /// The scheduler while a worker runs its requests. With no worker a
+    /// request would stay pending for ever, so its callers fail instead.
+    fn running(&self) -> Option<&Scheduler> {
+        (*self.worker_count.get()? > 0).then_some(self)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Moves queue `id`'s enqueued commands to the workers and wakes one
+    /// worker per read, once the lanes' lock (`lanes`) is released, so a
+    /// woken worker does not run into it. No read is left waiting while a
+    /// worker sleeps: a worker looks for a read under the lock before it
+    /// waits, so it sees the new reads or is waiting when their wakes come;
+    /// a worker that finishes a read starts the next one itself; and a start
+    /// refused for staging sets `starved`, which wakes every worker at the
+    /// next finish that frees staging.
+    fn submit_and_wake(&self, mut lanes: MutexGuard<'_, Lanes>, id: u64) {
+        let reads = lanes.submit(id);
+        drop(lanes);
+        if reads >= self.worker_count.get().copied().unwrap_or(0) {
+            self.work.notify_all();
+        } else {
+            (0..reads).for_each(|_| self.work.notify_one());
+        }
+    }
 }
 
-/// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+/// Largest buffer a worker keeps for its next request; a larger one is
+/// freed. Each worker so keeps at most two buffers of up to this size
+/// between requests.
+const KEPT_BUFFER_BYTES: usize = 1 << 20;
+
+/// A manual-reset event that one worker's overlapped reads wait on. Made
+/// with every access right and closed with its worker, so a wait on it is
+/// not expected to fail; `read_at` still ends its read if one does.
+struct Event(OwnedHandle);
+
+impl Event {
+    /// `None` if the host has no handle left for it.
+    fn new() -> Option<Event> {
+        // SAFETY: no attributes and no name; manual reset, not signalled.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        // SAFETY: an event we just created and nobody else owns.
+        Some(Event(unsafe { OwnedHandle::from_raw_handle(event) }))
+    }
+}
+
+/// What a worker keeps between requests: the event its file reads wait
+/// on, and buffers for a compressed source and for zlib output that is
+/// unpacked further. Reused, the buffers' pages are not faulted in again
+/// on every request.
+struct Worker {
+    event: Event,
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+}
+
+impl Worker {
+    /// A worker's state, or `None` if its event cannot be created.
+    fn new() -> Option<Worker> {
+        Some(Worker {
+            event: Event::new()?,
+            source: Vec::new(),
+            intermediate: Vec::new(),
+        })
+    }
+
+    /// Frees the buffers grown past `KEPT_BUFFER_BYTES`.
+    fn release_large(&mut self) {
+        for buffer in [&mut self.source, &mut self.intermediate] {
+            if buffer.len() > KEPT_BUFFER_BYTES {
+                *buffer = Vec::new();
+            }
+        }
+    }
+}
+
+/// `buffer`'s first `len` bytes, for the caller to fill: they hold what the
+/// last request left. A buffer too short is replaced by one of `len` bytes.
+fn reused_prefix(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if buffer.len() < len {
+        *buffer = vec![0; len];
+    }
+    &mut buffer[..len]
+}
+
+/// A worker: runs the next read of the most deserving queue. Runs on the
+/// worker threads only; holds the lanes' lock while it picks a read and
+/// while it finishes one, never while it reads, decodes or writes.
+fn work(scheduler: &'static Scheduler, mut worker: Worker) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -458,13 +561,13 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut worker);
+        worker.release_large();
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        lanes.count(&job, started);
-        if std::mem::take(&mut lanes.starved) {
+        if lanes.finish(&job, result) {
             scheduler.work.notify_all();
         }
+        lanes.count(&job, started);
         scheduler.finished.notify_all();
     }
 }
@@ -509,7 +612,8 @@ impl Lanes {
 
     /// Starts the next read of the class with the least virtual time, from
     /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// has room for it (or nothing else holds any). A read that holds no
+    /// staging needs no room.
     fn start(&mut self) -> Option<Job> {
         let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
         let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
@@ -520,7 +624,7 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        if staging > 0 && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
@@ -541,7 +645,10 @@ impl Lanes {
         })
     }
 
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+    /// Ends a read; returns whether it freed staging that a start waited
+    /// for, so the workers have a start to try again.
+    #[must_use = "a start that waited for staging needs every worker woken"]
+    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) -> bool {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
@@ -550,12 +657,13 @@ impl Lanes {
             }
             lane.flush();
         }
+        job.staging > 0 && std::mem::take(&mut self.starved)
     }
 
     /// Moves a queue's enqueued commands to the workers (the title's
-    /// Submit).
-    fn submit(&mut self, id: u64) {
-        self.submit_as(id, true);
+    /// Submit); returns how many of them are reads.
+    fn submit(&mut self, id: u64) -> usize {
+        self.submit_as(id, true)
     }
 
     /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
@@ -565,9 +673,9 @@ impl Lanes {
     /// before Submit (`sub_1400e88f0`), so until then they name no page or a
     /// page that now holds something else. A status entry behind a held
     /// read waits with it.
-    fn submit_as(&mut self, id: u64, explicit: bool) {
+    fn submit_as(&mut self, id: u64, explicit: bool) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
-            return;
+            return 0;
         };
         // A class that had nothing waiting starts from now, not from the
         // credit it left behind.
@@ -579,13 +687,14 @@ impl Lanes {
             self.clock[class] = self.clock[class].max(self.now);
         }
         let Some(lane) = self.lanes.get_mut(&id) else {
-            return;
+            return 0;
         };
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
         let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
         commands.append(&mut lane.unsubmitted);
+        let mut reads = 0;
         for command in commands {
             let hold = !explicit
                 && match &command {
@@ -599,11 +708,15 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    lane.reads.push_back((seq, request));
+                    reads += 1;
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
         lane.flush();
+        reads
     }
 }
 
@@ -831,11 +944,10 @@ extern "system" fn submit(this: QueueRef) {
     let Some(scheduler) = scheduler() else {
         return;
     };
-    let mut lanes = scheduler.lock();
+    let lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id);
-    scheduler.work.notify_all();
+    scheduler.submit_and_wake(lanes, id);
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -846,8 +958,9 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// Reads, inflates and/or unpacks, and writes one request, in `worker`'s
+/// buffers. Runs on the worker threads only, without the lanes' lock.
+fn execute(request: &Request, worker: &mut Worker) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -876,25 +989,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        let event = &mut worker.event;
+        return into_destination(request, size, |out| {
+            read_into(request, event, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, &mut worker.event, &mut worker.source)
+        .map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let size = usize::try_from(request.intermediate_size)
+            .map_err(|_| fail(E_INVALIDARG, "the intermediate size"))?;
+        let packed = reused_prefix(&mut worker.intermediate, size);
+        let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -957,24 +1075,28 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into `buffer` (waiting on `event`).
+fn read_source<'a>(
+    request: &Request,
+    event: &mut Event,
+    buffer: &'a mut Vec<u8>,
+) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let bytes = reused_prefix(buffer, size);
+    read_into(request, event, bytes)?;
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` (the source size) from the request's file or memory; file
+/// reads wait on the calling worker's `event`.
+fn read_into(request: &Request, event: &mut Event, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
@@ -990,14 +1112,96 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        let Some(offset) = u64::try_from(done)
+            .ok()
+            .and_then(|done| request.offset.checked_add(done))
+        else {
+            break Err(E_INVALIDARG);
+        };
+        match read_at(file, event, offset, &mut out[done..]) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+            Err(hr) => break Err(hr),
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Reads into `out` from `offset` of an overlapped `file` and waits for the
+/// read on `event`; returns the bytes read, 0 at the end of the file. Runs
+/// on the worker threads, each with an event of its own, and locks nothing:
+/// reads of one file by several workers run in parallel. A read whose wait
+/// fails is cancelled and waited for: this returns only once the read has
+/// ended, however long that takes.
+fn read_at(
+    file: &OwnedHandle,
+    event: &mut Event,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, HRESULT> {
+    // A longer buffer is read in more than one call.
+    let len = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let [o0, o1, o2, o3, o4, o5, o6, o7] = offset.to_le_bytes();
+    let mut overlapped = OVERLAPPED {
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: u32::from_le_bytes([o0, o1, o2, o3]),
+                OffsetHigh: u32::from_le_bytes([o4, o5, o6, o7]),
+            },
+        },
+        hEvent: event.0.as_raw_handle(),
+        ..Default::default()
+    };
+    // The host writes `overlapped` until the read ends, so every access
+    // from here on goes through this one pointer, never a reference.
+    let overlapped = &raw mut overlapped;
+    // SAFETY: `file` and `event` are open handles and `out` holds `len`
+    // bytes. A read that starts keeps writing `out` and `overlapped` until
+    // it ends, and both outlive that: this function returns only once the
+    // read has ended. The waiting `GetOverlappedResult` below returns at
+    // its end, or earlier if the wait on `event` fails, and then the read
+    // is cancelled and waited for. No count is passed, as overlapped reads
+    // ask.
+    let done = unsafe {
+        ReadFile(
+            file.as_raw_handle(),
+            out.as_mut_ptr(),
+            len,
+            std::ptr::null_mut(),
+            overlapped,
+        )
+    } != 0;
+    let started =
+        done || std::io::Error::last_os_error().raw_os_error() == Some(ERROR_IO_PENDING as i32);
+    let mut read = 0;
+    let waited = started && {
+        // SAFETY: as above: a read started on `overlapped`, waited for (`1`).
+        unsafe { GetOverlappedResult(file.as_raw_handle(), overlapped, &mut read, 1) != 0 }
+    };
+    if waited {
+        return usize::try_from(read).map_err(|_| E_INVALIDARG);
+    }
+    let error = std::io::Error::last_os_error();
+    // A read that started and whose wait failed (an event handle gone bad)
+    // still runs and writes `out` and `overlapped` until it ends, so this
+    // does not return before then: it cancels the read and spins until the
+    // host has written its status. The read bounds the loop: a file read
+    // finishes or fails on its own, cancelled or not, and one that never
+    // ends (a device that hangs) would hang a blocking wait the same way.
+    // The host writes the status on this thread, between two of its
+    // instructions, so it is read as it is at the moment.
+    const PENDING: usize = STATUS_PENDING as usize;
+    // SAFETY: a field of the live `overlapped`.
+    while started && unsafe { (&raw const (*overlapped).Internal).read_volatile() } == PENDING {
+        // SAFETY: an open handle and the read started on it.
+        unsafe { CancelIoEx(file.as_raw_handle(), overlapped) };
+        std::thread::yield_now();
+    }
+    if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+        return Ok(0);
+    }
+    Err(from_win32(&error))
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1403,12 +1607,14 @@ mod tests {
                 read(&mut l, id, 0, 4096);
             }
         }
-        (0..3).for_each(|id| l.submit(id));
+        (0..3).for_each(|id| {
+            let _reads = l.submit(id);
+        });
         let mut started = [0u32; 3];
         for _ in 0..330 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
+            let _wake = l.finish(&job, Ok(()));
         }
         // Normal gets about a tenth of what high and real-time get together.
         assert_eq!(started[1] + started[2], 300, "{started:?}");
@@ -1423,19 +1629,248 @@ mod tests {
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
-        l.submit(0);
+        let _reads = l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
+        let _wake = l.finish(&first, Ok(()));
         let second = l.start().unwrap();
         let raw = l.start().unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
         // Alone, a request larger than the buffer still runs.
         read(&mut l, 0, ZLIB, 500);
-        l.submit(0);
+        let _reads = l.submit(0);
         assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
+        let _wake = l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn a_read_without_staging_is_in_turn_beside_a_read_larger_than_the_staging() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 500); // alone, it runs though it is larger
+        read(&mut l, 0, 0, 16);
+        let _reads = l.submit(0);
+        let large = l.start().unwrap();
+        assert_eq!(large.staging, 500);
+
+        let raw = l.start().unwrap();
+
+        assert_eq!((raw.staging, l.starved, l.refused), (0, false, 0));
+        // The turn moved on to it: 500 bytes of a normal queue, at cost 10.
+        assert_eq!(l.now, 5000);
+    }
+
+    #[test]
+    fn only_a_finish_that_frees_staging_wakes_the_starts_that_wait_for_it() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(1, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 60);
+        read(&mut l, 0, ZLIB, 60);
+        read(&mut l, 1, 0, 1000);
+        let _reads = l.submit(0) + l.submit(1);
+        let staged = l.start().unwrap();
+        let raw = l.start().unwrap();
+        assert_eq!((staged.staging, raw.staging), (60, 0));
+        assert!(l.start().is_none(), "60 + 60 > 100");
+
+        assert!(!l.finish(&raw, Ok(())), "a raw read frees no staging");
+        assert!(l.starved);
+        assert!(l.finish(&staged, Ok(())));
+        assert!(!l.starved);
+    }
+
+    #[test]
+    fn submit_counts_the_reads_it_moves() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, 0, 16);
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        let status = Command::Status(Status { array, index: 0 });
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status);
+        read(&mut l, 0, 0, 16);
+
+        assert_eq!(l.submit(0), 3);
+        assert_eq!(l.submit(0), 0, "nothing left to move");
+    }
+
+    #[test]
+    fn submit_moves_nothing_of_an_unknown_queue() {
+        let mut l = lanes(STAGING);
+
+        assert_eq!(l.submit(7), 0);
+    }
+
+    #[test]
+    fn a_worker_keeps_a_buffer_as_it_is_for_a_shorter_request() {
+        let mut worker = Worker::new().unwrap();
+        let first = reused_prefix(&mut worker.source, 4096);
+        first.fill(0xAA);
+        let at = first.as_ptr();
+
+        worker.release_large();
+        let again = reused_prefix(&mut worker.source, 1000);
+
+        assert_eq!(again.as_ptr(), at);
+        assert_eq!(again, [0xAA; 1000], "the next request fills it");
+        assert_eq!(worker.source.len(), 4096);
+    }
+
+    #[test]
+    fn a_longer_request_gets_a_buffer_of_its_size() {
+        let mut worker = Worker::new().unwrap();
+        reused_prefix(&mut worker.source, 4096).fill(0xAA);
+
+        let longer = reused_prefix(&mut worker.source, 4097);
+
+        assert_eq!(longer, [0; 4097]);
+        assert_eq!(worker.source.len(), 4097);
+    }
+
+    #[test]
+    fn a_worker_frees_a_buffer_past_the_limit() {
+        let mut worker = Worker::new().unwrap();
+        reused_prefix(&mut worker.source, KEPT_BUFFER_BYTES);
+        reused_prefix(&mut worker.intermediate, KEPT_BUFFER_BYTES + 1);
+
+        worker.release_large();
+
+        assert_eq!(worker.intermediate.len(), 0);
+        assert_eq!(worker.source.len(), KEPT_BUFFER_BYTES, "kept");
+    }
+
+    #[test]
+    fn a_read_at_an_offset_gets_the_bytes_there() {
+        let contents = pattern(4096);
+        let (_dir, file) = file_with(&contents);
+        let mut worker = Worker::new().unwrap();
+        let mut out = [0u8; 16];
+        let r = request(0, out.as_mut_ptr().cast(), 16, file, 100, 16);
+
+        assert_eq!(read_into(&r, &mut worker.event, &mut out), Ok(()));
+        assert_eq!(out, contents[100..116]);
+    }
+
+    #[test]
+    fn a_read_leaves_the_handles_file_pointer_where_it_was() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_CURRENT, SetFilePointerEx};
+        let (_dir, file) = file_with(&pattern(4096));
+        let mut worker = Worker::new().unwrap();
+        let mut out = [0u8; 16];
+        let r = request(0, out.as_mut_ptr().cast(), 16, file, 100, 16);
+
+        read_into(&r, &mut worker.event, &mut out).unwrap();
+
+        // A read of an overlapped handle carries its own offset and does not
+        // move the file pointer; a synchronous one would have moved it to 116.
+        // SAFETY: the file object `open` made.
+        let handle = &unsafe { &*file.cast::<Instance<File>>() }.state.file;
+        let mut position = -1;
+        // SAFETY: an open handle and a place for the position.
+        let moved =
+            unsafe { SetFilePointerEx(handle.as_raw_handle(), 0, &mut position, FILE_CURRENT) };
+        assert_ne!(moved, 0);
+        assert_eq!(position, 0);
+    }
+
+    #[test]
+    fn a_read_whose_wait_fails_has_ended_when_read_at_returns() {
+        use std::io::Write;
+        use windows_sys::Win32::Foundation::{DuplicateHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, GetCurrentProcess};
+        // A pipe nobody has written to yet: a read of it stays pending.
+        let name = format!(r"\\.\pipe\victory-dstorage-test-{}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a terminated name, one instance, 4096-byte buffers.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(pipe, INVALID_HANDLE_VALUE);
+        // SAFETY: a pipe we just created and nobody else owns.
+        let pipe = unsafe { OwnedHandle::from_raw_handle(pipe) };
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&name).unwrap();
+        // A handle that may set the event and may not wait on it.
+        let event = Event::new().unwrap();
+        let mut unwaitable = std::ptr::null_mut();
+        // SAFETY: this process, an open event and a place for the new handle.
+        let duplicated = unsafe {
+            let process = GetCurrentProcess();
+            let event = event.0.as_raw_handle();
+            DuplicateHandle(
+                process,
+                event,
+                process,
+                &mut unwaitable,
+                EVENT_MODIFY_STATE,
+                0,
+                0,
+            )
+        };
+        assert_ne!(duplicated, 0);
+        // SAFETY: a handle we just made and nobody else owns.
+        let mut unwaitable = Event(unsafe { OwnedHandle::from_raw_handle(unwaitable) });
+        let mut out = [0u8; 1];
+
+        let read = read_at(&pipe, &mut unwaitable, 0, &mut out);
+
+        assert!(read.is_err());
+        writer.write_all(&[0xAA]).unwrap();
+        assert_eq!(out, [0], "no read is left to take the byte");
+    }
+
+    #[test]
+    fn a_scheduler_without_a_worker_is_not_running() {
+        let with_workers = |count| Scheduler {
+            lanes: Mutex::new(lanes(STAGING)),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+            worker_count: OnceLock::from(count),
+        };
+
+        assert!(with_workers(0).running().is_none());
+        assert!(with_workers(1).running().is_some());
+    }
+
+    /// Pins the bytes only: it holds for reads run one after another as much
+    /// as for reads in flight together.
+    #[test]
+    fn reads_of_one_file_queued_together_each_get_their_own_bytes() {
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 64;
+        let contents = pattern(CHUNK * CHUNKS);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; contents.len()];
+        // Chunk `i` of `out` gets the file's chunk `CHUNKS - 1 - i`.
+        for (i, chunk) in out.as_chunks_mut::<CHUNK>().0.iter_mut().enumerate() {
+            let offset = ((CHUNKS - 1 - i) * CHUNK) as u64;
+            enqueue(
+                queue,
+                &request(0, chunk.as_mut_ptr().cast(), CHUNK, file, offset, CHUNK),
+            );
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for (i, chunk) in out.as_chunks::<CHUNK>().0.iter().enumerate() {
+            let at = (CHUNKS - 1 - i) * CHUNK;
+            assert!(chunk[..] == contents[at..at + CHUNK], "chunk {i}");
+        }
+        void(queue, 0x40);
     }
 
     #[test]
@@ -1456,14 +1891,14 @@ mod tests {
         for entry in unsafe { &(*array).state.entries }.iter() {
             entry.store(E_PENDING, Ordering::Release);
         }
-        l.submit(0);
+        let _reads = l.submit(0);
         let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
         // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        let _wake = l.finish(&jobs[2], Ok(()));
+        let _wake = l.finish(&jobs[0], Ok(()));
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        let _wake = l.finish(&jobs[1], Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
     }
 
@@ -1659,14 +2094,14 @@ mod tests {
         let plain = l.start().unwrap();
         assert_eq!(plain.request.options, 0);
         assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
+        let _ = l.finish(&plain, Ok(()));
         assert_eq!(l.lanes[&0].held.len(), 2);
         l.submit(0);
         let paged = l.start().unwrap();
         assert_eq!(paged.request.options, PAGE_DESTINATION);
         assert!(l.lanes[&0].held.is_empty());
         assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
+        let _ = l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
     }
 

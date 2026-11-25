@@ -1202,9 +1202,14 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // Rounded up to whole slots of the small buffers' pool, so that views
+        // ending in the buffer's last 256 bytes fit and a root descriptor's
+        // read past the title buffer's end stays in this copy up to the
+        // rounded width, none when the length is whole slots already
+        // (`Host::shared_buffer`). Shaders write some buffers (unordered
+        // access), so not upload memory.
+        let width_bytes = len.next_multiple_of(crate::placed::SLOT_BYTES);
+        let (buffer, data) = host()?.shared_buffer(width_bytes)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
