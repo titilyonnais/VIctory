@@ -638,6 +638,9 @@ impl Prebuild {
     pub fn make(&self) -> Result<(), String> {
         let key = self.key();
         library::keep_early_list();
+        // Before making it, so that a driver crash names the pipeline.
+        #[cfg(feature = "diagnostics")]
+        make::log("start", &key, || self.describe());
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();

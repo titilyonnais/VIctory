@@ -140,7 +140,7 @@ pub(crate) fn log_built(key: &str) {
 /// once made or loaded (`built`, also from the pre-build), to compare what
 /// a run creates with what the pre-build makes.
 #[cfg(feature = "diagnostics")]
-fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+pub(crate) fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     use std::collections::HashSet;
     use std::io::Write;
     static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);

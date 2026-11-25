@@ -294,6 +294,23 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+/// Whether `hash` is listed in `VICTORY_REFUSE_SHADERS` (16-digit shader
+/// hashes, comma-separated): its pipelines are never handed to the host's
+/// shader compiler (one that crashes on them, AMD's on RX 9070 XT).
+fn refused_by_user(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_REFUSE_SHADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -309,6 +326,9 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        if shaders.iter().any(|s| refused_by_user(&s.hash)) {
+            return refuse("a shader listed in VICTORY_REFUSE_SHADERS", shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -476,6 +496,22 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Diagnostics: `VICTORY_HOST_DXIL_DUMP=<dir>` writes each shader's DXIL
+        // as `<hash>.dxil` before the host compiles it.
+        #[cfg(feature = "diagnostics")]
+        if let Some(dir) = std::env::var_os("VICTORY_HOST_DXIL_DUMP") {
+            for (s, _) in &stages {
+                if let Some(t) = s.translated() {
+                    let path = std::path::Path::new(&dir).join(format!("{}.dxil", s.hash));
+                    if !path.exists() {
+                        let _ = std::fs::write(path, &t.host.dxil);
+                    }
+                }
+            }
+            if std::env::var_os("VICTORY_HOST_DXIL_DUMP_ONLY").is_some() {
+                return None;
+            }
+        }
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
