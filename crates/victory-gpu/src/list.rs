@@ -1395,7 +1395,9 @@ impl Drop for Upload {
         crate::shadow::unregister(self.at, self.at as u64);
         UPLOADS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         UPLOADS[1].fetch_sub(self.len as u64, std::sync::atomic::Ordering::Relaxed);
-        // Not guarded any more: memory allocated here next is new.
+        // Not guarded any more: memory allocated here next is new. Hold the
+        // mapping lock across both notification and release.
+        let _remap = crate::watch::title_memory_remapping();
         crate::watch::title_memory_remapped(self.at, self.len);
         // SAFETY: our allocation; lists that still use its copy hold that.
         unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
