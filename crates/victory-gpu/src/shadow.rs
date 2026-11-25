@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -1147,10 +1147,28 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Read by every draw's views (`find`) on the title's threads, at once.
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The key of the innermost title buffer holding `[address, end)`.
+fn innermost(
+    map: &BTreeMap<(u64, usize), Entry>,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
@@ -1188,14 +1206,20 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // A copy made already, as it nearly always is, is found under the
+    // shared lock; the copy is made under the exclusive one.
+    {
+        let map = buffers_read();
+        let Some(key) = innermost(&map, address, end) else {
+            drop(map);
+            return loose(address, end);
+        };
+        if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.clone()) {
+            return Some(shadow);
+        }
+    }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let Some(key) = innermost(&map, address, end) else {
         drop(map);
         return loose(address, end);
     };
@@ -1442,7 +1466,8 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> =
+        buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1450,7 +1475,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
