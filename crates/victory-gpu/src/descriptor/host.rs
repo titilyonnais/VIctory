@@ -806,17 +806,27 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        // Hold `made` and `next` across the scan and clear so title slots
+        // rewritten concurrently and dynamic slots newly taken are not nulled;
+        // live dynamic slots belong to recorded lists and keep their views.
+        // (Such a slot keeps the texture until it is next made, not until its
+        // list is reset: the dynamic range comes round quickly.)
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             (0..kept.len() as u32)
                 .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                    i.checked_sub(self.count)
+                        .is_none_or(|d| !taken.1[d as usize])
+                        && kept[i as usize].as_ref().is_some_and(|k| {
+                            k.1.is_none()
+                                && textures
+                                    .contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                        })
                 })
                 .collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
@@ -1841,6 +1851,43 @@ mod tests {
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made again for the draw");
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
+    }
+
+    /// Dynamic slots still held by a recorded list keep their view when the
+    /// texture is given up; dynamic slots already released let go of it.
+    #[test]
+    fn live_dynamic_slots_keep_a_texture_given_up() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let (null, mut heap) = (std::ptr::null(), std::ptr::null());
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let tail = [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, tail);
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, words, desc);
+        let host = crate::descriptor::heap(heap)
+            .host()
+            .expect("a host view heap");
+        let (live, released) = (host.dynamic(1).unwrap(), host.dynamic(1).unwrap());
+        host.make_at(live, &view);
+        host.make_at(released, &view);
+        host.release(released, 1);
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(crate::resource::give_up_now(texture));
+        assert!(host.kept(live), "a live dynamic slot keeps its view");
+        assert!(!host.kept(released), "a released dynamic slot lets go");
+        host.release(live, 1);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
     }
 
     /// Work to run while a view's texture is prepared, once (tests).
