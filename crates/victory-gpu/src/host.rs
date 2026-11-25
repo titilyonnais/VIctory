@@ -807,6 +807,9 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
+    /// Last eligible color target nominated during recording of this list.
+    #[cfg(feature = "diagnostics")]
+    present_1440p: Mutex<Option<crate::capture::PresentCandidate>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1115,6 +1118,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                present_1440p: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -1252,6 +1257,16 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::present_1440p_on()
+                // SAFETY: a live fence of this queue.
+                && unsafe { self.fence.GetCompletedValue() } >= *submitted
+                && let Some(copy) = runs.iter().rev().find_map(|list| {
+                    list.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                })
+            {
+                crate::capture::publish_1440p_target(copy);
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1757,6 +1772,8 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        drop(self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).take());
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -2232,6 +2249,32 @@ impl HostList {
             self.deferred().kept.push(object);
         }
     }
+
+        /// Notes a 1440p target for possible diagnostic fallback presentation.
+  #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_1440p_target(&self, resource: crate::object::This) {
+        if !crate::capture::present_1440p_on() {
+            return;
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            return;
+        };
+        // SAFETY: a live host texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.Width == 2560
+            && desc.Height == 1440
+            && desc.DepthOrArraySize == 1
+            && desc.MipLevels == 1
+            && desc.SampleDesc.Count == 1
+            && matches!(desc.Format.0, 28 | 29 | 87 | 91)
+            && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+        {
+            *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(crate::capture::PresentCandidate { resource: resource as usize, copy });
+        }
+    }
+
 
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).

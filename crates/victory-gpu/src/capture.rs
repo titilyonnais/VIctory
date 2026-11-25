@@ -224,6 +224,33 @@ pub(crate) fn save_read_back(
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PresentCandidate {
+    pub(crate) resource: usize,
+    #[allow(dead_code)]
+    pub(crate) copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+// The most recent eligible target from completed work since the last present.
+static SUBMITTED_1440P: std::sync::Mutex<Option<PresentCandidate>> = std::sync::Mutex::new(None);
+
+pub(crate) fn present_1440p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some() || crate::switch::on("VICTORY_PRESENT_1440P"))
+}
+
+pub(crate) fn publish_1440p_target(copy: PresentCandidate) {
+    *SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+}
+
+pub(crate) fn take_1440p_target() -> Option<PresentCandidate> {
+    if !present_1440p_on() {
+        return None;
+    }
+    SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
