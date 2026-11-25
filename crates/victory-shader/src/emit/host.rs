@@ -1168,6 +1168,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// A typed RGBA32F Texture2D null SRV.
+    NullTexture,
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
@@ -1177,6 +1179,9 @@ pub enum View<'a> {
     /// face's levels in turn).
     MippedCube(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F square texture SRV (size, levels) whose texels in level
+    /// A mipped 2D texture array `(width, height, levels, slices, texels)` —
+    /// slice by slice, each mip level in turn.
+    MippedArray(u32, u32, u32, u32, &'a [[f32; 4]]),
     /// `n` are all `n`.
     Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1373,12 +1378,14 @@ impl Host {
                     View::Texture(..)
                     | View::Cube(..)
                     | View::Mipped(..)
-                    | View::MippedCube(..) => {
-                        let (w0, h0, mut texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
-                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
+                    | View::MippedCube(..)
+                    | View::MippedArray(..) => {
+                        let (w0, h0, mut texels, faces, levels, is_cube, is_array) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1, false, false),
+                            View::Mipped(w, h, l, t) => (w, h, t, 1, l, false, false),
+                            View::Cube(n, t) => (n, n, t, 6, 1, true, false),
+                            View::MippedCube(n, l, t) => (n, n, t, 6, l, true, false),
+                            View::MippedArray(w, h, l, s, t) => (w, h, t, s, l, false, true),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
@@ -1439,12 +1446,41 @@ impl Host {
                                 },
                             },
                         };
-                        dev.CreateShaderResourceView(
-                            &tex,
-                            (faces == 6).then_some(&cube as *const _),
-                            at,
-                        );
+                        let array = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                                    MipLevels: levels,
+                                    ArraySize: faces,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let srv_desc = if is_cube {
+                            Some(&cube as *const _)
+                        } else if is_array {
+                            Some(&array as *const _)
+                        } else {
+                            None
+                        };
+                        dev.CreateShaderResourceView(&tex, srv_desc, at);
                         keep.push(tex);
+                    }
+                    View::NullTexture => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None, Some(&desc), at);
                     }
                     View::Levels(w, levels) => {
                         let mut desc = texture(w, w, D3D12_RESOURCE_FLAG_NONE);
