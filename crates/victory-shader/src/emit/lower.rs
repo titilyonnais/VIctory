@@ -4998,27 +4998,12 @@ impl<'a> Lower<'a> {
                 self.s.sampler_choices.push((ha, hb, phi));
                 Ok(ha)
             }
-            Source::Phi { block, args } => {
+            Source::Phi { .. } => {
                 // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+                // join picks one with a phi, also through nested joins
+                // (from #1012).
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
+                let phi = self.uniform_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, phi, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
@@ -5094,6 +5079,35 @@ impl<'a> Lower<'a> {
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
             _ => false,
         })
+    }
+
+    /// The heap index of a descriptor every lane shares, computed in the
+    /// current block. One chosen by control flow is a phi at its join of the
+    /// index each predecessor computes at its end; an edge may bring another
+    /// join's (nested if/else). From #1012.
+    fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Phi { block, args } => {
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.uniform_heap_index(arg, sampler);
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            _ => Err("a descriptor chosen by control flow"),
+        }
     }
 
     /// The heap index of a descriptor that may differ between lanes,
