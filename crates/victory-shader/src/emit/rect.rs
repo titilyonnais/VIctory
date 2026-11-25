@@ -18,14 +18,19 @@ use crate::dxbc::{Container, FourCC};
 /// angle: the one opposite the longest side, else (ties, NaN) `1`. The
 /// geometry shader of [`rectangle_gs`] makes the same choice on the GPU.
 pub fn right_angle(xy: [[f32; 2]; 3]) -> usize {
-    let side = |i: usize, j: usize| {
-        let (dx, dy) = (xy[i][0] - xy[j][0], xy[i][1] - xy[j][1]);
-        dx * dx + dy * dy
-    };
-    let (d12, d20, d01) = (side(1, 2), side(2, 0), side(0, 1));
-    if d12 > d20 && d12 > d01 {
+    let edge = |i: usize, j: usize| [xy[j][0] - xy[i][0], xy[j][1] - xy[i][1]];
+    let dot = |a: [f32; 2], b: [f32; 2]| a[0] * b[0] + a[1] * b[1];
+    let (e01, e02, e12) = (edge(0, 1), edge(0, 2), edge(1, 2));
+    let (d01, d20, d12) = (dot(e01, e01), dot(e02, e02), dot(e12, e12));
+    // Opposite the strictly longest side, plus a dot-product rescue for thin
+    // rectangles where `d_long + d_short` rounds to `d_long` in `f32`:
+    // `4 * dot < min(leg0^2, leg1^2)` guarantees `opp^2 > max + 0.5 * min`,
+    // keeping exact isosceles ties (`4 * dot == 2 * base^2`) on `v1`.
+    let four_dot0 = 4.0 * dot(e01, e02);
+    let four_dot2 = 4.0 * dot(e02, e12);
+    if (d12 > d20 && d12 > d01) || (d01 > four_dot0 && d20 > four_dot0) {
         0
-    } else if d01 > d12 && d01 > d20 {
+    } else if (d01 > d12 && d01 > d20) || (d20 > four_dot2 && d12 > four_dot2) {
         2
     } else {
         1
@@ -71,24 +76,57 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         .iter()
         .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
         .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
-    let side = |s: &mut Shader, i: usize, j: usize| {
-        let mut sum = None;
-        for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
-            let d = s.m.bin(b, Bin::Sub, p, q);
-            let sq = s.m.bin(b, Bin::Mul, d, d);
-            sum = Some(match sum {
-                Some(x) => s.m.bin(b, Bin::Add, x, sq),
-                None => sq,
-            });
-        }
-        sum.expect("two columns")
+    let edge = |s: &mut Shader, i: usize, j: usize| -> [V; 2] {
+        [
+            s.m.bin(
+                b,
+                Bin::Sub,
+                corners[j][position][0],
+                corners[i][position][0],
+            ),
+            s.m.bin(
+                b,
+                Bin::Sub,
+                corners[j][position][1],
+                corners[i][position][1],
+            ),
+        ]
     };
-    let (d12, d20, d01) = (side(&mut s, 1, 2), side(&mut s, 2, 0), side(&mut s, 0, 1));
+    let dot = |s: &mut Shader, a: [V; 2], c: [V; 2]| {
+        let px = s.m.bin(b, Bin::Mul, a[0], c[0]);
+        let py = s.m.bin(b, Bin::Mul, a[1], c[1]);
+        s.m.bin(b, Bin::Add, px, py)
+    };
+    let (e01, e02, e12) = (edge(&mut s, 0, 1), edge(&mut s, 0, 2), edge(&mut s, 1, 2));
+    let (d01, d20, d12) = (
+        dot(&mut s, e01, e01),
+        dot(&mut s, e02, e02),
+        dot(&mut s, e12, e12),
+    );
+    let four = s.m.f32(4.0f32.to_bits());
+    let four_dot0 = dot(&mut s, e01, e02);
+    let four_dot0 = s.m.bin(b, Bin::Mul, four, four_dot0);
+    let four_dot2 = dot(&mut s, e02, e12);
+    let four_dot2 = s.m.bin(b, Bin::Mul, four, four_dot2);
     let longest = |s: &mut Shader, d: V, others: [V; 2]| {
         let [x, y] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
         s.m.bin(b, Bin::And, x, y)
     };
-    let (at0, at2) = (longest(&mut s, d12, [d20, d01]), longest(&mut s, d01, [d12, d20]));
+    let wider = |s: &mut Shader, a: V, c: V, limit: V| {
+        let x = s.m.cmp(b, pred::OGT, a, limit);
+        let y = s.m.cmp(b, pred::OGT, c, limit);
+        s.m.bin(b, Bin::And, x, y)
+    };
+    let at0 = {
+        let strict = longest(&mut s, d12, [d20, d01]);
+        let thin = wider(&mut s, d01, d20, four_dot0);
+        s.m.bin(b, Bin::Or, strict, thin)
+    };
+    let at2 = {
+        let strict = longest(&mut s, d01, [d12, d20]);
+        let thin = wider(&mut s, d20, d12, four_dot2);
+        s.m.bin(b, Bin::Or, strict, thin)
+    };
     // `x0` if the right angle is at v0, `x2` if at v2, else `x1`.
     let pick = |s: &mut Shader, [x0, x1, x2]: [V; 3]| {
         let x = s.m.select(b, at2, x2, x1);
@@ -156,6 +194,54 @@ mod rule_tests {
         assert_eq!(right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]), 2, "obtuse at v2");
         assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
         assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
+    }
+
+    /// Thin rectangles whose squared hypotenuse rounds to the long leg's
+    /// squared length in `f32` still find their right angle at every corner,
+    /// under rotation, while thin isosceles ties stay at `v1`.
+    #[test]
+    fn thin_rectangles_find_their_right_angle() {
+        let eps = 2.0f32.powi(-12);
+        assert_eq!(right_angle([[0.0, 0.0], [0.0, eps], [1.0, 0.0]]), 0);
+        assert_eq!(right_angle([[0.0, eps], [0.0, 0.0], [1.0, 0.0]]), 1);
+        assert_eq!(right_angle([[0.0, eps], [1.0, 0.0], [0.0, 0.0]]), 2);
+        assert_eq!(
+            right_angle([[-0.5, 0.5], [-0.5 + eps, 0.5], [-0.5, -0.5]]),
+            0
+        );
+        assert_eq!(
+            right_angle([[0.0, 0.0], [0.0, 2.0f32.powi(-20)], [1.0, 0.0]]),
+            0
+        );
+
+        // Rotated thin rectangle (right angle at each corner in turn).
+        for (s, c) in [(0.8f32, 0.6f32), 0.7f32.sin_cos()] {
+            let v0 = [-0.2f32, 0.3];
+            let v1 = [v0[0] - s * eps, v0[1] + c * eps];
+            let v2 = [v0[0] + c, v0[1] + s];
+            assert_eq!(right_angle([v0, v1, v2]), 0);
+            assert_eq!(right_angle([v1, v0, v2]), 1);
+            assert_eq!(right_angle([v1, v2, v0]), 2);
+        }
+
+        // Thin isosceles tie (d12 == d20) and exact acute isosceles ties keep `v1`.
+        assert_eq!(right_angle([[0.0, 0.0], [0.0, eps], [1.0, 0.5 * eps]]), 1);
+        assert_eq!(
+            right_angle([
+                [0.0, 0.0],
+                [8193.0 / 16384.0, 4100.0 / 16384.0],
+                [4100.0 / 16384.0, 8193.0 / 16384.0],
+            ]),
+            1
+        );
+        assert_eq!(
+            right_angle([
+                [4100.0 / 16384.0, 8193.0 / 16384.0],
+                [0.0, 0.0],
+                [8193.0 / 16384.0, 4100.0 / 16384.0],
+            ]),
+            1
+        );
     }
 }
 
@@ -270,5 +356,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A thin rectangle with its right angle at `v0` completes onto the
+    /// `+y` side rather than flipping onto `-y` when `d12` rounds to `d20`.
+    #[test]
+    fn thin_rectangles_get_their_fourth_corner() {
+        let (vs, ps) = (shader(false), shader(true));
+        let gs = super::rectangle_gs(&vs).unwrap();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            for c in [&vs, &gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let eps = 2.0f32.powi(-12);
+        let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
+        let vertices = [corner(-0.75, 0.0), corner(-0.75, eps), corner(0.75, 0.0)].concat();
+        let (w, h) = (8u32, 8192u32);
+        let mut ran = 0;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 24,
+                size: (w, h),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            // Row 4095 has center y = +2^-13 (inside [0, 2^-12]); row 4096 has y = -2^-13.
+            for y in [4095u32, 4096] {
+                let v = 1.0 - 2.0 * (y as f32 + 0.5) / h as f32;
+                for x in 0..w {
+                    let u = 2.0 * (x as f32 + 0.5) / w as f32 - 1.0;
+                    let inside = y == 4095 && u.abs() < 0.75;
+                    let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
+                    let t = texels[(y * w + x) as usize];
+                    let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
+                    assert!(near, "warp {warp} pixel ({x}, {y}): {t:?}, want {want:?}");
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }

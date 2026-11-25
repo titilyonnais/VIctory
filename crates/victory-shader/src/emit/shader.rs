@@ -63,6 +63,8 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    /// 64-bit floating point (`fptrunc` from a `double`).
+    pub const FLOAT64: u64 = 1 << 2;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -140,6 +142,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -205,6 +210,8 @@ impl Shader {
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            heap_props: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -540,12 +547,16 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        self.heap_props.push(props);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
-        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        let marked = flagged_nonuniform(nonuniform, sampler, props, compute);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(marked));
         let h = self.op(
             block,
             "createHandleFromHeap",
@@ -942,6 +953,9 @@ impl Shader {
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
+        if self.flags & flags::FLOAT64 != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
@@ -1087,5 +1101,42 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+}
+
+/// Whether a heap handle carries `nonUniformIndex`: where its index may
+/// differ between lanes (`nonuniform`), and for raw buffers (DXIL resource
+/// kind 11) in compute programs.
+///
+/// AMD's shader compiler (RX 9070 XT, driver 32.0.32029.2010) crashes
+/// (`amdxc64.dll+0x861b9f`, reading 0x8) on some large compute programs
+/// that read raw buffers through heap handles at a uniform index, the
+/// characters' `CS_RaytracingResolve` among them: one of its passes leaves
+/// an instruction ahead of the load it reads, and its code placement then
+/// finds that load not placed yet. Flagged non-uniform, those loads take
+/// another path there and the 68 programs it refused compile. The flag is
+/// always correct (a uniform index is one case of it); it is kept to compute
+/// programs, where the crash was seen.
+fn flagged_nonuniform(nonuniform: bool, sampler: bool, props: (u32, u32), compute: bool) -> bool {
+    let raw = !sampler && props.0 & 0xFF == 11;
+    nonuniform || raw && compute
+}
+
+#[cfg(test)]
+mod nonuniform_tests {
+    use super::flagged_nonuniform;
+
+    #[test]
+    fn raw_buffer_heap_handles_of_compute_programs_are_flagged_nonuniform() {
+        // ByteAddressBuffer (kind 11), Texture2D (kind 2), a typed buffer (10).
+        let (raw, texture, typed) = ((11, 0), (2, 1033), (10, 0));
+        assert!(flagged_nonuniform(false, false, raw, true));
+        assert!(!flagged_nonuniform(false, false, raw, false));
+        assert!(!flagged_nonuniform(false, false, texture, true));
+        assert!(!flagged_nonuniform(false, false, typed, true));
+        // Samplers keep the flag their index asks for.
+        assert!(!flagged_nonuniform(false, true, raw, true));
+        assert!(flagged_nonuniform(true, true, (14, 0), true));
+        assert!(flagged_nonuniform(true, false, texture, false));
     }
 }

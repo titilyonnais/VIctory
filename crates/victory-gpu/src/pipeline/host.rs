@@ -20,6 +20,7 @@ use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
+#[derive(Clone)]
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
     sample_mask: u32,
@@ -299,6 +300,62 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// Integer render targets do not blend: D3D12 refuses a pipeline that
+    /// enables blending on one. The console's renderer allows it, so the
+    /// title's own streams do - measured on the card with the debug layer on,
+    /// the mesh/pixel pipeline the intro uses has `R8_UINT` at slot 2 with
+    /// blending enabled, and `CreateGraphicsPipelineState` answers
+    /// `E_INVALIDARG` ("this format does not support blending"), losing every
+    /// draw that needs that pipeline.
+    ///
+    /// Blending is turned off for those slots alone and the pipeline is made.
+    /// Where the blend was a write (`ONE`/`ZERO`, the title's usual state) the
+    /// picture is the same; where it was not, the slot is overwritten instead
+    /// of blended.
+    ///
+    /// `IndependentBlendEnable` decides what "that slot" means: with it off -
+    /// D3D12's default - slot 0's state applies to every bound slot and
+    /// `RenderTarget[1..]` is ignored, so a slot cannot be settled on its own.
+    /// Then slot 0's state is copied to every slot and the slots are made
+    /// independent, which leaves the float slots blending exactly as the title
+    /// asked while an integer slot can be turned off by itself. When every
+    /// bound slot is integer, nothing has to become independent: slot 0's
+    /// blend goes off and with it the shared state of all of them.
+    fn settle_integer_targets(&mut self) -> usize {
+        let count = self.targets.NumRenderTargets.min(8) as usize;
+        let integer = |i: usize| !takes_blending(self.targets.RTFormats[i]);
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            // With slot 0 not blending, no slot does: nothing to settle.
+            if !shared.BlendEnable.as_bool() || !(0..count).any(integer) {
+                return 0;
+            }
+            if (0..count).any(|i| !integer(i)) {
+                // Float slots share one state with integer ones: they stop
+                // sharing, all of slot 0's state on each, and only the integer
+                // slots give up their blend below.
+                self.blend.RenderTarget = [shared; 8];
+                self.blend.IndependentBlendEnable = true.into();
+            }
+        }
+        let mut off: Vec<(usize, i32)> = Vec::new();
+        for i in 0..count {
+            let format = self.targets.RTFormats[i];
+            if !takes_blending(format) && self.blend.RenderTarget[i].BlendEnable.as_bool() {
+                self.blend.RenderTarget[i].BlendEnable = false.into();
+                off.push((i, format.0));
+            }
+        }
+        if !off.is_empty() {
+            tracing::info!(
+                slots = ?off,
+                independent = self.blend.IndependentBlendEnable.as_bool(),
+                "a title state blends an integer render target, which the host refuses: blending is off for those slots"
+            );
+        }
+        off.len()
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -673,6 +730,10 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
+        // Settled once, before the state is described: what a pipeline is made
+        // with is what its name says.
+        let mut g = g.clone();
+        g.settle_integer_targets();
         let state = g.describe();
         if mesh.is_some() {
             let name = super::library::name(
@@ -681,7 +742,7 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let made = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let made = match mesh_pipeline(&host.device, &root, code(0), code(1), &g, &name) {
                 Ok(made) => made,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -737,7 +798,7 @@ impl HostPipeline {
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
-            PrimitiveTopologyType: host_topology(g),
+            PrimitiveTopologyType: host_topology(&g),
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
@@ -802,6 +863,34 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
     }
 }
 
+/// Whether a render target format takes blending. D3D12's integer formats do
+/// not, and a stream that enables it on one is refused whole.
+fn takes_blending(format: DXGI_FORMAT) -> bool {
+    !matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+    )
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 fn mesh_pipeline(
@@ -813,7 +902,7 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<super::library::PipelineState> {
     use windows::core::Interface;
-    /// A stream subobject: its type, then its description, pointer-aligned.
+/// A stream subobject: its type, then its description, pointer-aligned.
     #[repr(C, align(8))]
     struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
     #[repr(C)]
@@ -1227,5 +1316,112 @@ mod tests {
         let state = GraphicsState::default();
         assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
         assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
+    }
+
+    /// A title state that blends an integer target has the blend turned off for
+    /// that slot alone, and the others are left as the title wrote them. The
+    /// host refuses such a state whole (`E_INVALIDARG`), which is what the
+    /// title's mesh/pixel pipeline of the intro arrives with - slot 2 is
+    /// `R8_UINT` and its blend is enabled.
+    #[test]
+    fn a_blend_on_an_integer_target_is_turned_off_for_that_slot_only() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        for i in 0..3 {
+            g.blend.RenderTarget[i].BlendEnable = true.into();
+            g.blend.RenderTarget[i].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            g.blend.RenderTarget[i].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        }
+        // A fourth slot is past `NumRenderTargets`: not written, so not touched.
+        g.blend.RenderTarget[3].BlendEnable = true.into();
+
+        assert_eq!(g.settle_integer_targets(), 1);
+        assert!(g.blend.RenderTarget[0].BlendEnable.as_bool(), "a float target keeps its blend");
+        assert!(!g.blend.RenderTarget[1].BlendEnable.as_bool(), "the integer target's blend is off");
+        assert!(g.blend.RenderTarget[2].BlendEnable.as_bool(), "a float target keeps its blend");
+        assert!(g.blend.RenderTarget[3].BlendEnable.as_bool(), "past the target count");
+        assert_eq!(g.blend.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA, "only the enable is turned off");
+        // Settling twice turns nothing else off.
+        assert_eq!(g.settle_integer_targets(), 0);
+        // A state whose integer target the title already left unblended
+        // settles to the same thing, and so keeps the same pipeline name.
+        let mut written_off = g.clone();
+        written_off.blend.RenderTarget[1].BlendEnable = true.into();
+        assert_eq!(written_off.settle_integer_targets(), 1);
+        assert_eq!(written_off.describe(), g.describe(), "the settled state is what the name describes");
+        assert_eq!(
+            written_off.blend.RenderTarget[1].BlendEnable.as_bool(),
+            g.blend.RenderTarget[1].BlendEnable.as_bool()
+        );
+    }
+
+    /// With `IndependentBlendEnable` off - D3D12's default - slot 0's state
+    /// applies to every bound slot and `RenderTarget[1..]` is never read, so an
+    /// integer slot cannot be settled on its own and a float slot cannot be
+    /// left blending on its own. The slots are made independent, all carrying
+    /// slot 0's state, and only the integer ones give up their blend.
+    #[test]
+    fn a_shared_blend_state_stops_sharing_so_an_integer_slot_can_be_settled() {
+        // Slot 0 a float target that blends, slot 2 an integer one: what the
+        // title's own state looks like, with the slots sharing one state.
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = false.into();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        // Never read while the slots share, so the title may leave anything here.
+        g.blend.RenderTarget[2].BlendEnable = false.into();
+
+        assert_eq!(g.settle_integer_targets(), 1);
+        assert!(g.blend.IndependentBlendEnable.as_bool(), "the slots have to stop sharing");
+        assert!(g.blend.RenderTarget[0].BlendEnable.as_bool(), "the float slot keeps blending");
+        assert!(g.blend.RenderTarget[1].BlendEnable.as_bool(), "the float slot keeps blending");
+        assert!(!g.blend.RenderTarget[2].BlendEnable.as_bool(), "the integer slot does not blend");
+        assert_eq!(g.blend.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA, "slot 0's state on every slot");
+
+        // The other way round: slot 0 is the integer one, so taking its blend
+        // off must not take a float slot's blend with it.
+        let mut h = GraphicsState::default();
+        h.blend.IndependentBlendEnable = false.into();
+        h.targets.NumRenderTargets = 2;
+        h.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+        h.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        h.blend.RenderTarget[0].BlendEnable = true.into();
+        assert_eq!(h.settle_integer_targets(), 1);
+        assert!(h.blend.IndependentBlendEnable.as_bool(), "the float slot has to keep its blend");
+        assert!(!h.blend.RenderTarget[0].BlendEnable.as_bool(), "the integer slot does not blend");
+        assert!(h.blend.RenderTarget[1].BlendEnable.as_bool(), "the float slot keeps blending");
+
+        // Every bound slot integer: the shared state can simply go off, and
+        // nothing has to become independent.
+        let mut all = GraphicsState::default();
+        all.blend.IndependentBlendEnable = false.into();
+        all.targets.NumRenderTargets = 2;
+        all.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+        all.targets.RTFormats[1] = DXGI_FORMAT_R16_UINT;
+        all.blend.RenderTarget[0].BlendEnable = true.into();
+        // One slot's blend is turned off - slot 0's, which is the state all of
+        // them share.
+        assert_eq!(all.settle_integer_targets(), 1);
+        assert!(!all.blend.IndependentBlendEnable.as_bool(), "nothing to keep apart");
+        assert!(!all.blend.RenderTarget[0].BlendEnable.as_bool(), "no slot blends");
+
+        // Slot 0 not blending means no slot blends: nothing to settle.
+        let mut quiet = GraphicsState::default();
+        quiet.blend.IndependentBlendEnable = false.into();
+        quiet.targets.NumRenderTargets = 2;
+        quiet.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        quiet.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        quiet.blend.RenderTarget[0].BlendEnable = false.into();
+        quiet.blend.RenderTarget[1].BlendEnable = true.into();
+        let before = quiet.describe();
+        assert_eq!(quiet.settle_integer_targets(), 0);
+        assert_eq!(quiet.describe(), before, "a state that blends nothing is left alone");
     }
 }

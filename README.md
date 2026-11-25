@@ -212,6 +212,14 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 
+Every build also survives the host driver's compiler faulting on a pipeline
+(AMD's does on a few of the title's) or not ending one within
+`VICTORY_PIPELINE_HANG` seconds (60 when unset, `0` never gives up): the
+pipeline is noted in `compiler-faults.txt` beside the pipeline library,
+its draws are dropped, and later runs do not make it. Delete the file to
+try them again (after a driver update, say); `VICTORY_PIPELINE_GUARD=0`
+turns this off, noted pipelines included.
+
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
