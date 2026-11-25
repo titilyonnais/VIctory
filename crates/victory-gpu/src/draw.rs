@@ -3355,6 +3355,50 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A raw view the title places 4 bytes into its buffer (enough on the
+    /// console) is made over a copy of its own bytes: a host raw view's
+    /// first byte must be 16 bytes in (the device is removed otherwise);
+    /// one 16 bytes in views the buffer's copy.
+    #[test]
+    fn raw_views_off_16_bytes_get_their_own_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let src = buffer(1 << 16);
+        let (bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let start = bytes as u64;
+        // SAFETY: a plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        // 64 raw bytes placed at `address`.
+        let view = |address: u64| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            desc[..10].copy_from_slice(&[format, 1, 5768, 0, 0, 0, 16, 0, 1, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let width = |address: u64| {
+            let made = crate::descriptor::host::make_view(&view(address), at).expect("a view");
+            // SAFETY: a live buffer.
+            unsafe { made.GetDesc() }.Width
+        };
+        assert_eq!(width(start + 16), 1 << 16, "16 bytes in: the buffer's copy");
+        assert_ne!(width(start + 4), 1 << 16, "4 bytes in: its own copy");
+        let (copy, address, _) = crate::descriptor::host::view_copy(&view(start + 4)).unwrap();
+        assert_eq!((copy.range().0, address), (start + 4, start + 4));
+        assert!(copy.offset(start + 4).is_multiple_of(16), "a raw view can start there");
+    }
+
     /// A structured view the title places off its buffer's elements (the
     /// culling constants at a ring position) is made over a copy of its own
     /// bytes; one on an element views the buffer's copy.

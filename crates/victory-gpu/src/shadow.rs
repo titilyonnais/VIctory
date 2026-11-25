@@ -1268,7 +1268,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// bakes' parameter blocks: refused, their slots read zeros, every meshlet
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
-/// view or a list holds it.
+/// view or a list holds it. `element` is what the view's first byte must be
+/// a multiple of in its copy: its element size, 16 for a raw view (a host
+/// raw view 4 bytes off removes the device).
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
