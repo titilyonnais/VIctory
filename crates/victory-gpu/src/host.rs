@@ -999,6 +999,11 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<usize>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
 }
 
 impl Host {
@@ -1382,6 +1387,11 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+            // Textures shaders wrote that the title reads on the CPU
+            // ([`crate::texback`]).
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -1729,6 +1739,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -2097,6 +2108,36 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.contains(&(resource as usize)) {
+            deferred.back_wanted.push(resource as usize);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for resource in wanted {
+            let resource = resource as crate::object::This;
+            crate::list::ensure_state(self, resource, COPY_SOURCE);
+            let Some(copy) = crate::resource::host_copy(resource) else {
+                continue;
+            };
+            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -2118,7 +2159,13 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty()
+            && d.uploads.is_empty()
+            && d.writes.is_empty()
+            && d.after.is_empty()
+            && d.missed.is_empty()
+            && d.back_wanted.is_empty()
+            && d.texture_backs.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -2650,8 +2697,17 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.buffer_in_heap(size, D3D12_HEAP_TYPE_DEFAULT)
+    }
+
+    /// A buffer of `size` bytes in the read-back heap, in the copy-destination state.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.buffer_in_heap(size, D3D12_HEAP_TYPE_READBACK)
+    }
+
+    fn buffer_in_heap(&self, size: u64, heap_type: D3D12_HEAP_TYPE) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
+            Type: heap_type,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
