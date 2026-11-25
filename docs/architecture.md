@@ -97,7 +97,11 @@ runs both, again where a bound on the index of a register-relative move
 (`v_movrel*`) is proven on the per-lane form, so the move names only the
 registers it can reach. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
-comes from (table, heap, root descriptor or constant). A descriptor a
+comes from (table, heap, root descriptor or constant). What a region that
+`s_cbranch_execz` skips when no lane would run it sets in scalar registers
+(a descriptor, a table address's high half) is the region's after it:
+scalar writes are the wave's, so the per-lane branch of structurisation does
+not hold for them. A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths

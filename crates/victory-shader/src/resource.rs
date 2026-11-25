@@ -10,7 +10,10 @@
 //! `s_load_dword*`, and builds a buffer descriptor around a root
 //! descriptor's address itself. Each descriptor operand and each scalar
 //! memory address is traced through the SSA values back to those
-//! parameters, by data flow: copies, phis that agree, and additions.
+//! parameters, by data flow: copies, phis that agree, and additions. Words a
+//! region sets that `s_cbranch_execz` skips when no lane would run it are
+//! the region's after it: scalar writes are the wave's, so the per-lane
+//! branch structurisation makes of the skip does not hold for them.
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -943,10 +946,12 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// `hi` is `high` (0 for a table), possibly plus a carry, or set to it in
+    /// a region `s_cbranch_execz` can skip.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
+            || self.past_skip_is(hi, want)
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
@@ -1161,7 +1166,7 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
+        let edges: Vec<_> = (0..self.p.blocks[block].preds.len())
             .map(|j| {
                 let edge: Vec<Term> = words
                     .iter()
@@ -1172,9 +1177,127 @@ impl<'a> Tracer<'a> {
                     .collect();
                 self.classify(&edge, joins, known)
             })
-            .collect::<Result<_, _>>();
+            .collect();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        if let Some(source) = self.past_skip(block, &edges) {
+            return Ok(Some(source));
+        }
+        let args = edges.into_iter().collect::<Result<_, _>>()?;
+        Ok(Some(Source::Phi { block, args }))
+    }
+
+    /// The source of descriptor words that a region `s_cbranch_execz` can
+    /// skip sets, read after the region (joined at `block`), where the words
+    /// the skip leaves trace to no descriptor. Scalar writes are the whole
+    /// wave's, and the branch skips the region only when no lane of the wave
+    /// would run it: a lane that reaches `block` without running the region
+    /// itself reads what another lane's run set. Only a wave no lane of which
+    /// runs it reads what the skip leaves, the registers' earlier contents
+    /// (an EXEC save, a lane mask), which compiled code does not read as a
+    /// descriptor. `edges` are the words traced per predecessor of `block`.
+    /// `None` unless every edge that fails is such a skip and the others
+    /// trace to one source whose handle can be made at `block`: a constant,
+    /// or a load or a built descriptor whose address only reads values that
+    /// dominate `block`.
+    /// shortcut: a skip's edge that fails to trace is taken to hold no
+    /// descriptor; were it one tracking cannot follow, a wave no lane of
+    /// which runs the region would read that one, not the region's.
+    fn past_skip(&self, block: usize, edges: &[Result<Source, &'static str>]) -> Option<Source> {
+        let preds = &self.p.blocks[block].preds;
+        let mut found: Option<&Source> = None;
+        for (edge, &pred) in edges.iter().zip(preds) {
+            match edge {
+                Err(_) if self.skips(pred, block) => {}
+                Err(_) => return None,
+                Ok(s) if found.is_some_and(|f| f != s) => return None,
+                Ok(s) => found = Some(s),
+            }
+        }
+        let source = found?;
+        // Every edge traced: the phi of the sources stands as it is.
+        if edges.iter().all(Result::is_ok) {
+            return None;
+        }
+        let reads: Vec<Value> = match source {
+            Source::Constant(_) => Vec::new(),
+            // Lowering makes the handle where the descriptor is read, from
+            // the values the load reads for its address.
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                let Fields::Smem { base, soffset, .. } = &inst.fields else {
+                    return None;
+                };
+                let Operand::Scalar { code, .. } = *base else {
+                    return None;
+                };
+                let mut reads = vec![inst.read(Reg::S(code))?, inst.read(Reg::S(code + 1))?];
+                if let Operand::Scalar { code, .. } = *soffset
+                    && code != NULL
+                {
+                    reads.push(inst.read(Reg::S(code))?);
+                }
+                reads
+            }
+            Source::Built { address, .. } => address.dynamic.into_iter().collect(),
+            _ => return None,
+        };
+        let order = crate::ir::reverse_postorder(&self.p.blocks);
+        let idom = crate::ir::idoms(&self.p.blocks, &order, &self.rpo);
+        reads
+            .iter()
+            .all(|&v| self.dominates(v, block, &idom))
+            .then(|| source.clone())
+    }
+
+    /// Whether block `pred` ends in an `s_cbranch_execz` that skips to block
+    /// `block` (past a region, when no lane would run it).
+    fn skips(&self, pred: usize, block: usize) -> bool {
+        let from = &self.p.blocks[pred];
+        matches!(from.exit, Exit::Branch { taken, not_taken } if taken == block && not_taken != block)
+            && from
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_execz")
+    }
+
+    /// Whether `t` is `want` wherever a region that `s_cbranch_execz` can
+    /// skip has run: a phi where the region ends whose other edges are
+    /// `want`, as a table address's high half the region sets (see
+    /// [`Self::past_skip`] for why the skip's own edges do not count).
+    fn past_skip_is(&self, t: Term, want: Term) -> bool {
+        let Term::Value(v) = t else { return false };
+        let Some((b, i)) = self.phis[v.0 as usize] else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let mut ran = false;
+        for (&arg, &pred) in block.phis[i].args.iter().zip(&block.preds) {
+            if self.origin(arg) == want {
+                ran = true;
+            } else if !self.skips(pred, b) {
+                return false;
+            }
+        }
+        ran
+    }
+
+    /// Whether value `v` is defined in a block that dominates block `b` (a
+    /// value on entry is); `idom` are the immediate dominators.
+    fn dominates(&self, v: Value, b: usize, idom: &[usize]) -> bool {
+        let def = match (self.defs[v.0 as usize], self.phis[v.0 as usize]) {
+            (Some((d, _)), _) | (None, Some((d, _))) => d,
+            (None, None) => return true,
+        };
+        let mut x = b;
+        loop {
+            if x == def {
+                return true;
+            }
+            match idom[x] {
+                up if up == x || up == usize::MAX => return false,
+                up => x = up,
+            }
+        }
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -2373,6 +2496,197 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
+    }
+
+    /// Tracks `words` as a pixel program whose table is in user data 9.
+    fn tracked(words: &[u32]) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref())
+    }
+
+    /// `region` in an `if` the compiler skips with `s_cbranch_execz` when no
+    /// lane runs it, then a read through `s[8:11]` (block 0 is the test,
+    /// block 1 the region, block 2 the rest).
+    fn after_a_skippable_region(region: &[u32]) -> Vec<u32> {
+        let skip = 0xBF88_0000 | region.len() as u32;
+        let mut words = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            skip,        // s_cbranch_execz past the region
+        ];
+        words.extend(region);
+        words.extend([
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// A descriptor that a region `s_cbranch_execz` can skip loads, read
+    /// after the region (as compiled shadow-ray and probe-scheduling compute
+    /// programs do): the skip leaves registers that hold no descriptor, and
+    /// the region's scalar load is the wave's, so the read is of the loaded
+    /// one.
+    #[test]
+    fn a_descriptor_loaded_in_a_skippable_region_is_read_after_it() {
+        let r = tracked(&after_a_skippable_region(&[
+            0xF408_0201,
+            0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+        ]))
+        .unwrap();
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (1, 0),
+                first: 0
+            }
+        );
+        assert_eq!(r.scalar, [((1, 0), at(0, 0x10))]);
+    }
+
+    /// An immediate sampler set inside a region that `s_cbranch_execz` can
+    /// skip and sampled with after it (as compiled mip-filtering programs
+    /// do).
+    #[test]
+    fn a_sampler_set_in_a_skippable_region_is_the_constant_after_it() {
+        let r = tracked(&[
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0005, // s_cbranch_execz -> 0x30
+            0xB00C_0092, // s_movk_i32 s12, 0x92
+            0xBE8D_03FF,
+            0x00C0_0000, // s_mov_b32 s13, 0xc00000
+            0xBE8E_0BA8, // s_brev_b32 s14, 40
+            0xBE8F_0380, // s_mov_b32 s15, 0
+            0xBEFE_0314, // 0x30: s_mov_b32 exec_lo, s20
+            0xF080_0F08,
+            0x0060_0002, // image_sample v[0:3], v[2:3], s[0:7], s[12:15]
+            S_ENDPGM,
+        ])
+        .unwrap();
+        let sources: Vec<_> = r.descriptors.iter().map(|d| (d.role, &d.source)).collect();
+        assert_eq!(
+            sources,
+            [
+                (
+                    Role::Resource,
+                    &Source::Loaded {
+                        load: (0, 2),
+                        first: 0
+                    }
+                ),
+                (
+                    Role::Sampler,
+                    &Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])
+                ),
+            ]
+        );
+    }
+
+    /// A table address whose high half is cleared in a region
+    /// `s_cbranch_execz` can skip, loaded through after it.
+    #[test]
+    fn a_table_address_a_skippable_region_completes_is_traced_after_it() {
+        let r = tracked(&[
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> 0x14
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEFE_0314, // 0x14: s_mov_b32 exec_lo, s20
+            0xF408_0201,
+            0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ])
+        .unwrap();
+        assert_eq!(r.scalar, [((2, 1), at(0, 0x10))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (2, 1),
+                first: 0
+            }
+        );
+    }
+
+    /// Where the skip leaves a descriptor too, the read stays a choice
+    /// between the two.
+    #[test]
+    fn a_descriptor_a_skippable_region_reloads_is_still_joined() {
+        let r = tracked(&[
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> 0x24
+            0xF408_0201,
+            0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            0xBEFE_0314, // 0x24: s_mov_b32 exec_lo, s20
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ])
+        .unwrap();
+        let Source::Phi { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        let offsets: Vec<_> = args
+            .iter()
+            .map(|a| match a {
+                Source::Loaded { load, .. } => {
+                    r.scalar.iter().find(|s| s.0 == *load).unwrap().1.offset
+                }
+                a => panic!("{a:?}"),
+            })
+            .collect();
+        assert_eq!(offsets, [0, 0x10]);
+    }
+
+    /// The region's descriptor is only taken where its handle can be made
+    /// after the region: not from an offset the region computes, and not
+    /// past a branch that a uniform condition takes.
+    #[test]
+    fn a_descriptor_read_after_a_skip_otherwise_still_fails() {
+        const WHY: &str = "a descriptor neither loaded nor built";
+        let refused = |words: &[u32]| match tracked(words) {
+            Err(ShaderError::Unsupported { what, .. }) => what,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(
+            refused(&after_a_skippable_region(&[
+                0x8F05_8401, // s_lshl_b32 s5, s1, 4
+                0xF408_0201,
+                0x0A00_0000, // s_load_dwordx4 s[8:11], s[2:3], s5
+            ])),
+            WHY
+        );
+        assert_eq!(
+            refused(&[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0002, // s_cbranch_scc1 -> 0x18
+                0xF408_0201,
+                0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+                0xE000_2000,
+                0x8002_0400, // 0x18: buffer_load_format_x v4, v0, s[8:11], 0 idxen
+                S_ENDPGM,
+            ]),
+            WHY
+        );
     }
 
     /// The FidelityFX upscaler's byte accesses make a loaded buffer
