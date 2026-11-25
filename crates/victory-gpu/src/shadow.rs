@@ -1021,6 +1021,26 @@ fn outside_withheld(from: usize, to: usize, withheld: &[(usize, usize)]) -> Vec<
     ranges
 }
 
+/// The marked bits of `bits` below `end` (and so the bits themselves
+/// cleared); marks of offsets past the bitmap land in its last bit, which no
+/// copy owns. Clearing that bit's whole dword dropped the writes to the 31
+/// pages before it.
+fn drain_marks(bits: &mut [u32], end: u32) -> Vec<u32> {
+    if let Some(last) = bits.last_mut() {
+        *last &= !(1 << 31);
+    }
+    let used = (end as usize).div_ceil(32).min(bits.len());
+    let mut marked = Vec::new();
+    for (w, word) in bits[..used].iter_mut().enumerate() {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            marked.push((w * 32) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    marked
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`MarkedSlice::commit`]), except bytes in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
@@ -1039,17 +1059,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         // SAFETY: the mapped bitmap; the GPU is done with it (one submission
         // runs at a time).
         let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-        // Marks of offsets past the bitmap land in its last bit, no copy's.
-        bits[words - 1] = 0;
-        let used = (marks().end as usize).div_ceil(32).min(words);
-        for (w, word) in bits[..used].iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
-            let into = if memory && memory_withheld { &mut held } else { &mut marked };
-            while x != 0 {
-                into.push((w * 32) as u32 + x.trailing_zeros());
-                x &= x - 1;
-            }
-        }
+        let into = if memory && memory_withheld { &mut held } else { &mut marked };
+        into.extend(drain_marks(bits, marks().end));
     }
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
@@ -2081,6 +2092,18 @@ pub(crate) mod tests {
             [(page, page + 10), (page + 50, page + 80)]
         );
         assert!(outside_withheld(page, page + PAGE, &[(page, page + PAGE)]).is_empty());
+    }
+
+    /// Only the last bit of the bitmap is the sink for offsets past it; the
+    /// bits before it in its last dword belong to copies.
+    #[test]
+    fn marks_in_the_last_dword_are_read_but_the_sink_bit_is_not() {
+        let last = victory_shader::emit::VIEW_WRITE_BITS - 1;
+        let mut bits = vec![0u32; (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize];
+        let w = bits.len() - 1;
+        bits[w] = (1 << 31) | (1 << 30) | 1;
+        assert_eq!(drain_marks(&mut bits, last), [last - 31, last - 1]);
+        assert_eq!(bits[w], 0, "the sink bit is cleared too");
     }
 
     /// Mark bits are handed out in runs and come back joined.
