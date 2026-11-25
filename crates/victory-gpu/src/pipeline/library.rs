@@ -51,7 +51,7 @@
 //! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -61,8 +61,66 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a change to the translator (`victory_shader::SOURCE_HASH`) makes every
+/// name in it useless. The first run after one used to write the few
+/// pipelines it made over the old library: measured on the title, a 926 MB
+/// library (27 160 pipelines, a 7.5 minute warm-up) became 612 KB, and
+/// bisecting between two builds paid that warm-up for each of them, in
+/// turn, every time. So each translation keeps its library beside the
+/// others, in `dir/<SOURCE_HASH>`, and a run only ever writes its own;
+/// [`KEPT`] of the newest are kept.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.set(keyed(&dir));
+}
+
+/// Whether `dir` is a library directory this wrote: a name that is 16
+/// lowercase hex digits (a [`victory_shader::SOURCE_HASH`]) holding
+/// [`LIBRARY_FILE`].
+fn is_translation(dir: &Path) -> bool {
+    let ours = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+}
+
+/// How many translations keep a library: the one in use and the previous
+/// build's, which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// `dir` under this build's translation, with older libraries pruned to
+/// [`KEPT`] (by modification time).
+fn keyed(dir: &Path) -> PathBuf {
+    let path = dir.join(victory_shader::SOURCE_HASH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        // Only a directory this wrote: named like a translation and holding
+        // a library. Anything else in the cache directory (`backup/`, a
+        // copy of one) is not ours to delete.
+        .filter(|other| *other != path && is_translation(other))
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the translation that made
+        // them. Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -1244,5 +1302,37 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    /// Pruning keeps only directories this wrote: a `backup/` (or any
+    /// directory without a hash name) in the cache directory survives,
+    /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn pruning_leaves_foreign_directories_alone() {
+        let dir = std::env::temp_dir().join(format!("victory-keyed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An old directory of ours, an old one of someone else's, and the
+        // one this build uses.
+        for (name, own) in [("00112233aabbccdd", true), ("backup", false)] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("sentinel"), b"keep me").unwrap();
+            if own {
+                std::fs::write(at.join(LIBRARY_FILE), b"library").unwrap();
+            }
+        }
+        let current = dir.join(victory_shader::SOURCE_HASH);
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join(LIBRARY_FILE), b"library").unwrap();
+
+        assert_eq!(keyed(&dir), current);
+        assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
