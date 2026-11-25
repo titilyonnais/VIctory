@@ -640,7 +640,6 @@ extern "system" fn resolve(
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
         };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
@@ -652,7 +651,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            let format = resolve_format(format);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -680,6 +679,13 @@ extern "system" fn resolve(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
+}
+
+/// The host's format for a resolve in the console's `format`: the host
+/// textures of formats it has no id for (118-120) are made in `pc_format`s.
+#[cfg(windows)]
+fn resolve_format(format: u32) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::resource::pc_format(format) as i32)
 }
 
 #[repr(C)]
@@ -1574,6 +1580,14 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// A resolve names the format the host texture was made in.
+    #[cfg(windows)]
+    #[test]
+    fn resolves_name_the_formats_of_the_host_textures() {
+        assert_eq!([118, 119, 120].map(|f| resolve_format(f).0), [45, 46, 47]);
+        assert_eq!(resolve_format(28).0, 28);
     }
 
     #[test]
