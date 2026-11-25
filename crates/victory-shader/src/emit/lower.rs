@@ -6404,14 +6404,32 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f32_f64" => {
-                // A 64-bit source (a register pair) truncated to f32, as the
-                // host's `fptrunc`: MODE's 64-bit round mode is nearest even
-                // unless the title set toward zero, which has no DXIL form.
-                if self.mode16 == Some(3) {
-                    return Err("a 64-bit to 32-bit conversion toward zero");
+                // A 64-bit source truncated to f32, as the host's `fptrunc`:
+                // that rounds to nearest even, which is MODE's default; every
+                // other 64-bit round mode (directed, or written at run time)
+                // has no DXIL form and is refused rather than mis-rounded.
+                if self.mode16 != Some(0) {
+                    return Err("a 64-bit conversion in a directed or unknown round mode");
                 }
-                self.s.flags |= flags::FLOAT64;
-                let x = self.src64(inst, 0)?;
+                // The literal form below builds the 64 bits with integer
+                // shifts, so the module uses both features.
+                self.s.flags |= flags::FLOAT64 | flags::INT64;
+                // A literal source is the *high* word of the binary64 (RDNA 2
+                // ISA 6.2.1): the low word is zero. A register pair comes
+                // through `src64` as the integer its bits are.
+                let Fields::Valu(v) = &inst.fields else {
+                    return Err("a 64-bit source");
+                };
+                let i64t = self.s.m.int(64);
+                let x = match v.src.first().copied() {
+                    Some(Operand::Literal(k)) => {
+                        let k32 = self.s.m.i32(k);
+                        let hi = self.s.m.cast(c, Cast::ZExt, k32, i64t);
+                        let thirty_two = self.s.m.int_const(i64t, 32);
+                        self.s.m.bin(c, Bin::Shl, hi, thirty_two)
+                    }
+                    _ => self.src64(inst, 0)?,
+                };
                 let double = self.s.m.double();
                 let bits = self.s.m.cast(c, Cast::Bitcast, x, double);
                 let r = self.s.m.cast(c, Cast::FpTrunc, bits, self.s.t.f32);

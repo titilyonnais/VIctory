@@ -2415,3 +2415,15 @@ fn a_64_bit_value_converts_to_f32_round_to_nearest() {
         }
     });
 }
+
+/// A literal source of `v_cvt_f32_f64` is the *high* word of the binary64
+/// (RDNA 2 ISA 6.2.1), the low word being zero: 0xC0020000 is -2.25, not
+/// the sign-extended integer its bits would otherwise be.
+#[test]
+fn a_64_bit_literal_source_is_the_high_word() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, 255), 0xC002_0000]);
+    let cases = [[0u32, 0, 0, 0]];
+    run_cases(&shader, &cases, |backend, i, _in, got| {
+        assert_eq!(got, (-2.25f32).to_bits(), "{backend}: case {i}");
+    });
+}
