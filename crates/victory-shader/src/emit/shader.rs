@@ -140,6 +140,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -205,6 +208,8 @@ impl Shader {
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            heap_props: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -540,6 +545,8 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        self.heap_props.push(props);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
