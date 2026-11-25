@@ -1126,7 +1126,9 @@ mod tests {
             !prebuilt(&refused),
             "PSO whose store failed is marked prebuilt"
         );
-        let list = std::fs::read_to_string(dir.path().join("prebuilt-pipelines.txt")).unwrap();
+        // Each translation keeps its library and lists in its own directory.
+        let kept = dir.path().join(victory_shader::SOURCE_HASH);
+        let list = std::fs::read_to_string(kept.join("prebuilt-pipelines.txt")).unwrap();
         assert_eq!(list.lines().skip(1).collect::<Vec<_>>(), [stored.as_str()]);
         eprintln!("the stored key is persisted and the refused PSO remains pending");
     }
