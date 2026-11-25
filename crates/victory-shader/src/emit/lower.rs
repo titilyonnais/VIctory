@@ -211,6 +211,11 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// The `v_interp_p1*` sites each interpolation completes, to the
+    /// interpolation that completes them: a first half lowered on its own
+    /// (its completing half never reached, or the value stored before it)
+    /// gets the value it was the half of.
+    firsts: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -622,6 +627,22 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            firsts: x
+                .io
+                .interps
+                .iter()
+                .flat_map(|(_, i)| match i {
+                    // The 32-bit first half only: a 16-bit one (`p1ll_f16`)
+                    // packs two halves in a dword, and a read of the whole
+                    // dword is not the interpolation (it stays refused).
+                    Interp::Interpolated { first, .. } => first
+                        .iter()
+                        .filter(|f| p.blocks[f.0].insts[f.1].name() == "v_interp_p1_f32")
+                        .map(|f| (*f, i))
+                        .collect::<Vec<_>>(),
+                    Interp::Vertex { .. } => Vec::new(),
+                })
+                .collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -7603,7 +7624,10 @@ impl<'a> Lower<'a> {
     }
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        let Some(&interp) = self.interps.get(&site) else {
+        // A first half is lowered as the interpolation it is half of: the
+        // completing half recomputes the whole value anyway, so a title that
+        // reads the half early sees the finished one rather than nothing.
+        let Some(&interp) = self.interps.get(&site).or_else(|| self.firsts.get(&site)) else {
             return Err("the first half of an interpolation");
         };
         // Where the compiler reused the i or j register on another path, no

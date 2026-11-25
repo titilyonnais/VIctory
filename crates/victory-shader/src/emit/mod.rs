@@ -1267,6 +1267,27 @@ mod tests {
         assert!(part.to_string().contains("first half"), "{part}");
     }
 
+    /// A 32-bit first half read as a whole dword: the console value is
+    /// `attr * i` (the half), and the completing `p2` adds the rest. The
+    /// host cannot make an interpolation outward of its two halves, so the
+    /// half is lowered as the interpolation itself: the `p2` recomputes and
+    /// stores the same value, and a shader that stores the half early (this
+    /// title has two) translates instead of being dropped.
+    #[test]
+    fn a_first_half_read_early_is_the_interpolation() {
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E08_0302,    // v_mov_b32 v4, v2
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            0xBF81_0000,
+        ];
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+    }
+
     /// A pixel export before the `done` one, both under a lane guard (EXEC
     /// narrowed without a branch): the lanes outside it are discarded at the
     /// `done` export, so the first one stores in every lane. With EXEC
