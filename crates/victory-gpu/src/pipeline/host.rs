@@ -89,6 +89,17 @@ impl Default for GraphicsState {
     }
 }
 
+/// Whether a render target format holds integers (`_UINT`, `_SINT`): D3D12
+/// cannot blend those, and refuses a pipeline whose blend state enables it
+/// for such a slot (`E_INVALIDARG`). Every such DXGI format among the typed
+/// colour formats 1..=64; the `B8G8R8A8`/`B8G8R8X8` family above has none.
+fn integer_target(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 37 | 39 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+    )
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -169,6 +180,24 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state as the host takes it: blending cleared on a render
+    /// target whose format holds integers. A console title may describe
+    /// blending on such a slot (the format cannot blend, so it does
+    /// nothing); D3D12 refuses the whole pipeline instead
+    /// (`CreatePipelineState`: "the render target format at slot N ... does
+    /// not support blending", `E_INVALIDARG`), which drops every draw of
+    /// that pipeline.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let slots = (self.targets.NumRenderTargets as usize).min(blend.RenderTarget.len());
+        for (i, target) in blend.RenderTarget.iter_mut().enumerate().take(slots) {
+            if integer_target(self.targets.RTFormats[i].0 as u32) {
+                target.BlendEnable = false.into();
+            }
+        }
+        blend
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -185,7 +214,7 @@ impl GraphicsState {
             .collect();
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -632,7 +661,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -736,7 +765,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -879,5 +908,30 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+    #[test]
+    fn blending_is_cleared_only_on_integer_targets() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 6;
+        // UNORM, FLOAT, R8_UINT, R16G16_UINT, R16G16_SINT, R10G10B10A2_UNORM.
+        for (i, f) in [29u32, 10, 62, 37, 39, 24].into_iter().enumerate() {
+            g.targets.RTFormats[i] = DXGI_FORMAT(f as i32);
+        }
+        for t in &mut g.blend.RenderTarget {
+            t.BlendEnable = true.into();
+        }
+        let blend = g.host_blend();
+        let on = |i: usize| blend.RenderTarget[i].BlendEnable.as_bool();
+        assert!(on(0), "R8G8B8A8_UNORM blends");
+        assert!(on(1), "R16G16B16A16_FLOAT blends");
+        assert!(!on(2), "R8_UINT cannot");
+        assert!(!on(3), "R16G16_UINT cannot");
+        assert!(!on(4), "R16G16_SINT cannot");
+        assert!(on(5), "R10G10B10A2_UNORM blends");
+        assert!(on(6), "a slot past NumRenderTargets is left as it was");
+        assert!(
+            g.describe().starts_with(&format!("{:?} ", g.host_blend())),
+            "the name sees the state the pipeline is made from"
+        );
     }
 }
