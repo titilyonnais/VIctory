@@ -34,6 +34,11 @@ pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
+    /// A vertex (or hull, domain, geometry) shader that declares a UAV: the
+    /// validator recomputes it from the declarations and refuses the module
+    /// without it ("Flags must match usage"; #2016, #1987). #1962's
+    /// heap-usage bitmap is such a UAV in vertex programs.
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -485,7 +490,9 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self
+            .m
+            .i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -502,6 +509,17 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // A stage that traditionally had no UAVs, declaring one (#2016): every stage but pixel and
+        // compute. The validator asks it of mesh shaders too ("Flags must match usage", bit 16).
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if !self.pixel
+            && !compute
+            && (self.heap_used.is_some()
+                || self.memory_dirty.is_some()
+                || !self.root_uavs.is_empty())
+        {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -573,7 +591,8 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.memory.is_some() || self.view_addresses.is_some() {
+            if !self.root_srvs.is_empty() || self.memory.is_some() || self.view_addresses.is_some()
+            {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -610,7 +629,8 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.heap_used.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.heap_used.is_some()
+            {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -836,6 +856,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
+        }
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;

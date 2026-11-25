@@ -228,7 +228,7 @@ fn run_cases(
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
             sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
             sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
             sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
@@ -264,12 +264,12 @@ fn is_f16_nan(bits: u16) -> bool {
 #[test]
 fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     let shader = build_valu_cs(&[
-        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
-        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
-        s_mov_b32(2, 128),      // s2 = 0
-        0xBF82_0002,            // s_branch -> the join
-        s_mov_b32(2, 129),      // s2 = 1
-        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        0xBF06_0100,             // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,             // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),       // s2 = 0
+        0xBF82_0002,             // s_branch -> the join
+        s_mov_b32(2, 129),       // s2 = 1
+        0xBF85_0000,             // s_cbranch_scc1 -> the following instruction
         vop1(0x001, 0, sgpr(2)), // join: v0 = s2
     ]);
     run_cases(
@@ -644,12 +644,19 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
     let mut cases: Vec<u32> = (0..16).collect();
     // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    cases.extend([
+        0xABCD_EF05,
+        0xFFFF_FFF8,
+        0x1234_5670,
+        0x8000_000F,
+        0x0000_00F7,
+    ]);
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
         let want = nibble(cases[i]).to_bits();
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
             inp[0],
             f32::from_bits(got),
@@ -1703,15 +1710,19 @@ fn a_lane_mask_joined_with_a_number_reads_as_the_mask() {
         0xBF06_8000, // s_cmp_eq_u32 s0, 0
         0xBF85_0003, // s_cbranch_scc1 mask
         s_mov_b32(12, 255),
-        0x55, // s_mov_b32 s12, 0x55
-        0xBF82_0001, // s_branch join
-        s_mov_b32(12, 106), // mask: s_mov_b32 s12, vcc_lo
+        0x55,                     // s_mov_b32 s12, 0x55
+        0xBF82_0001,              // s_branch join
+        s_mov_b32(12, 106),       // mask: s_mov_b32 s12, vcc_lo
         vop1(0x001, 0, sgpr(12)), // join: v_mov_b32 v0, s12
     ]);
-    run_cases(&shader, &[[0; 4], [1, 0, 0, 0]], |backend, _, inputs, got| {
-        let want = if inputs[0] == 0 { 1 } else { 0x55 };
-        assert_eq!(got, want, "{backend}");
-    });
+    run_cases(
+        &shader,
+        &[[0; 4], [1, 0, 0, 0]],
+        |backend, _, inputs, got| {
+            let want = if inputs[0] == 0 { 1 } else { 0x55 };
+            assert_eq!(got, want, "{backend}");
+        },
+    );
 }
 
 /// A register array indexed through M0 whose upper registers hold
@@ -1888,7 +1899,8 @@ fn build_sample_cs(body: &[u32]) -> HostShader {
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
@@ -1949,11 +1961,17 @@ fn comparison_gathers_and_offset_samples_lower_and_validate() {
         let shader = build_sample_cs(&body(op));
         assert!(!shader.dxil.is_empty(), "{name} lowered");
     }
-    let samples: [(u16, &str); 4] = [
+    // Implicit derivatives too: in a compute program they become SampleGrad
+    // with the quad's gradients (Sample is pixel-only at validator 1.6).
+    let samples: [(u16, &str); 8] = [
         (0x027, "image_sample_lz"),
         (0x037, "image_sample_lz_o"),
         (0x034, "image_sample_l_o"),
         (0x03f, "image_sample_c_lz_o"),
+        (0x020, "image_sample"),
+        (0x025, "image_sample_b"),
+        (0x030, "image_sample_o"),
+        (0x035, "image_sample_b_o"),
     ];
     for (op, name) in samples {
         let shader = build_sample_cs(&body(op));

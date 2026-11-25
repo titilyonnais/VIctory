@@ -676,7 +676,13 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            // The note after an error says what the validator compared
+            // ("Flags declared=…, actual=…"), which tells what to fix (#2016).
+            let reason = match text.lines().find(|l| l.contains("note:")) {
+                Some(note) => format!("{first} ({})", note.trim()),
+                None => first.clone(),
+            };
+            t.fail(format!("validator: {reason}"), label);
         }
     }
 }
