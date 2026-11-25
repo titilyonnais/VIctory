@@ -439,7 +439,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     scheduler.worker_count.get_or_init(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = workers();
         let started = (0..workers)
             .filter(|i| {
                 let Some(worker) = Worker::new() else {
@@ -455,6 +455,23 @@ fn scheduler() -> Option<&'static Scheduler> {
         started
     });
     scheduler.running()
+}
+
+/// Workers to start: `VICTORY_DSTORAGE_WORKERS`, else half the host's
+/// logical processors (at least 2). One per logical processor (12 on a
+/// 6-core test machine) left them waiting on each other and on the title's
+/// guarded memory, busy but reading almost nothing, while the game's own
+/// threads and the submitting thread wanted the same cores (2026-11-25).
+/// Each worker overlaps its own reads, so fewer of them still keep the disk
+/// busy.
+fn workers() -> usize {
+    let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::env::var("VICTORY_DSTORAGE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or((logical / 2).max(2))
+        .min(64)
 }
 
 impl Scheduler {
