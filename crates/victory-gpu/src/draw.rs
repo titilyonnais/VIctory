@@ -92,6 +92,8 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Host-computed compute dispatch spread constants `[row, asked_x]`.
+    dispatch_spread: [u32; 2],
 }
 
 impl Drop for State {
@@ -633,6 +635,9 @@ impl State {
                                 None => return false,
                             }
                         }
+                        None if u.slot == victory_shader::emit::DISPATCH_SLOT => {
+                            self.dispatch_spread[usize::from(u.dword != 0)]
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -932,7 +937,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let (row, asked, gx, gy, gz) = spread_groups(x, y, z);
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -943,7 +952,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1549,12 +1558,29 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
+        };
+        let spread = if kind == DISPATCH && p.compute {
+            p.stages.first().and_then(|s| {
+                let (param, _) = s.user_data?;
+                let row_index = s
+                    .translated()
+                    .host
+                    .user_data
+                    .iter()
+                    .find(|u| u.slot == victory_shader::emit::DISPATCH_SLOT && u.dword == 0)?
+                    .index;
+                let sig = host_spread_signature(&p.root, param, row_index)?;
+                let buf = list.spread_buffer(u64::from(max.max(1)) * 20)?;
+                Some((sig, buf))
+            })
+        } else {
+            None
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1570,10 +1596,11 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let Some(signature) = spread.as_ref().map(|(s, _)| s.clone()).or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -1582,7 +1609,14 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        let spread_buf = spread.as_ref().map(|(_, b)| b);
+        if !crate::indirect::bound_spread(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            spread_buf,
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1602,8 +1636,14 @@ impl State {
             },
             _ => false,
         };
+        let exec_buf = spread_buf.unwrap_or(&args.buffer);
+        let exec_off = if spread_buf.is_some() {
+            0
+        } else {
+            args.offset(arguments)
+        };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, exec_buf);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1629,8 +1669,8 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                exec_buf,
+                exec_off,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1642,7 +1682,7 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, exec_buf);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1687,6 +1727,73 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// Spreads `x > 65,535` with `z == 1` into `(row, asked_x, row, y, rows)`.
+fn spread_groups(x: u32, y: u32, z: u32) -> (u32, u32, u32, u32, u32) {
+    if x > 65_535 && z == 1 {
+        let rows = x.div_ceil(65_535);
+        if rows <= 65_535 {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y, rows);
+        }
+    }
+    (0, x, x, y, z)
+}
+
+/// Command signature for spread indirect dispatches: 2 root constants
+/// (`row`, `asked_x`) followed by `DISPATCH` (`gx, gy, gz`), stride 20 bytes.
+fn host_spread_signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    row_index: u32,
+) -> Option<ID3D12CommandSignature> {
+    type SpreadKey = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(SpreadKey, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, row_index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: row_index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: valid argument descriptors and root signature.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(
+            &desc,
+            Some(root),
+            &mut signature,
+        )
+    };
+    if let Err(e) = result {
+        once!(error = %e, param, row_index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
     Some(signature)
 }
 

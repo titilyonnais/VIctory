@@ -326,6 +326,9 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::slot`] for host-computed compute dispatch spreading
+/// (`dword = 0`: groups per row, or `0` when unspread; `dword = 1`: asked `x` groups).
+pub const DISPATCH_SLOT: u8 = u8::MAX;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

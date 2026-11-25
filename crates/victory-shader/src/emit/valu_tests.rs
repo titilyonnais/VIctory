@@ -201,6 +201,7 @@ fn run_cases(
             for u in &shader.user_data {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Constants, super::DISPATCH_SLOT) => 0,
                     (RootType::Table, 1) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
@@ -1266,6 +1267,7 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     for u in &shader.user_data {
         ud[u.index as usize] = match (u.root, u.slot) {
             (RootType::Constants, 0) => k,
+            (RootType::Constants, super::DISPATCH_SLOT) => 0,
             (RootType::Table, 1 | 2) => 0,
             other => panic!("unexpected user data {other:?}"),
         };
@@ -1488,6 +1490,9 @@ fn image_atomics_of_64_bits() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
+            if u.slot == super::DISPATCH_SLOT {
+                continue;
+            }
             assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
             ud[u.index as usize] = 0;
         }

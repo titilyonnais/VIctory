@@ -1822,6 +1822,14 @@ impl HostList {
         }
     }
 
+    /// Allocates a temporary UAV buffer for spread indirect dispatch records
+    /// and keeps it alive until the list is reset.
+    pub(crate) fn spread_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let (buffer, _) = host()?.shared_buffer(size)?;
+        self.keep(&buffer);
+        Some(buffer)
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {

@@ -257,7 +257,9 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             for u in &shader.user_data {
                 let constants = [TITLE as u32, (TITLE >> 32) as u32, value, operand.to_bits()];
                 ud[u.index as usize] = match u.root {
-                    RootType::Constants => constants[u.dword as usize],
+                    RootType::Constants if u.slot != super::DISPATCH_SLOT => {
+                        constants[u.dword as usize]
+                    }
                     RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
                     _ => 0,
                 };
