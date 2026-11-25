@@ -2250,8 +2250,9 @@ impl HostList {
         }
     }
 
-        /// Notes a 1440p target for possible diagnostic fallback presentation.
-  #[cfg(feature = "diagnostics")]
+    /// `VICTORY_PRESENT_1440P`: notes a 2560x1440 color target this list
+    /// renders to or writes, a stand-in for a black 4K primary.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn note_1440p_target(&self, resource: crate::object::This) {
         if !crate::capture::present_1440p_on() {
             return;
@@ -2271,10 +2272,9 @@ impl HostList {
             && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
         {
             *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(crate::capture::PresentCandidate { resource: resource as usize, copy });
+                Some(crate::capture::PresentCandidate { copy });
         }
     }
-
 
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).

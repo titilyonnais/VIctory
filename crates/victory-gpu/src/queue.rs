@@ -544,38 +544,29 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        // Diagnostics, `VICTORY_PRESENT_1440P`: a 4K primary that came out
+        // black is replaced by the frame's last finished 2560x1440 color
+        // target (issue #841: the world renders there, the 4K output stays
+        // zero). A primary that is not black is shown as usual (menus,
+        // subtitles).
         #[cfg(feature = "diagnostics")]
-        let fallback_copy = if crate::capture::present_1440p_on() {
-            if let Some(candidate) = crate::capture::take_1440p_target() {
-                if let Some(candidate_res) = crate::resource::host_resource(candidate.resource as This) {
-                    if is_unwritten_4k(&texture, &candidate_res) {
-                        let state = crate::host::legal_state(&candidate_res, COPY_SOURCE);
-                        Some((candidate_res, state))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+        let fallback = crate::capture::take_1440p_target()
+            .filter(|c| is_4k(&texture) && c.copy.texture != texture)
+            .filter(|_| crate::capture::probe_now(host, &texture, state) == Some(true));
+        #[cfg(feature = "diagnostics")]
+        let shown = match &fallback {
+            Some(c) => {
+                // The candidate's tracked host state, moved for the copy and back.
+                let before = c.copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
+                let shown = host.present(&c.copy.texture, before, frame);
+                c.copy.state.store(before, Ordering::Relaxed);
+                note_fallback(frame);
+                shown
             }
-        } else {
-            None
+            None => host.present(&texture, state, frame),
         };
-        #[cfg(feature = "diagnostics")]
-        let (texture_to_present, state_to_present) = fallback_copy
-            .as_ref()
-            .map(|(res, state)| (res, *state))
-            .unwrap_or((&texture, state));
         #[cfg(not(feature = "diagnostics"))]
-        let (texture_to_present, state_to_present) = (&texture, state);
-
-        let shown = host.present(texture_to_present, state_to_present, frame);
-        #[cfg(feature = "diagnostics")]
-        if let Some((ref candidate_res, before)) = fallback_copy {
-            crate::host::legal_state(candidate_res, before);
-        }
+        let shown = host.present(&texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -620,19 +611,24 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     *last = (black, drawn, last.2);
 }
 
-
-#[cfg(feature = "diagnostics")]
-fn is_unwritten_4k(
-    primary: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    candidate: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> bool {
+/// Whether a presented texture is the console's 3840x2160 output.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn is_4k(primary: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
     // SAFETY: a live host texture.
     let desc = unsafe { primary.GetDesc() };
-    desc.Width == 3840
-        && desc.Height == 2160
-        && primary != candidate
+    (desc.Width, desc.Height) == (3840, 2160)
 }
 
+/// Counts presents that showed the 2560x1440 fallback, logged at powers
+/// of two.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_fallback(frame: u64) {
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    let n = SHOWN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(frame, shown = n, "a black 4K primary presented as the last 2560x1440 target");
+    }
+}
 
 /// A run of destination pages: how they are mapped (0 pool pages from
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
