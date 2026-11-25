@@ -456,14 +456,7 @@ impl Shadow {
                     if host != old && crate::host::read_into((start + at) as *const u8, title) {
                         // Title memory with the GPU's bytes put in; the copy
                         // takes the title's bytes in turn.
-                        let mut changed = false;
-                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                            if *h != *o && *t != *h {
-                                *t = *h;
-                                changed = true;
-                            }
-                            *h = *t;
-                        }
+                        let changed = merge_host_into_title(title, host, old);
                         #[cfg(test)]
                         tests::before_copy_back_write();
                         // Under the remap lock: a page remapped meanwhile
@@ -553,6 +546,12 @@ impl Shadow {
             was_saved,
             withheld,
         })
+    }
+
+    /// Whether the title's writes to the copy's memory are tracked (its
+    /// refreshes copy only the 64 KiB pages written).
+    pub(crate) fn is_tracked(&self) -> bool {
+        self.tracked.is_some()
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -767,6 +766,43 @@ impl Drop for Shadow {
 /// The 64 KiB title pages `[start, start + len)` touches.
 fn pages(start: u64, len: u64) -> u32 {
     ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
+}
+
+/// Applies GPU changes (`host != before`) onto `title` and syncs `host` to
+/// match `title`, processing 8 bytes at a time to skip unmodified words and
+/// avoid redundant writes to write-combined GPU shadow memory.
+fn merge_host_into_title(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+    let mut changed = false;
+    let (t_words, t_rest) = title.as_chunks_mut::<8>();
+    let (h_words, h_rest) = host.as_chunks_mut::<8>();
+    let (b_words, b_rest) = before.as_chunks::<8>();
+    for ((t, h), b) in t_words.iter_mut().zip(h_words.iter_mut()).zip(b_words) {
+        let hw = u64::from_ne_bytes(*h);
+        let bw = u64::from_ne_bytes(*b);
+        if hw == bw {
+            let tw = u64::from_ne_bytes(*t);
+            if tw != hw {
+                *h = *t;
+            }
+            continue;
+        }
+        for i in 0..8 {
+            let hb = h[i];
+            if hb != b[i] && t[i] != hb {
+                t[i] = hb;
+                changed = true;
+            }
+            h[i] = t[i];
+        }
+    }
+    for ((t, h), b) in t_rest.iter_mut().zip(h_rest.iter_mut()).zip(b_rest) {
+        if *h != *b && *t != *h {
+            *t = *h;
+            changed = true;
+        }
+        *h = *t;
+    }
+    changed
 }
 
 /// The bits of the buffer views' written-pages bitmap (`victory_shader::
@@ -1807,8 +1843,16 @@ pub(crate) mod tests {
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
         assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
         assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 not marked");
-        // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
+        // Only this copy's two bits: parallel tests' copies may hold bits in
+        // the same dwords.
+        let left = [base, base + 1]
+            .iter()
+            .filter(|&&n| {
+                // SAFETY: a dword of the mapped bitmap.
+                let word = unsafe { *bits.add(n / 32) };
+                word & 1 << (n % 32) != 0
+            })
+            .count();
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len, &[]), 0, "nothing kept to compare");
         unregister(p, p as u64);
@@ -2386,5 +2430,37 @@ pub(crate) mod tests {
         assert_eq!(title, 0x22);
         unregister(p, p as u64);
         crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn word_merge_matches_bytewise_merge() {
+        let len = 4099; // non-multiple of 8 to cover remainder path
+        let before: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut host = before.clone();
+        let mut title = before.clone();
+        // GPU writes scattered single bytes and full words (including remainder).
+        for i in [0, 3, 7, 16, 17, 18, 19, 1024, 4095, 4097, 4098] {
+            host[i] ^= 0x55;
+        }
+        // Title writes overlapping and non-overlapping bytes.
+        for i in [5, 16, 200, 201, 202, 203, 204, 205, 206, 207, 4096] {
+            title[i] ^= 0xAA;
+        }
+        let (mut ref_title, mut ref_host) = (title.clone(), host.clone());
+        let mut ref_changed = false;
+        for ((t, h), b) in ref_title.iter_mut().zip(ref_host.iter_mut()).zip(&before) {
+            if *h != *b && *t != *h {
+                *t = *h;
+                ref_changed = true;
+            }
+            *h = *t;
+        }
+        let changed = merge_host_into_title(&mut title, &mut host, &before);
+        assert_eq!(changed, ref_changed);
+        assert_eq!(title, ref_title);
+        assert_eq!(host, ref_host);
+        // Second merge where host == before and title == host reports unchanged.
+        let before2 = host.clone();
+        assert!(!merge_host_into_title(&mut title, &mut host, &before2));
     }
 }

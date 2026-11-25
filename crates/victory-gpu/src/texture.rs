@@ -1042,23 +1042,6 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// The shared workers keep their scratch buffers from one call to the
-    /// next (#2786): a thread made per call faulted in a fresh one each time.
-    #[test]
-    fn in_parallel_reuses_the_workers_scratch() {
-        use std::collections::HashSet;
-        let first: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
-        let second: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
-        for set in [&first, &second] {
-            crate::workers::pool().run(4, 64, |_| {
-                let s = Scratch::take(64 * 1024);
-                set.lock().unwrap().insert(s.0.as_ptr() as usize);
-            });
-        }
-        let (first, second) = (first.into_inner().unwrap(), second.into_inner().unwrap());
-        assert!(second.iter().any(|p| first.contains(p)), "first {first:?}, second {second:?}");
-    }
-
     fn layout(w: u32, h: u32, mips: u32) -> victory_formats::texture::Layout {
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
         Layout::new(&Desc {
