@@ -1,7 +1,8 @@
 //! End-to-end tests of descriptors whose emission needs more than one
 //! binding: a buffer read by element through the resource heap (no
-//! used-resource entry, so no stride; the view-stride table gives it), and
-//! one of two immediate samplers chosen by uniform control flow. Synthetic
+//! used-resource entry, so no stride; the view-stride table gives it), one
+//! of two immediate samplers chosen by uniform control flow, and a buffer
+//! sized and read through one descriptor load (a handle each). Synthetic
 //! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present,
 //! and run on the host GPU and WARP.
 
@@ -124,6 +125,32 @@ const HALF_LOAD_WAVE32: &[u32] = &[
     0x3406_0082, // v_lshlrev_b32 v3, 2, v0
     0xE070_1000,
     0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
+/// lane loads dword `lane` and stores it to dword `lane`, and stores the
+/// SRV's record count (its descriptor's dword 2, read as a number) to dword
+/// `32 + lane`: one descriptor load serves the loads and the size.
+const RAW_SIZE_AND_LOAD_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE030_1000,
+    0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E06_020A, // v_mov_b32 v3, s10
+    0xE070_1000,
+    0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+    0xE070_1080,
+    0x8004_0301, // buffer_store_dword v3, v1, s[16:19], 0 offen offset:128
     0xBF81_0000, // s_endpgm
 ];
 
@@ -469,6 +496,65 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(half).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A raw buffer's size read from the descriptor load its loads go through:
+/// the size in bytes, beside what the loads read. AMD's RDNA 4 driver ends
+/// the process at the pipeline's creation when both share one handle.
+#[test]
+fn a_raw_buffers_size_beside_its_loads_reads_its_byte_count() {
+    let shader = build(
+        RAW_SIZE_AND_LOAD_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![
+            entry(ResourceType::Srv, 4, 0),
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        32,
+    );
+    let data: Vec<u32> = (0..40).map(|k| 0x1000 + 7 * k).collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(64),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 0, the UAV's at 1.
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // 40 dwords: 160 bytes.
+        let want: Vec<u32> = (0..32).map(|l| 0x1000 + 7 * l).chain([160; 32]).collect();
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
