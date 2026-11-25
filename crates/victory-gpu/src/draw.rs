@@ -2902,6 +2902,68 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
     }
 
+    /// Shader views the title makes of no resource (null views: a buffer
+    /// view of 0 elements, as the world's first dispatches have, and a 2D
+    /// view) read through a table by a dispatch: nothing to copy or upload,
+    /// and the shader reads zeros. (Resource 0 was taken for a texture's;
+    /// the first such dispatch crashed, run combo-lots12, frame 2603.)
+    #[test]
+    fn null_shader_views_read_by_a_dispatch_read_zeros() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let tail = [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, tail);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        // Format, dimension, mapping, first element, count, stride, flags:
+        // R32_UINT, 0 elements; then a 2D RGBA8 view of one level.
+        let buffer: [u32; 10] = [42, 1, 0x1688, 0, 0, 0, 0, 0, 0, 0];
+        let texture: [u32; 10] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, null, &buffer, start);
+        crate::descriptor::create_srv(null, null, &texture, start + 32);
+        let mirror = title_heap.host().expect("a host view heap");
+        // As a dispatch's table finds them (`State::table_entry`).
+        let views: Vec<View> = (0..2u32)
+            .map(|i| mirror.mirror(i, start + u64::from(i) * 32, true).expect("a view"))
+            .collect();
+        assert_eq!(views, [View::Shader(0, Some(buffer)), View::Shader(0, Some(texture))]);
+        // The host slot the 2D one becomes: a null view of its kind.
+        let slots = Slots::new(1);
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT(28),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 0x1688,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        // SAFETY: a slot of a live heap.
+        unsafe {
+            let at = slots.0.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateShaderResourceView(None, Some(&desc), at);
+        }
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // SAFETY: the mapped output.
+        unsafe { std::ptr::write_bytes(data, 0xff, 64 * 64 * 16) };
+        let list = host.new_list().unwrap();
+        for view in &views {
+            readable(&list, &used(ResourceType::Srv), view, true);
+        }
+        run(&list, &slots, &read, 0, Some(&out), (8, 8));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: inside the mapped output.
+        let texel = unsafe { (data as *const [u32; 4]).read() };
+        assert_eq!(texel, [0; 4], "a null view reads zeros");
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+    }
+
     /// A texture fed from title memory given up (`resource::evict`) while a
     /// recorded list names it: the list still reads it, and the next use
     /// makes it again with its bytes from title memory.
