@@ -2016,6 +2016,55 @@ mod tests {
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 
+    /// A heap sync makes the slots whose records hold their views whole (a
+    /// constant buffer view, a view of placed memory, a copy of one) as it
+    /// does those naming table entries, and passes the others by.
+    #[test]
+    fn heap_syncs_make_the_slots_whose_records_hold_their_views_whole() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let desc = heap_desc.as_ptr().cast();
+        assert_eq!(crate::descriptor::create_heap(null, desc, &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let host = title_heap.host().expect("a host view heap");
+        // In slots 2 and 3, a constant buffer view of no memory (as above),
+        // and a 2D view of a 4x1 RGBA8 texture placed in title memory, whose
+        // slot a heap sync leaves null (no memory read) until a draw reads it.
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start + 64);
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (0x4950_0000, 0xd);
+        crate::descriptor::create_placed_srv(null, &words, &view, start + 96);
+        // SAFETY: slots 0 to 3 of the heap's memory, 32 bytes each.
+        let record =
+            |slot: u64| unsafe { ((start + slot * 32) as *const [u32; 3]).read_unaligned() };
+        let kind = |slot: u64| record(slot)[2] >> crate::descriptor::KIND_SHIFT;
+        assert_eq!(kind(2), crate::descriptor::CONSTANT, "held whole");
+        assert_eq!(kind(3), crate::descriptor::PLACED, "held whole");
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping((start + 64) as *const u8, start as *mut u8, 64) };
+        assert_eq!((record(0), record(1)), (record(2), record(3)));
+        assert!(!host.made(0) && !host.made(1), "copied as bytes: not seen yet");
+        host.sync_slots(0, 2, start, 32);
+        assert!(host.made(0) && host.made(1), "the copies are made");
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && !host.made(1) && host.made(2), "a cleared record leaves its slot");
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
