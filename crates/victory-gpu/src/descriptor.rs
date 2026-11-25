@@ -117,18 +117,20 @@ const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap.
+/// start, end, heap. Written only when a heap is made or dropped; the title
+/// threads writing views read it at once.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> =
+    std::sync::RwLock::new(Vec::new());
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` read-locked for the
+/// duration so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     drop(waited);
     let Some(&(_, _, at)) = heaps
@@ -165,7 +167,7 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -208,7 +210,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -225,7 +227,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -246,7 +248,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -263,7 +265,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -277,7 +279,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -290,7 +292,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -304,7 +306,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
@@ -463,7 +465,10 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Read by every view written and every slot a draw binds, on the
+/// title's threads at once; written when a view is first seen or its
+/// resource released.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -625,15 +630,33 @@ fn words_for(view: View) -> [u32; 2] {
         View::Placed(unordered, resource, desc) => {
             let (shape, address) = shape_of(*unordered, resource, desc);
             if address >> PLACED_ADDRESS_BITS == 0 {
-                let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(shape) = views.shape(shape) {
+                // A shape seen before, as most are, is found under the
+                // shared lock.
+                let known = VIEWS
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shape_index
+                    .get(&shape)
+                    .copied();
+                let shape = known.or_else(|| {
+                    VIEWS.write().unwrap_or_else(|e| e.into_inner()).shape(shape)
+                });
+                if let Some(shape) = shape {
                     return placed_words(shape, address);
                 }
             }
         }
         _ => {}
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    // A view seen before, as most are: its entry is found under the shared
+    // lock, which keeps `forget` from making it stale while it is looked up.
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = views.index.get(&view) {
+            return [i, views.list[i as usize].1];
+        }
+    }
+    VIEWS.write().unwrap_or_else(|e| e.into_inner()).entry(view)
 }
 
 impl View {
@@ -660,7 +683,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -685,13 +708,13 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => VIEWS
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .placed_of(i, generation),
         _ => None,
@@ -703,7 +726,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// table entry at its own generation, a constant buffer view held whole, or
 /// a placed view held whole whose shape is known.
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
@@ -948,7 +971,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1176,7 +1199,7 @@ pub(crate) mod tests {
         };
         let entries = || {
             VIEWS
-                .lock()
+                .read()
                 .unwrap()
                 .list
                 .iter()
@@ -1185,7 +1208,7 @@ pub(crate) mod tests {
         };
         let shapes = || {
             VIEWS
-                .lock()
+                .read()
                 .unwrap()
                 .shapes
                 .iter()
@@ -1238,7 +1261,7 @@ pub(crate) mod tests {
         let [_, i, _] = words();
         {
             // The entry at the last generation below the kind bits.
-            let mut views = VIEWS.lock().unwrap();
+            let mut views = VIEWS.write().unwrap();
             views.list[i as usize].1 = GENERATIONS;
         }
         record(at, View::Shader(resource, None));
@@ -1246,7 +1269,7 @@ pub(crate) mod tests {
         assert_eq!(view(at), Some(View::Shader(resource, None)));
         forget(resource);
         assert_eq!(view(at), None, "the released view's record is stale");
-        let generation = VIEWS.lock().unwrap().list[i as usize].1;
+        let generation = VIEWS.read().unwrap().list[i as usize].1;
         assert_eq!(generation, 1, "wrapped to 1, not into the kind bits");
     }
 
