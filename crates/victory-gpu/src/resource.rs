@@ -825,6 +825,9 @@ pub(crate) struct HostTexture {
     pub(crate) pending_host_writes: std::sync::atomic::AtomicUsize,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
+    /// The first mip level any use of it reads (`crate::texture::note_reads`):
+    /// `u32::MAX` until a view says, 0 once anything reads it whole.
+    pub(crate) read_from: std::sync::atomic::AtomicU32,
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
@@ -865,6 +868,7 @@ impl HostTexture {
             host_written: false.into(),
             pending_host_writes: 0.into(),
             staging: std::sync::Mutex::new(None),
+            read_from: u32::MAX.into(),
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
@@ -2112,6 +2116,40 @@ pub(crate) extern "system" fn create_at_address(
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Textures placed (by the title, without a resource object) at addresses
+/// in `[from, to)`: for the diagnostics of a texture whose unread levels
+/// another one's memory overlaps.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_textures_in(from: u64, to: u64) -> usize {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.range((from, [0; 14])..(to, [0; 14])).count()
+}
+
+/// The resource description words of a single 2D texture in the title's
+/// default layout, as a placed view carries them (tests).
+#[cfg(all(test, windows))]
+pub(crate) fn texture_words(width: u64, height: u32, format: u32, mips: u16) -> [u32; 14] {
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: mips,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 0,
+    };
+    // SAFETY: 56 bytes in the description's layout.
+    unsafe {
+        std::ptr::from_ref(&desc)
+            .cast::<[u32; 14]>()
+            .read_unaligned()
+    }
+}
 
 /// Console bytes of the placed textures [`texture_at`] made (they are never
 /// released).

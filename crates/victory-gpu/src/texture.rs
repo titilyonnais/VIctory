@@ -47,9 +47,13 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// The first level uploaded: the levels before it are never read
+    /// ([`note_reads`]), and `prefix` bytes of the memory hold the rest.
+    first: u32,
+    prefix: usize,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
-    /// memory, hashed instead).
+    /// memory, hashed instead), of its first `prefix` bytes.
     tracked: Option<crate::watch::Tracked>,
     /// Per subresource, the bytes of the texture's memory it lies in (from
     /// its start, whole layout blocks); empty where the layout gives none.
@@ -405,6 +409,10 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    // Copies and bound tables read the texture whole.
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        note_reads(&copy, 0);
+    }
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
@@ -612,8 +620,17 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
-        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
+        // The levels read only (`first` on): past their bytes may lie
+        // another texture. The rest of the layout is neither read nor
+        // detiled.
+        let read_from = |i: u32| i % self.mips >= self.first;
+        let all = || {
+            (0..self.footprints.len() as u32)
+                .filter(|&i| read_from(i))
+                .collect::<Vec<_>>()
+        };
         let size = self.layout.size as usize;
+        let prefix = self.prefix;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
@@ -623,7 +640,7 @@ impl Staging {
             if t.clean() {
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
+            let ranges = t.take(start, start + prefix);
             if ranges.is_empty() {
                 return (0, None);
             }
@@ -631,8 +648,13 @@ impl Staging {
             // textures change page by page; a whole re-read and detile of
             // each cost up to 430 MB a frame, run integ2).
             let n = self.footprints.len();
-            let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+            let span = |i: usize| {
+                self.spans
+                    .get(i)
+                    .map_or((0, prefix), |&(a, b)| (a.min(prefix), b.min(prefix)))
+            };
             let touched: Vec<usize> = (0..n)
+                .filter(|&i| read_from(i as u32))
                 .filter(|&i| {
                     let (a, b) = span(i);
                     ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
@@ -687,7 +709,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
         }
-        if !committed(self.memory, size) {
+        if !committed(self.memory, prefix) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -706,20 +728,27 @@ impl Staging {
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        // SAFETY: committed memory of the levels' bytes.
+        let tiled = unsafe { std::slice::from_raw_parts(self.memory, prefix) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        crate::copystat::add(crate::copystat::C::TexHashed, prefix as u64);
         if last.hash == Some(hash) {
-            return (size, None);
+            return (prefix, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = if prefix < size {
+            // Detiled from a layout-sized copy; the levels not read are not.
+            let mut scratch = Scratch::take(size);
+            scratch.0[..prefix].copy_from_slice(tiled);
+            self.detile(&scratch.0[..size], &every)
+        } else {
+            self.detile(tiled, &every)
+        };
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        crate::copystat::add(crate::copystat::C::TexChanged, prefix as u64);
+        (prefix, buffer.map(|(b, at)| (b, at, every)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
@@ -731,7 +760,7 @@ impl Staging {
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
         if tracing::enabled!(tracing::Level::DEBUG) {
-            if tiled.iter().all(|&b| b == 0) {
+            if tiled[..self.prefix.min(tiled.len())].iter().all(|&b| b == 0) {
                 tracing::debug!(
                     memory = ?self.memory,
                     desc = ?self.layout.desc,
@@ -834,6 +863,72 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// The first mip level a shader view (its words as the title writes them)
+/// can read: its most detailed level, or a later one where its minimum
+/// level-of-detail clamp is past it. 0 for a view of the resource as a
+/// whole and for buffers.
+pub(crate) fn first_level(view: Option<&[u32; 10]>) -> u32 {
+    let Some(w) = view else {
+        return 0;
+    };
+    // `D3D12_SHADER_RESOURCE_VIEW_DESC`: format, dimension, mapping, a pad,
+    // then the dimension's fields, the clamp last.
+    let clamp = match w[1] {
+        2 | 8 | 9 => w[6], // 1D, 3D, cube
+        4 => w[7],         // 2D
+        3 | 10 => w[8],    // 1D array, cube array
+        5 => w[9],         // 2D array
+        _ => return 0,
+    };
+    let clamp = f32::from_bits(clamp);
+    let clamp = if clamp.is_finite() && clamp > 0.0 {
+        clamp as u32
+    } else {
+        0
+    };
+    w[4].max(clamp)
+}
+
+/// Something reads `copy` from level `first` on (a shader view, or 0 for a
+/// copy or a bound table): a staging made from a later level is made again.
+pub(crate) fn note_reads(copy: &crate::resource::HostTexture, first: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if copy.read_from.load(Relaxed) <= first || copy.read_from.fetch_min(first, Relaxed) <= first {
+        return;
+    }
+    let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    if held.as_ref().is_some_and(|s| s.first > first) {
+        *held = None;
+    }
+}
+
+/// The first level to upload of a texture of `mips` levels read from
+/// `read_from` on: only single 2D textures start past level 0 (an array's
+/// slices each hold the whole chain, so its unread levels are not one
+/// range).
+fn first_uploaded(layout: &victory_formats::texture::Layout, read_from: u32, mips: u32) -> u32 {
+    use victory_formats::texture::Dimension;
+    if read_from == u32::MAX || layout.slices != 1 || layout.desc.dimension != Dimension::Tex2d {
+        return 0;
+    }
+    read_from.min(mips.saturating_sub(1))
+}
+
+/// The bytes at the start of a single texture's memory that hold its levels
+/// from `first` on: the levels are stored smallest first (the mip tail,
+/// then each larger level), so they end where level `first - 1` begins,
+/// or where the tail ends when `first` lies in the tail.
+fn readable_bytes(layout: &victory_formats::texture::Layout, first: u32) -> u64 {
+    if first == 0 || layout.slices != 1 {
+        return layout.size;
+    }
+    let k = first.min(layout.first_tail_mip) as usize;
+    match k.checked_sub(1).and_then(|k| layout.mips.get(k)) {
+        Some(next) if next.offset > 0 => next.offset,
+        _ => layout.size,
+    }
+}
+
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
 pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
@@ -880,16 +975,45 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         );
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let mips = u32::from(d.MipLevels);
+    let read_from = copy.read_from.load(std::sync::atomic::Ordering::Relaxed);
+    let first = first_uploaded(&layout, read_from, mips);
+    // Watched by 64 KiB pages: a write in the last page the levels read
+    // share with what follows them still uploads them again (only them).
+    let prefix = readable_bytes(&layout, first) as usize;
+    if first > 0 {
+        once!(
+            ?desc,
+            first,
+            read = prefix,
+            whole = layout.size,
+            "textures only viewed from a smaller level are uploaded from it on"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(
+        memory = ?memory,
+        mips,
+        first,
+        read = prefix,
+        whole = layout.size,
+        neighbours = crate::resource::placed_textures_in(
+            memory as u64 + prefix as u64,
+            memory as u64 + layout.size
+        ),
+        "texture staged"
+    );
+    let spans = spans(&layout, count, mips);
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
+        first,
+        prefix,
         memory,
-        tracked: crate::watch::track(memory as usize, layout_size, true),
+        tracked: crate::watch::track(memory as usize, prefix, true),
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
@@ -902,6 +1026,161 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(w: u32, h: u32, mips: u32) -> victory_formats::texture::Layout {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: w,
+            height: h,
+            depth: 1,
+            mips,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S_X,
+        })
+        .unwrap()
+    }
+
+    /// A texture's levels are stored smallest first: the levels from any
+    /// level on take the start of its memory, smaller as the level rises,
+    /// and level 0 on is the whole of it.
+    #[test]
+    fn the_readable_levels_are_a_prefix_of_the_memory() {
+        let l = layout(2048, 2048, 12);
+        assert!(
+            l.first_tail_mip > 0 && l.first_tail_mip < 12,
+            "{}",
+            l.first_tail_mip
+        );
+        assert_eq!(readable_bytes(&l, 0), l.size);
+        let prefixes: Vec<u64> = (0..12).map(|first| readable_bytes(&l, first)).collect();
+        for pair in prefixes.windows(2) {
+            assert!(
+                pair[1] <= pair[0],
+                "smaller from a later level: {prefixes:?}"
+            );
+        }
+        // Each level on lies inside its prefix, and none before it does.
+        for first in 1..l.first_tail_mip {
+            let end = readable_bytes(&l, first);
+            let m = &l.mips[first as usize];
+            assert!(m.offset < end, "level {first} in its prefix");
+            assert!(
+                l.mips[first as usize - 1].offset >= end,
+                "level {} outside",
+                first - 1
+            );
+        }
+        // From a level in the tail on: the tail block alone, the same for all.
+        let tail = readable_bytes(&l, l.first_tail_mip);
+        assert_eq!(readable_bytes(&l, 11), tail);
+        assert!(tail < l.size / 64, "a tail of {tail} bytes");
+        // Level 1 on is about a quarter of the memory.
+        let one = readable_bytes(&l, 1);
+        assert!(one * 3 < l.size && one * 5 > l.size, "{one} of {}", l.size);
+    }
+
+    /// Views say their first level by their most detailed level or their
+    /// level-of-detail clamp, per dimension; arrays and unknown views keep
+    /// every level.
+    #[test]
+    fn views_name_their_first_level() {
+        let view = |dimension: u32, most_detailed: u32, clamp_at: usize, clamp: f32| {
+            let mut w = [0u32; 10];
+            (w[1], w[4]) = (dimension, most_detailed);
+            w[clamp_at] = clamp.to_bits();
+            w
+        };
+        assert_eq!(first_level(None), 0);
+        assert_eq!(
+            first_level(Some(&view(4, 3, 7, 0.0))),
+            3,
+            "2D, most detailed level"
+        );
+        assert_eq!(
+            first_level(Some(&view(4, 0, 7, 2.5))),
+            2,
+            "2D, clamp 2.5 reads level 2"
+        );
+        assert_eq!(
+            first_level(Some(&view(4, 4, 7, 2.0))),
+            4,
+            "the later of the two"
+        );
+        assert_eq!(first_level(Some(&view(9, 0, 6, 5.0))), 5, "cube");
+        assert_eq!(first_level(Some(&view(5, 0, 9, 1.0))), 1, "2D array");
+        assert_eq!(first_level(Some(&view(4, 0, 7, f32::NAN))), 0);
+        assert_eq!(first_level(Some(&view(1, 9, 7, 0.0))), 0, "a buffer");
+        // Arrays are uploaded whole whatever their views read.
+        let mut array = layout(256, 256, 9);
+        assert_eq!(first_uploaded(&array, 3, 9), 3);
+        array.slices = 2;
+        assert_eq!(first_uploaded(&array, 3, 9), 0);
+        assert_eq!(
+            first_uploaded(&layout(256, 256, 9), u32::MAX, 9),
+            0,
+            "no view yet"
+        );
+        assert_eq!(
+            first_uploaded(&layout(256, 256, 9), 20, 9),
+            8,
+            "at most the last level"
+        );
+    }
+
+    /// A texture placed in title memory and viewed only from level 3 on
+    /// (the title keeps a streamed texture's small levels and places the
+    /// next texture where its larger ones would be): it is uploaded and
+    /// watched from level 3 on only, so a write past those levels (the next
+    /// texture's, past the 64 KiB watch page they share) does not upload it
+    /// again, a write inside them does, and a view of every level later
+    /// makes it whole again.
+    #[test]
+    fn a_texture_viewed_from_a_later_level_is_staged_from_it_only() {
+        let p = crate::watch::tests::pool(8);
+        let words = crate::resource::texture_words(256, 256, 28, 9);
+        let Some(r) = crate::resource::texture_at(p as u64, &words) else {
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let copy = crate::resource::host_copy(r).expect("a host copy");
+        note_reads(&copy, 3);
+        let s = staging(r, &copy.texture).expect("its staging");
+        assert_eq!(s.first, 3);
+        assert_eq!(s.prefix as u64, readable_bytes(&s.layout, 3));
+        assert!(
+            s.prefix * 16 < s.layout.size as usize,
+            "{} of {}",
+            s.prefix,
+            s.layout.size
+        );
+        let (_, _, first) = s.refresh().expect("uploaded the first time");
+        assert!(first.iter().all(|&i| i % s.mips >= 3), "levels 3 on only: {first:?}");
+        assert!(s.refresh().is_none(), "nothing written since");
+        let title = |at: usize| (p + at) as *mut u8;
+        let past = s.prefix.next_multiple_of(crate::watch::PAGE) + 16;
+        assert!(past < s.layout.size as usize);
+        // SAFETY: a byte of our pool, inside the layout.
+        unsafe { title(past).write_volatile(0x5a) };
+        assert!(
+            s.refresh().is_none(),
+            "a write past the levels read is not this texture's"
+        );
+        // SAFETY: as above.
+        unsafe { title(8).write_volatile(0xa5) };
+        assert!(s.refresh().is_some(), "a write inside them is");
+        // A view of every level: made again, whole.
+        note_reads(&copy, 0);
+        assert!(
+            copy.staging.lock().unwrap().is_none(),
+            "the staging from level 3 is let go"
+        );
+        let whole = staging(r, &copy.texture).expect("its staging again");
+        assert_eq!((whole.first, whole.prefix), (0, whole.layout.size as usize));
+        crate::watch::tests::free(p);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
