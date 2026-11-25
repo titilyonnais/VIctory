@@ -6428,6 +6428,22 @@ impl<'a> Lower<'a> {
                         let thirty_two = self.s.m.int_const(i64t, 32);
                         self.s.m.bin(c, Bin::Shl, hi, thirty_two)
                     }
+                    // An inline f32 constant is the same value as a binary64
+                    // in a 64-bit float operand, not its f32 bits widened.
+                    Some(Operand::Const(c @ 240..=248)) => {
+                        let x = [
+                            0.5f64,
+                            -0.5,
+                            1.0,
+                            -1.0,
+                            2.0,
+                            -2.0,
+                            4.0,
+                            -4.0,
+                            1.0 / (2.0 * std::f64::consts::PI),
+                        ][usize::from(c - 240)];
+                        self.s.m.int_const(i64t, x.to_bits() as i64)
+                    }
                     _ => self.src64(inst, 0)?,
                 };
                 let double = self.s.m.double();
