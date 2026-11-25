@@ -4104,7 +4104,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -4165,7 +4164,36 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
+            // Read as data and never used: a whole descriptor (eight
+            // dwords) loaded from a table or the heap that the used-resource
+            // list names as nothing else is an image's, read for its size
+            // (the pixel programs of faces scale coordinates by the size of
+            // a texture they pick by index). Its slot comes from the
+            // address, as for an image read. Other loads read the view's
+            // address (`view_addresses`). From Coderlord's fix in #1528 and
+            // #1067.
+            // shortcut: such an image is taken for 2D (its other kinds have
+            // other sizes); a view of another shape reads sizes of the wrong
+            // rank.
+            let src = Source::Loaded { load: site, first: 0 };
+            let used = self.used_kind(&src);
+            let image = count == 8
+                && self.scalar.get(&site).is_some_and(|a| {
+                    a.offset % 32 == 0
+                        && matches!(
+                            self.x.native.layout.get(a.param).map(|p| p.root),
+                            Some(RootType::Table | RootType::ResourceHeap)
+                        )
+                })
+                && used.is_none_or(|u| {
+                    matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.dwords == 8
+                });
+            if !image {
+                return self.view_addresses(inst, site, code, count);
+            }
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            return self.descriptor_words(inst, site, &src, 0, code, count, uav, (2 | u, 0x409), Some(2));
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -4220,7 +4248,28 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        self.descriptor_words(inst, site, &src, first, code, count, uav, props, image)
+    }
+
+    /// The dwords of descriptor load `inst` (at `site`, its first dword the
+    /// descriptor's `first`) that have a host value, from `GetDimensions` on
+    /// the view `props` describes ([`Self::descriptor_data`]): an image's
+    /// (`image`: its kind) or a buffer's.
+    #[allow(clippy::too_many_arguments)]
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        first: u8,
+        code: u8,
+        count: u32,
+        uav: bool,
+        props: (u32, u32),
+        image: Option<u32>,
+    ) -> Result<(), Why> {
+        const OTHER: Why = "a descriptor's address or format read as data";
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
