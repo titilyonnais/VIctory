@@ -51,7 +51,7 @@
 //! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -61,8 +61,66 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a change to the translator (`victory_shader::SOURCE_HASH`) makes every
+/// name in it useless. The first run after one used to write the few
+/// pipelines it made over the old library: measured on the title, a 926 MB
+/// library (27 160 pipelines, a 7.5 minute warm-up) became 612 KB, and
+/// bisecting between two builds paid that warm-up for each of them, in
+/// turn, every time. So each translation keeps its library beside the
+/// others, in `dir/<SOURCE_HASH>`, and a run only ever writes its own;
+/// [`KEPT`] of the newest are kept.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.set(keyed(&dir));
+}
+
+/// Whether `dir` is a library directory this wrote: a name that is 16
+/// lowercase hex digits (a [`victory_shader::SOURCE_HASH`]) holding
+/// [`LIBRARY_FILE`].
+fn is_translation(dir: &Path) -> bool {
+    let ours = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+}
+
+/// How many translations keep a library: the one in use and the previous
+/// build's, which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// `dir` under this build's translation, with older libraries pruned to
+/// [`KEPT`] (by modification time).
+fn keyed(dir: &Path) -> PathBuf {
+    let path = dir.join(victory_shader::SOURCE_HASH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        // Only a directory this wrote: named like a translation and holding
+        // a library. Anything else in the cache directory (`backup/`, a
+        // copy of one) is not ours to delete.
+        .filter(|other| *other != path && is_translation(other))
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the translation that made
+        // them. Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -420,6 +478,12 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+pub(crate) struct PipelineState {
+    pub(crate) pso: ID3D12PipelineState,
+    /// The library contains this PSO under its name.
+    pub(crate) in_library: bool,
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
@@ -428,13 +492,13 @@ pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create().map(|pso| PipelineState { pso, in_library: false });
     };
     let _held = NAMES.hold(name);
     // The interface alone under the lock: loads take up to seconds. Its
@@ -446,7 +510,7 @@ pub(crate) fn pipeline(
         .clone();
     if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+        return Ok(PipelineState { pso, in_library: true });
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -456,10 +520,11 @@ pub(crate) fn pipeline(
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
+    if in_library {
         l.added += 1;
     }
-    Ok(pso)
+    Ok(PipelineState { pso, in_library })
 }
 
 #[cfg(feature = "diagnostics")]
@@ -489,7 +554,15 @@ pub(crate) fn save(now: bool) {
     }
     let (staged, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            drop(l);
+            // Only the early list changed: the library's bytes are the ones
+            // on disk already, and a library is gigabytes (rewritten six
+            // times in 130 s with `made=0` on a 3.8 GB one, #2180).
+            if used_changed {
+                save_early_list(dir);
+            }
             return;
         }
         // SAFETY: a plain query.
@@ -544,6 +617,24 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Writes the early list alone, the library being unchanged since its last
+/// save; a failed write leaves the list for the next save.
+fn save_early_list(dir: &std::path::Path) {
+    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+        Ok(()) => tracing::info!(
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            "early pipeline list saved, host pipeline library unchanged"
+        ),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "early pipeline list not saved");
+        }
     }
 }
 
@@ -1244,5 +1335,37 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    /// Pruning keeps only directories this wrote: a `backup/` (or any
+    /// directory without a hash name) in the cache directory survives,
+    /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn pruning_leaves_foreign_directories_alone() {
+        let dir = std::env::temp_dir().join(format!("victory-keyed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An old directory of ours, an old one of someone else's, and the
+        // one this build uses.
+        for (name, own) in [("00112233aabbccdd", true), ("backup", false)] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("sentinel"), b"keep me").unwrap();
+            if own {
+                std::fs::write(at.join(LIBRARY_FILE), b"library").unwrap();
+            }
+        }
+        let current = dir.join(victory_shader::SOURCE_HASH);
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join(LIBRARY_FILE), b"library").unwrap();
+
+        assert_eq!(keyed(&dir), current);
+        assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

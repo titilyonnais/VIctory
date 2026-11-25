@@ -6,6 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::ops::Range;
 use std::sync::Arc;
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -53,7 +54,7 @@ impl Default for GraphicsState {
             StencilPassOp: D3D12_STENCIL_OP_KEEP,
             StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
         };
-        GraphicsState {
+        let mut state = GraphicsState {
             blend: D3D12_BLEND_DESC {
                 RenderTarget: [target; 8],
                 ..Default::default()
@@ -85,7 +86,26 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
-        }
+        };
+        zero_padding(&mut state.blend, &blend_padding());
+        zero_padding(&mut state.depth, &[depth_padding()]);
+        state
+    }
+}
+
+/// Zeroes the bytes of `value` at `padding`, in place: a structure read
+/// from the title's memory carries whatever lay between its fields, and the
+/// host's pipeline library tells descriptions apart by their bytes, padding
+/// included (an entry stored with other padding bytes never loads). The
+/// caller keeps `value` where it is: a move may rewrite its padding.
+fn zero_padding<T>(value: &mut T, padding: &[Range<usize>]) {
+    let bytes = std::ptr::from_mut(value).cast::<u8>();
+    for range in padding {
+        assert!(range.start <= range.end && range.end <= size_of::<T>());
+        // SAFETY: `value` is a whole `T`; these checked ranges contain only
+        // padding. Raw writes do not read the other, possibly uninitialised,
+        // padding bytes as `u8` values.
+        unsafe { bytes.add(range.start).write_bytes(0, range.len()) };
     }
 }
 
@@ -148,6 +168,24 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// Where the padding of a blend description lies: after each target's
+/// write mask, a byte in a four-byte field.
+fn blend_padding() -> [Range<usize>; 8] {
+    std::array::from_fn(|i| {
+        let target = std::mem::offset_of!(D3D12_BLEND_DESC, RenderTarget)
+            + i * size_of::<D3D12_RENDER_TARGET_BLEND_DESC>();
+        target + std::mem::offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1
+            ..target + size_of::<D3D12_RENDER_TARGET_BLEND_DESC>()
+    })
+}
+
+/// Where the padding of a depth-stencil description lies: between the
+/// stencil write mask and the front face's operations.
+fn depth_padding() -> Range<usize> {
+    std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1
+        ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, FrontFace)
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -159,10 +197,16 @@ impl GraphicsState {
         unsafe {
             let data = at.add(4);
             match kind {
-                8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                8 => {
+                    self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
+                    zero_padding(&mut self.blend, &blend_padding());
+                }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    zero_padding(&mut self.depth, &[depth_padding()]);
+                }
                 21 => {
                     // shortcut: the depth bounds test is dropped (the host
                     // pipeline uses the plain description); bring it back
@@ -178,6 +222,7 @@ impl GraphicsState {
                         FrontFace: d.FrontFace,
                         BackFace: d.BackFace,
                     };
+                    zero_padding(&mut self.depth, &[depth_padding()]);
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
@@ -339,6 +384,7 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    pub(crate) in_library: bool,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -600,8 +646,8 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
-            let pso = match made {
-                Ok(pso) => pso,
+            let made = match made {
+                Ok(made) => made,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -609,11 +655,12 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
-                pso,
+                pso: made.pso,
+                in_library: made.in_library,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -634,8 +681,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
-                Ok(pso) => pso,
+            let made = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+                Ok(made) => made,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
@@ -643,11 +690,12 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
-                pso,
+                pso: made.pso,
+                in_library: made.in_library,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -710,8 +758,8 @@ impl HostPipeline {
             // SAFETY: as above.
             || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
         );
-        let pso = match made {
-            Ok(pso) => pso,
+        let made = match made {
+            Ok(made) => made,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
@@ -719,7 +767,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::name(&made.pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
@@ -732,7 +780,8 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
-            pso,
+            pso: made.pso,
+            in_library: made.in_library,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
@@ -762,7 +811,7 @@ fn mesh_pipeline(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<super::library::PipelineState> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
     #[repr(C, align(8))]
@@ -926,6 +975,164 @@ mod tests {
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
+    #[test]
+    fn a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt() {
+        use super::super::{Prebuild, library, prebuilt, save_pipeline_cache, use_pipeline_cache};
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, range, resource};
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::core::{HSTRING, PCWSTR};
+
+        // The device's pipeline cache has process-wide state.
+        const CHILD: &str = "VICTORY_TEST_PIPELINE_STORE_REFUSAL";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::host::tests::a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                output.status.success(),
+                "pipeline cache child exited with {}\n{stdout}{stderr}",
+                output.status
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
+        eprintln!("opening the D3D12 device");
+        let Some(host) = host() else {
+            return;
+        };
+        eprintln!("creating the directly indexed root signature");
+        let Ok((root, root_bytes)) = root_signature(&host.device, &[], &[], true) else {
+            eprintln!("no directly indexed root signature; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        use_pipeline_cache(dir.path().to_owned());
+
+        // Use the same SM 6.6 DXIL path as real prebuilds. The two shaders
+        // differ in group size, so the incoming description cannot load
+        // the pipeline stored under its name.
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = |threads| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 1,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [threads, 1, 1],
+                }),
+                code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+            };
+            let (program, flow) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let flow = flow.unwrap();
+            let resources =
+                resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
+            let io = io::raise(&program, &native).unwrap();
+            emit::emit(&container, &native, &program, &flow, &io, &resources).unwrap()
+        };
+        eprintln!("emitting the synthetic compute shaders");
+        let original = shader(1);
+        let incoming = shader(2);
+        assert_ne!(original.dxil, incoming.dxil);
+        let desc = |code: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: the descriptor borrows the live root and bytecode.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let (original_desc, incoming_desc) = (desc(&original.dxil), desc(&incoming.dxil));
+        let name = library::name("compute", &root_bytes, &[&incoming.dxil], "");
+        eprintln!("storing the seed PSO");
+        let mut cache = None;
+        library::pipeline(
+            &name,
+            |lib, name| {
+                cache = Some(lib.clone());
+                // SAFETY: the descriptor borrows live data.
+                unsafe { lib.LoadComputePipeline(name, &original_desc) }
+            },
+            // SAFETY: the descriptor borrows live data.
+            || unsafe { host.device.CreateComputePipelineState(&original_desc) },
+        )
+        .expect("seed the library name");
+        let Some(cache) = cache else {
+            eprintln!("no D3D12 pipeline library; skipped");
+            return;
+        };
+        eprintln!("checking the mismatched load and refused store");
+        let wide = HSTRING::from(&name);
+        let name = PCWSTR(wide.as_ptr());
+        // SAFETY: both descriptions borrow the live root and bytecode.
+        unsafe {
+            let _: ID3D12PipelineState = cache
+                .LoadComputePipeline(name, &original_desc)
+                .expect("seeded PSO");
+            assert!(
+                cache
+                    .LoadComputePipeline::<_, ID3D12PipelineState>(name, &incoming_desc)
+                    .is_err()
+            );
+            let made: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&incoming_desc)
+                .unwrap();
+            assert_eq!(
+                cache.StorePipeline(name, &made).unwrap_err().code(),
+                E_INVALIDARG
+            );
+        }
+
+        let prebuild = |container: &[u8], host| {
+            let item = Prebuild::compute(container);
+            assert!(
+                item.shaders[0]
+                    .translated
+                    .set(Some(Translated {
+                        host,
+                        used: Vec::new()
+                    }))
+                    .is_ok()
+            );
+            item.make().expect("host PSO creation succeeds");
+            item.key()
+        };
+        eprintln!("running and saving the two prebuilds");
+        let refused = prebuild(b"refused synthetic PSO", incoming);
+        let stored = prebuild(b"stored synthetic PSO", original);
+        save_pipeline_cache();
+        assert!(prebuilt(&stored));
+        assert!(
+            !prebuilt(&refused),
+            "PSO whose store failed is marked prebuilt"
+        );
+        // Each translation keeps its library and lists in its own directory.
+        let kept = dir.path().join(victory_shader::SOURCE_HASH);
+        let list = std::fs::read_to_string(kept.join("prebuilt-pipelines.txt")).unwrap();
+        assert_eq!(list.lines().skip(1).collect::<Vec<_>>(), [stored.as_str()]);
+        eprintln!("the stored key is persisted and the refused PSO remains pending");
+    }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
@@ -983,5 +1190,42 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// The bytes of `value` no field reads (see `zero_padding`).
+    fn padding_of<T>(value: &T, padding: &[Range<usize>]) -> Vec<u8> {
+        // SAFETY: `value` is a whole `T`; only known padding ranges are read.
+        unsafe {
+            let bytes =
+                std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>());
+            padding
+                .iter()
+                .flat_map(|r| r.clone().map(|i| bytes[i]))
+                .collect()
+        }
+    }
+
+    /// Descriptions read with other bytes between their fields are the same
+    /// to the host: the title leaves what it likes there, and the pipeline
+    /// library compares those padding bytes too.
+    #[test]
+    fn read_states_carry_no_padding() {
+        // 4 bytes of type, then the longest description, the blend's.
+        let junk = vec![0xffu8; 4 + size_of::<D3D12_BLEND_DESC>()];
+        let mut state = GraphicsState::default();
+        for kind in [21, 11, 8] {
+            // SAFETY: 0xff bytes, a whole subobject of each kind.
+            unsafe { state.read(kind, junk.as_ptr()) };
+            assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
+        }
+        assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
+        // The fields themselves are the title's.
+        assert_eq!(state.blend.RenderTarget[7].RenderTargetWriteMask, 0xff);
+        assert_eq!(state.depth.StencilWriteMask, 0xff);
+        assert_eq!(state.depth.FrontFace.StencilFailOp, D3D12_STENCIL_OP(-1));
+        // So does the default state.
+        let state = GraphicsState::default();
+        assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
+        assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
     }
 }

@@ -14,14 +14,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, EXCEPTION_ACCESS_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2,
+    VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -67,6 +72,9 @@ const GRAPHICS: u64 = 3;
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+/// Coalesce adjacent placeholders on `VirtualFree(..., MEM_RELEASE | ...)` (not
+/// in windows-sys' memory module).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -729,7 +737,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_run(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -738,7 +746,9 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
-/// (Grand Theft Auto VI passes 0 for addresses to clear).
+/// (Grand Theft Auto VI passes 0 for addresses to clear). Contiguous address
+/// runs are batched into `XMemMapPhysicalPages` so consecutive physical pages
+/// become one VMA instead of one per 64 KiB page.
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -747,21 +757,32 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
+        let start = unsafe { *addresses.add(i) };
+        let start_addr = start as usize;
+        let is_unmap = pages.is_null() || unsafe { *pages.add(i) } == 0;
+        let mut run = 1;
+        while i + run < n {
+            // SAFETY: within `0..n`.
+            let next_addr = unsafe { *addresses.add(i + run) } as usize;
+            let next_unmap = pages.is_null() || unsafe { *pages.add(i + run) } == 0;
+            if next_unmap != is_unmap || next_addr != start_addr.wrapping_add(run * PAGE) {
+                break;
+            }
+            run += 1;
+        }
+        let run_pages = if is_unmap {
+            std::ptr::null()
+        } else {
+            // SAFETY: `i < n` and `pages` is non-null.
+            unsafe { pages.add(i) }
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        if XMemMapPhysicalPages(start, run, run_pages).is_null() {
             return 0;
         }
+        i += run;
     }
     1
 }
@@ -770,30 +791,155 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. Coalesces contiguous source slices into single views to stay well
+/// under Linux's `vm.max_map_count`; false if a source page is not mapped
+/// physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     let _remap = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
+    if from == 0 || len == 0 {
+        return true;
+    }
+    let mut runs: Vec<(usize, usize, Slice)> = Vec::new();
+    let mut k = 0;
+    while k < len {
         let at = from + k;
-        let Some(slice) = physical
+        let Some((&view_base, (view_size, view_slice))) = physical
             .views
             .range(..=at)
             .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
+            .filter(|(base, (size, _))| at < *base + *size)
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        let avail = (view_base + *view_size - at).min(len - k);
+        let chunk_len = avail.div_ceil(PAGE) * PAGE;
+        let slice = Slice {
+            index: view_slice.index + (at - view_base) / PAGE,
+            section: view_slice.section.clone(),
+        };
+        match runs.last_mut() {
+            Some((_, run_len, first))
+                if Arc::ptr_eq(&first.section, &slice.section)
+                    && slice.index == first.index + *run_len / PAGE =>
+            {
+                *run_len += chunk_len;
+            }
+            _ => runs.push((k, chunk_len, slice)),
+        }
+        k += chunk_len;
+    }
+    for (offset, run_len, slice) in runs {
+        if !map_run(&mut physical, to + offset, run_len, slice) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Coalesces adjacent placeholder sub-regions overlapping `[base, base + len)`
+/// within each `VirtualAlloc2` reservation (`AllocationBase`).
+///
+/// `MapViewOfFile3(..., MEM_REPLACE_PLACEHOLDER)` requires `[base, base + len)`
+/// to lie inside one contiguous placeholder. Unmapping previous views leaves
+/// split placeholders; `VirtualFree(..., MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)`
+/// merges them along exact placeholder boundaries within one reservation.
+fn coalesce_placeholders(base: usize, len: usize) {
+    if len <= PAGE {
+        return;
+    }
+    let end = base.saturating_add(len);
+    // SAFETY: pseudo handle for the current process.
+    let process = unsafe { GetCurrentProcess() };
+    let mut cursor = base;
+    while cursor < end {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying our own address space into a sized struct.
+        if unsafe {
+            VirtualQueryEx(
+                process,
+                cursor as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } == 0
+            || mbi.RegionSize == 0
+        {
+            break;
+        }
+        let region_base = mbi.BaseAddress as usize;
+        let region_end = region_base.saturating_add(mbi.RegionSize);
+        if region_end <= cursor {
+            break;
+        }
+        if mbi.State != MEM_RESERVE {
+            cursor = region_end;
+            continue;
+        }
+        // Each split placeholder has its own `AllocationBase == BaseAddress`,
+        // so walk all adjacent `MEM_RESERVE` placeholder regions across `[base, end)`.
+        let span_start = region_base;
+        let mut span_end = region_end;
+        let mut count = 1usize;
+        while span_end < end {
+            let mut next = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: querying our own address space into a sized struct.
+            if unsafe {
+                VirtualQueryEx(
+                    process,
+                    span_end as *const c_void,
+                    &mut next,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            } == 0
+                || next.RegionSize == 0
+            {
+                break;
+            }
+            if next.State != MEM_RESERVE {
+                break;
+            }
+            let next_end = (next.BaseAddress as usize).saturating_add(next.RegionSize);
+            if next_end <= span_end {
+                break;
+            }
+            span_end = next_end;
+            count += 1;
+        }
+        if count > 1 {
+            // SAFETY: `[span_start, span_end)` spans `count` adjacent
+            // placeholder sub-regions within one `AllocationBase` along exact
+            // placeholder boundaries.
+            unsafe {
+                VirtualFree(
+                    span_start as *mut c_void,
+                    span_end - span_start,
+                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                );
+            }
+        }
+        cursor = span_end;
+    }
+}
+
+/// Maps a contiguous run of slices over `[base, base + len)` as a single view,
+/// falling back to page-by-page mapping if the run spans a reservation
+/// boundary where a single `MapViewOfFile3` cannot cover it.
+fn map_run(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    if len <= PAGE {
+        return map(physical, base, len, slice);
+    }
+    if map(physical, base, len, slice.clone()) {
+        return true;
+    }
+    for k in 0..len / PAGE {
+        let page_slice = Slice {
+            section: slice.section.clone(),
+            index: slice.index + k,
+        };
+        if !map(physical, base + k * PAGE, PAGE, page_slice) {
             return false;
         }
     }
@@ -806,7 +952,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
-    let view = unsafe {
+    let try_map = || unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
@@ -824,6 +970,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             0,
         )
     };
+    let mut view = try_map();
+    if view.Value as usize != base && len > PAGE {
+        coalesce_placeholders(base, len);
+        view = try_map();
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -942,6 +1093,113 @@ fn refusal_message(
     message
 }
 
+/// Active split-and-remap window `[ACTIVE_SPLIT_LO, ACTIVE_SPLIT_HI)` while
+/// `unmap()` temporarily unmaps a coalesced multi-page view to remap its
+/// surviving head and/or tail.
+static ACTIVE_SPLIT_LO: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_SPLIT_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Lock-free ring of recently split view ranges so a thread whose access
+/// violation arrived microseconds after `unmap()` finished remapping the
+/// surviving head/tail still retries cleanly once `VirtualQuery` confirms
+/// the page is committed and accessible again.
+const SPLIT_RING_LEN: usize = 16;
+static RECENT_SPLITS: [(AtomicUsize, AtomicUsize); SPLIT_RING_LEN] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; SPLIT_RING_LEN];
+static RECENT_SPLIT_NEXT: AtomicUsize = AtomicUsize::new(0);
+static SPLIT_VEH_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+fn install_split_veh() {
+    SPLIT_VEH_INSTALLED.call_once(|| {
+        // SAFETY: installs a lock-free, allocation-free first-chance VEH.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(on_split_fault));
+        }
+    });
+}
+
+fn begin_split_window(lo: usize, hi: usize) {
+    install_split_veh();
+    let slot = RECENT_SPLIT_NEXT.fetch_add(1, Ordering::Relaxed) % SPLIT_RING_LEN;
+    RECENT_SPLITS[slot].0.store(lo, Ordering::Release);
+    RECENT_SPLITS[slot].1.store(hi, Ordering::Release);
+    ACTIVE_SPLIT_LO.store(lo, Ordering::Release);
+    ACTIVE_SPLIT_HI.store(hi, Ordering::Release);
+}
+
+fn end_split_window() {
+    ACTIVE_SPLIT_HI.store(0, Ordering::Release);
+    ACTIVE_SPLIT_LO.store(0, Ordering::Release);
+}
+
+fn in_recent_split(addr: usize) -> bool {
+    for (lo, hi) in &RECENT_SPLITS {
+        let l = lo.load(Ordering::Acquire);
+        let h = hi.load(Ordering::Acquire);
+        if l < h && addr >= l && addr < h {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe extern "system" fn on_split_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: Windows passes valid EXCEPTION_POINTERS and ExceptionRecord.
+    let rec = unsafe { &*(*info).ExceptionRecord };
+    if rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let access = rec.ExceptionInformation[0]; // 0 = read, 1 = write, 8 = DEP
+    let addr = rec.ExceptionInformation[1];
+    if access != 0 && access != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let mut waited = false;
+    loop {
+        let lo = ACTIVE_SPLIT_LO.load(Ordering::Acquire);
+        let hi = ACTIVE_SPLIT_HI.load(Ordering::Acquire);
+        if lo < hi && addr >= lo && addr < hi {
+            waited = true;
+            std::hint::spin_loop();
+        } else {
+            break;
+        }
+    }
+    if !waited && !in_recent_split(addr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // Confirm the surviving page is actually committed and permits this access
+    // before resuming; a genuinely unmapped address still propagates normally.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || mbi.State != MEM_COMMIT {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let prot = mbi.Protect & 0xff;
+    let allowed = if access == 0 {
+        prot == PAGE_READONLY
+            || prot == PAGE_READWRITE
+            || prot == PAGE_EXECUTE_READ
+            || prot == PAGE_EXECUTE_READWRITE
+    } else {
+        prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE
+    };
+    if allowed {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -964,6 +1222,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    let hit_empty = hit.is_empty();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -976,6 +1235,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                     physical.shown.remove(&key);
                 }
             }
+        }
+        let splitting = at < base || at + size > end;
+        if splitting {
+            begin_split_window(at, at + size);
         }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
@@ -995,6 +1258,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
+        if splitting {
+            end_split_window();
+        }
+    }
+    if !hit_empty && len > PAGE {
+        coalesce_placeholders(base, len);
     }
 }
 
@@ -1469,6 +1738,196 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_alias_coalesces_contiguous_pages_into_single_view() {
+        const N: usize = 4;
+        let pages = allocate(N);
+        let reserve = || {
+            let p = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                N * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!p.is_null());
+            p
+        };
+        let (src, dst) = (reserve(), reserve());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(src, N, pages.as_ptr()), src);
+
+        // Write a distinct marker byte into each page at `src`.
+        for i in 0..N {
+            // SAFETY: all `N` pages at `src` are mapped read-write.
+            unsafe { at(src, i).cast::<u8>().write(0x20 + i as u8) };
+        }
+
+        // Alias the entire `N`-page range at `dst`: must land as ONE coalesced view.
+        assert!(map_alias(dst as u64, src as u64, (N * PAGE) as u64));
+        {
+            let guard = physical();
+            let dst_views: Vec<(usize, usize)> = guard
+                .views
+                .range(dst as usize..dst as usize + N * PAGE)
+                .map(|(&base, &(len, _))| (base, len))
+                .collect();
+            assert_eq!(dst_views, vec![(dst as usize, N * PAGE)]);
+        }
+        for i in 0..N {
+            // SAFETY: all `N` pages at `dst` are mapped read-write.
+            assert_eq!(unsafe { at(dst, i).cast::<u8>().read() }, 0x20 + i as u8);
+        }
+
+        // Partially unmap page 1 of `dst` (splitting the view into head + hole + tail),
+        // then re-alias the full `N`-page range: placeholder coalescing must merge the
+        // split placeholders back so the re-alias is again ONE single view.
+        assert!(map_alias(at(dst, 1) as u64, 0, PAGE as u64));
+        assert_eq!(query(at(dst, 1)).host.State, MEM_RESERVE);
+        assert!(map_alias(dst as u64, src as u64, (N * PAGE) as u64));
+        {
+            let guard = physical();
+            let dst_views: Vec<(usize, usize)> = guard
+                .views
+                .range(dst as usize..dst as usize + N * PAGE)
+                .map(|(&base, &(len, _))| (base, len))
+                .collect();
+            assert_eq!(dst_views, vec![(dst as usize, N * PAGE)]);
+        }
+        for i in 0..N {
+            // SAFETY: all `N` pages at `dst` are mapped read-write.
+            assert_eq!(unsafe { at(dst, i).cast::<u8>().read() }, 0x20 + i as u8);
+        }
+
+        // Unmap page by page (leaving `N` separate 64 KiB placeholders), then
+        // re-alias the whole range: `map` must coalesce them into ONE view.
+        for i in 0..N {
+            assert!(map_alias(at(dst, i) as u64, 0, PAGE as u64));
+        }
+        assert!(map_alias(dst as u64, src as u64, (N * PAGE) as u64));
+        {
+            let guard = physical();
+            let dst_views: Vec<(usize, usize)> = guard
+                .views
+                .range(dst as usize..dst as usize + N * PAGE)
+                .map(|(&base, &(len, _))| (base, len))
+                .collect();
+            assert_eq!(dst_views, vec![(dst as usize, N * PAGE)]);
+        }
+
+        assert!(map_alias(dst as u64, 0, (N * PAGE) as u64));
+        assert_eq!(XMemMapPhysicalPages(src, N, std::ptr::null()), src);
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_reads_survive_coalesced_view_split() {
+        use std::sync::atomic::AtomicBool;
+        let pages = 8usize;
+        let size = pages * PAGE;
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            0,
+            PAGE_NOACCESS,
+        );
+        assert!(!base.is_null());
+        let mut phys = [0usize; 8];
+        let mut count = pages;
+        assert_ne!(XMemAllocatePhysicalPages(0, &mut count, phys.as_mut_ptr()), 0);
+        assert_eq!(count, pages);
+        assert_eq!(XMemMapPhysicalPages(base, pages, phys.as_ptr()), base);
+        let tail_ptr = (base as usize + 4 * PAGE + 0x40) as *mut u64;
+        // SAFETY: tail page is mapped and writable.
+        unsafe { tail_ptr.write_volatile(0x1122_3344_5566_7788) };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_r = stop.clone();
+        let addr = tail_ptr as usize;
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !stop_r.load(Ordering::Relaxed) {
+                // SAFETY: tail page stays logically mapped throughout head splits/remaps.
+                let v = unsafe { (addr as *const u64).read_volatile() };
+                assert_eq!(v, 0x1122_3344_5566_7788);
+                reads += 1;
+            }
+            reads
+        });
+
+        // Repeatedly split the head (pages 0..2) and remap it while reader hammers page 4.
+        for _ in 0..40 {
+            assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+            assert_eq!(XMemMapPhysicalPages(base, 2, phys.as_ptr()), base);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader thread must not crash during split");
+        assert!(reads > 0);
+
+        XMemMapPhysicalPages(base, pages, std::ptr::null());
+        XMemFreePhysicalPages(pages, phys.as_ptr());
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn scatter_coalesces_contiguous_pages_into_single_view() {
+        const N: usize = 4;
+        let pages = allocate(N);
+        let dst = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            N * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!dst.is_null());
+        let at = |page: usize| dst.wrapping_byte_add(page * PAGE);
+        let addrs: [*mut c_void; N] = std::array::from_fn(at);
+
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addrs.as_ptr(), N, pages.as_ptr()),
+            1
+        );
+        {
+            let guard = physical();
+            let dst_views: Vec<(usize, usize)> = guard
+                .views
+                .range(dst as usize..dst as usize + N * PAGE)
+                .map(|(&base, &(len, _))| (base, len))
+                .collect();
+            assert_eq!(dst_views, vec![(dst as usize, N * PAGE)]);
+        }
+        for i in 0..N {
+            // SAFETY: all `N` pages at `dst` are mapped read-write.
+            unsafe {
+                at(i).cast::<u8>().write(0x40 + i as u8);
+                assert_eq!(at(i).cast::<u8>().read(), 0x40 + i as u8);
+            }
+        }
+
+        // Contiguous unmap via scatter clears all pages back to placeholders.
+        let zeros = [0usize; N];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addrs.as_ptr(), N, zeros.as_ptr()),
+            1
+        );
+        {
+            let guard = physical();
+            assert_eq!(
+                guard
+                    .views
+                    .range(dst as usize..dst as usize + N * PAGE)
+                    .count(),
+                0
+            );
+        }
+        for i in 0..N {
+            assert_eq!(query(at(i)).host.State, MEM_RESERVE);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 }
 
