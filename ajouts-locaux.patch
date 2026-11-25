@@ -1,0 +1,88 @@
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index bd69afe..db7ae58 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -638,6 +638,9 @@ impl Prebuild {
+     pub fn make(&self) -> Result<(), String> {
+         let key = self.key();
+         library::keep_early_list();
++        // Before making it, so that a driver crash names the pipeline.
++        #[cfg(feature = "diagnostics")]
++        make::log("start", &key, || self.describe());
+         // Without the run's log lines per shader and pipeline: tens of
+         // thousands of them would bury the pre-build's own report.
+         let quiet = tracing::Dispatch::none();
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index f9c036c..f67fe6a 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -288,6 +288,23 @@ pub(crate) struct HostPipeline {
+     pub(crate) name: String,
+ }
+ 
++/// Whether `hash` is listed in `VICTORY_REFUSE_SHADERS` (16-digit shader
++/// hashes, comma-separated): its pipelines are never handed to the host's
++/// shader compiler (one that crashes on them, AMD's on RX 9070 XT).
++fn refused_by_user(hash: &str) -> bool {
++    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++    LIST.get_or_init(|| {
++        std::env::var("VICTORY_REFUSE_SHADERS")
++            .unwrap_or_default()
++            .split(',')
++            .map(|h| h.trim().to_ascii_lowercase())
++            .filter(|h| !h.is_empty())
++            .collect()
++    })
++    .iter()
++    .any(|h| h == hash)
++}
++
+ /// Logs a pipeline that gets no host pipeline, once per reason.
+ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+@@ -303,6 +320,9 @@ impl HostPipeline {
+     /// A host pipeline for vertex and pixel shaders with the graphics
+     /// state `g`, or for one compute shader.
+     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
++        if shaders.iter().any(|s| refused_by_user(&s.hash)) {
++            return refuse("a shader listed in VICTORY_REFUSE_SHADERS", shaders);
++        }
+         let find = |stage| shaders.iter().find(|s| s.stage == stage);
+         let compute = match shaders {
+             [cs] if cs.stage == "compute" => Some(cs),
+@@ -470,6 +490,22 @@ impl HostPipeline {
+                 return None;
+             }
+         };
++        // Diagnostics: `VICTORY_HOST_DXIL_DUMP=<dir>` writes each shader's DXIL
++        // as `<hash>.dxil` before the host compiles it.
++        #[cfg(feature = "diagnostics")]
++        if let Some(dir) = std::env::var_os("VICTORY_HOST_DXIL_DUMP") {
++            for (s, _) in &stages {
++                if let Some(t) = s.translated() {
++                    let path = std::path::Path::new(&dir).join(format!("{}.dxil", s.hash));
++                    if !path.exists() {
++                        let _ = std::fs::write(path, &t.host.dxil);
++                    }
++                }
++            }
++            if std::env::var_os("VICTORY_HOST_DXIL_DUMP_ONLY").is_some() {
++                return None;
++            }
++        }
+         let code = |i: usize| {
+             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+                 D3D12_SHADER_BYTECODE::default(),
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index 855c64e..495ff86 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -140,7 +140,7 @@ pub(crate) fn log_built(key: &str) {
+ /// once made or loaded (`built`, also from the pre-build), to compare what
+ /// a run creates with what the pre-build makes.
+ #[cfg(feature = "diagnostics")]
+-fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
++pub(crate) fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+     use std::collections::HashSet;
+     use std::io::Write;
+     static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
