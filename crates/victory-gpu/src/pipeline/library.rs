@@ -547,7 +547,15 @@ pub(crate) fn save(now: bool) {
     }
     let (staged, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            drop(l);
+            // Only the early list changed: the library's bytes are the ones
+            // on disk already, and a library is gigabytes (rewritten six
+            // times in 130 s with `made=0` on a 3.8 GB one, #2180).
+            if used_changed {
+                save_early_list(dir);
+            }
             return;
         }
         // SAFETY: a plain query.
@@ -602,6 +610,24 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Writes the early list alone, the library being unchanged since its last
+/// save; a failed write leaves the list for the next save.
+fn save_early_list(dir: &std::path::Path) {
+    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+        Ok(()) => tracing::info!(
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            "early pipeline list saved, host pipeline library unchanged"
+        ),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "early pipeline list not saved");
+        }
     }
 }
 
