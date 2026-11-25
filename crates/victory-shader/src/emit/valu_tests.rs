@@ -1612,3 +1612,196 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// SMEM `s_load_dwordx4` or `s_load_dwordx8` with a constant byte offset.
+const fn s_load_dwords(op: u32, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op & 0xFF) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// MIMG sequential-address instruction (`dim`: 1 = 2D).
+const fn mimg_sample(
+    op: u16,
+    dmask: u8,
+    dim: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+) -> [u32; 2] {
+    [
+        0x3C << 26
+            | ((op as u32 & 0x7F) << 18)
+            | ((dmask as u32 & 0xF) << 8)
+            | ((dim as u32 & 7) << 3)
+            | ((op as u32 >> 7) & 1),
+        ((ssamp as u32 >> 2) & 0x1F) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+/// A 1-thread compute shader with a Texture2D SRV at table 0, a raw UAV at
+/// index 1 and a sampler at table 0. `body` leaves four dwords in v8..v11.
+fn build_sample_cs(body: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.push(s_mov_b32(7, 0x80));
+    words.extend_from_slice(&s_load_dwords(0x03, 16, 4, 0));
+    words.extend_from_slice(&s_load_dwords(0x02, 24, 4, 32));
+    words.extend_from_slice(&s_load_dwords(0x02, 12, 6, 0));
+    words.push(vop1(0x001, 0, 0x80));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    words.extend_from_slice(body);
+    for k in 0..4u8 {
+        words.extend_from_slice(&buffer_store_dword(8 + k, 24, u16::from(k) * 4));
+    }
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+    shader
+}
+
+#[test]
+fn comparison_gathers_and_offset_samples_lower_and_validate() {
+    // The opcodes and address order of the comparison gather and the `_o`
+    // sample forms: previously all were refused by name.
+    let body = |op: u16| {
+        let mut words = Vec::new();
+        for reg in 1..=4u8 {
+            words.push(vop1(0x001, reg, 0x80)); // zero address dwords
+        }
+        words.extend_from_slice(&mimg_sample(op, 0x1, 1, 8, 1, 16, 12));
+        words
+    };
+    let cmps: [(u16, &str); 2] = [
+        (0x04f, "image_gather4_c_lz"),
+        (0x05f, "image_gather4_c_lz_o"),
+    ];
+    for (op, name) in cmps {
+        let shader = build_sample_cs(&body(op));
+        assert!(!shader.dxil.is_empty(), "{name} lowered");
+    }
+    let samples: [(u16, &str); 4] = [
+        (0x027, "image_sample_lz"),
+        (0x037, "image_sample_lz_o"),
+        (0x034, "image_sample_l_o"),
+        (0x03f, "image_sample_c_lz_o"),
+    ];
+    for (op, name) in samples {
+        let shader = build_sample_cs(&body(op));
+        assert!(!shader.dxil.is_empty(), "{name} lowered");
+    }
+}
