@@ -485,6 +485,20 @@ impl Shadow {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
     }
 
+    /// Advances any snapshot segments covering `[offset, offset + data.len())`
+    /// to `data`, so a later declared copy-back neither takes those bytes for
+    /// the GPU's nor puts them back over a later title write.
+    fn sync_snapshot(&self, offset: usize, data: &[u8]) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let end = offset + data.len();
+        for (at, bytes) in before.0.iter_mut() {
+            let (s, e) = ((*at).max(offset), (*at + bytes.len()).min(end));
+            if s < e {
+                bytes[s - *at..e - *at].copy_from_slice(&data[s - offset..e - offset]);
+            }
+        }
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -843,6 +857,9 @@ impl MarkedSlice<'_> {
         let host =
             unsafe { std::slice::from_raw_parts_mut(self.copy.data.add(self.from - start), n) };
         if !self.was_saved && *host == self.before[..] {
+            // Equal to title memory as prepared: so is the snapshot of
+            // declared ranges over the slice (see below).
+            self.copy.sync_snapshot(self.from - start, host);
             return Some((0, false));
         }
         let mut title = vec![0u8; n];
@@ -861,6 +878,10 @@ impl MarkedSlice<'_> {
             let _writing = crate::watch::writing(self.from, n);
             crate::host::write_mapped(self.from as *mut u8, title.as_ptr(), n);
         }
+        // The host slice is title memory now; so is the snapshot of declared
+        // ranges over it: their copy-backs must not take the title's bytes
+        // the merge took for the GPU's.
+        self.copy.sync_snapshot(self.from - start, host);
         Some((if changed { n } else { 0 }, changed))
     }
 }
@@ -1697,6 +1718,38 @@ pub(crate) mod tests {
         let read = |at: usize| unsafe { ((addr + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(20)), (0xaa, 0xbb));
         unregister(addr, addr as u64);
+    }
+
+    /// A marked copy-back advances the snapshot of the declared range over
+    /// the same page with the copy, so that range's copy-back does not put
+    /// the title's bytes it took back over a title write made since.
+    #[test]
+    fn a_declared_copy_back_after_a_marked_one_keeps_newer_title_writes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // SAFETY: bytes of our pool.
+        let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.writing(p, PAGE, false);
+        // A shader writes byte 10; the title writes byte 40 meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        write(40, 0x11);
+        let slice = copy.prepare_marked(p).expect("an armed page is prepared");
+        assert!(slice.commit().is_some_and(|(n, _)| n > 0));
+        drop(slice);
+        // The title writes both bytes again before the declared copy-back.
+        write(10, 0x22);
+        write(40, 0x23);
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        assert_eq!([read(10), read(40)], [0x22, 0x23]);
+        unregister(p, p as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
