@@ -61,15 +61,20 @@ fn heap_uav_inference_and_glc_coherence_set_handle_properties() {
     // Both reloaded `s_buffer_load_dword` uses on `s[20:23]` resolve to the
     // same UAV @ 0 (`0x500B` for `glc`, `0x100B` plain) and reuse its entry
     // handles instead of creating a new read-only SRV (`0x000B`) handle.
+    // Each buffer descriptor's load also makes the handle its size queries
+    // take, of the same properties; none is read here, so none is written.
     assert_eq!(
         l.heap_props,
         vec![
             (0x100B, 0), // UAV @ 0 handle (load + store + reloaded scalar load)
+            (0x100B, 0), // its size queries' handle
             (0x000B, 0), // read-only SRV @ 1 handle
+            (0x000B, 0), // its size queries' handle
             (0x500B, 0), // buffer_load_dword glc + reloaded scalar glc on UAV @ 0
             (0x000B, 0), // s_buffer_load_dword on read-only heap constants @ 2
         ]
     );
+    assert_eq!(l.heap_handles, 4);
 }
 
 #[test]
