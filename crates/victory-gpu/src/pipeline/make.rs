@@ -349,7 +349,15 @@ static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // `VICTORY_PIPELINE_THREADS` sets how many (issue #2124: AMD's shader
+        // compiler on RX 9070 XT crashes when several make pipelines at once).
+        let n = std::env::var("VICTORY_PIPELINE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            });
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
