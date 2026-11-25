@@ -9608,6 +9608,9 @@ impl<'a> Lower<'a> {
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
+        // Ballots and mask numbers below go at the end of the block writing
+        // the mask.
+        self.cur_ir = usize::MAX;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -9633,6 +9636,18 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A lane mask joined with a number (a traversal keeps
+                    // lane masks as numbers on its LDS stack): with console
+                    // lanes the mask as a number is the console's.
+                    (_, false)
+                        if read
+                            && self.mask_data == MaskData::Console
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.mask_dword(arg)
+                            .map_err(|why| Stop::Retry(phi.value, why))?
+                    }
                     (Some(Val::Missing(why)), _) if read => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -9656,11 +9671,24 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let untracked = || unsupported(offset, "a lane-mask join of an untracked mask");
+                let x = match self.x.st.masks.get(&arg) {
+                    Some(&m) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // No lane from this edge reads it (a register the
+                    // compiler reuses): any mask will do.
+                    None if self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg) => {
+                        self.s.m.bool(false)
+                    }
+                    // A mask that arrives as a number (popped from a
+                    // traversal's stack): with console lanes it is the
+                    // console's, and the lane takes its own bit.
+                    None if self.console_lanes && !p.wave64 => match self.vals.get(&arg) {
+                        Some(&Val::I32(word)) => self.lane_bit(qb, word, None),
+                        _ => return Err(untracked()),
+                    },
+                    None => return Err(untracked()),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

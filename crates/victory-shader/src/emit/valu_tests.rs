@@ -1539,6 +1539,27 @@ fn src_scc_reads_as_zero_or_one() {
     }
 }
 
+/// A register that holds a lane mask on one path and a number on the
+/// other, read as a number after the join (a traversal keeps lane masks as
+/// numbers on its LDS stack): the mask is the console's, lane 0's bit here.
+#[test]
+fn a_lane_mask_joined_with_a_number_reads_as_the_mask() {
+    let shader = build_valu_cs(&[
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 mask
+        s_mov_b32(12, 255),
+        0x55, // s_mov_b32 s12, 0x55
+        0xBF82_0001, // s_branch join
+        s_mov_b32(12, 106), // mask: s_mov_b32 s12, vcc_lo
+        vop1(0x001, 0, sgpr(12)), // join: v_mov_b32 v0, s12
+    ]);
+    run_cases(&shader, &[[0; 4], [1, 0, 0, 0]], |backend, _, inputs, got| {
+        let want = if inputs[0] == 0 { 1 } else { 0x55 };
+        assert_eq!(got, want, "{backend}");
+    });
+}
+
 /// A register array indexed through M0 whose upper registers hold
 /// descriptor words, which have no host value: the indices are clamped
 /// (`v_med3_u32`, `v_and_b32`), so the moves reach only v8-v11, and the
