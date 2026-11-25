@@ -1528,3 +1528,132 @@ fn gathers_at_a_level_a16_packed_lshl_or_validates_src2_high_half() {
     const_neg_one.push(0x0000_3C00);
     build_packed(&const_neg_one).expect("constant -1.0f16 LOD with zero high half in src2");
 }
+
+/// A wave64 lane-mask join whose mask along one edge is a program input
+/// the pass does not derive from EXEC or a VALU result (`Structured::other`),
+/// as `CS_IrradianceCache_Shade` joins `s[6:7]`: with console lanes the
+/// lane tests its own bit of it on that edge, as a select does.
+#[test]
+fn a_wave64_mask_join_of_an_input_mask_lowers() {
+    let code: [u32; 18] = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0001, // s_cbranch_scc1 join
+        0xBE80_046A, // s_mov_b64 s[0:1], vcc
+        0xD501_0001,
+        0x0001_0280, // join: v_cndmask_b32 v1, 0, 1, s[0:1]
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0003,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v3, -1, v3
+        0x3404_0682, // v_lshlrev_b32 v2, 2, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let l = lowered(&native).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut l.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        heap_usage: l.heap_usage,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Only where 64-lane waves run (the hardware adapter, as the console).
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("no 64-lane waves on this adapter; not run");
+        return;
+    };
+    for inputs in [[0x8000_0005u32, 3, 0, 0], [0x8000_0005, 3, 1, 0]] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let mask = u64::from(inputs[1]) << 32 | u64::from(inputs[0]);
+        for lane in 0..64 {
+            let want = if inputs[2] == 0 {
+                (mask >> lane) as u32 & 1
+            } else {
+                u32::from(lane == 0)
+            };
+            assert_eq!(out[0][lane], want, "lane {lane}, inputs {inputs:x?}");
+        }
+    }
+}

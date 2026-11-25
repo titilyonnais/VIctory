@@ -10648,14 +10648,26 @@ impl<'a> Lower<'a> {
                     None if self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg) => {
                         self.s.m.bool(false)
                     }
-                    // A mask that arrives as a number (popped from a
-                    // traversal's stack): with console lanes it is the
-                    // console's, and the lane takes its own bit.
-                    None if self.console_lanes && !p.wave64 => match self.vals.get(&arg) {
-                        Some(&Val::I32(word)) => self.lane_bit(qb, word, None),
-                        _ => return Err(untracked()),
-                    },
-                    None => return Err(untracked()),
+                    None => {
+                        let word = match self.vals.get(&arg) {
+                            Some(&Val::I32(w)) if self.console_lanes && !p.wave64 => Some(w),
+                            _ => None,
+                        };
+                        match (word, self.x.st.other.get(&arg).copied()) {
+                            // A mask that arrives as a number (popped from a
+                            // traversal's stack): with console lanes it is
+                            // the console's, and the lane takes its own bit.
+                            (Some(word), _) => self.lane_bit(qb, word, None),
+                            // A mask the pass does not derive from EXEC or a
+                            // VALU result (a program input, a constant, a
+                            // uniform select): the lane's bit, as a select
+                            // on it reads it.
+                            (None, Some(m)) => {
+                                self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                            }
+                            (None, None) => return Err(untracked()),
+                        }
+                    }
                 };
                 incoming.push((x, qb));
             }
