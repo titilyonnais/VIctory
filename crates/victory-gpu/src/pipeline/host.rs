@@ -522,7 +522,12 @@ impl HostPipeline {
                 if let Some(t) = s.translated() {
                     let path = std::path::Path::new(&dir).join(format!("{}.dxil", s.hash));
                     if !path.exists() {
-                        let _ = std::fs::write(path, &t.host.dxil);
+                        let _ = std::fs::write(&path, &t.host.dxil);
+                        // A compute pipeline's root signature, for
+                        // `examples/one_pipeline.rs` to make it alone.
+                        if compute.is_some() {
+                            let _ = std::fs::write(path.with_extension("rts"), &root_blob);
+                        }
                     }
                 }
             }

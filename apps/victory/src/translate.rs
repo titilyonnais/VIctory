@@ -341,6 +341,27 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);
     }
+    // Diagnostics: `VICTORY_CONTAINER_DUMP=<dir>` with
+    // `VICTORY_CONTAINER_DUMP_LIST=<file>` (16-digit hashes, one per line)
+    // writes those containers as `<hash>.bin` and translates nothing, for
+    // `victory-shader`'s `one_pipeline` example.
+    #[cfg(feature = "diagnostics")]
+    let dump = match std::env::var_os("VICTORY_CONTAINER_DUMP") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            victory_core::ensure_outside_repo(&dir)?;
+            std::fs::create_dir_all(&dir)?;
+            let list = std::env::var_os("VICTORY_CONTAINER_DUMP_LIST")
+                .ok_or_else(|| anyhow::anyhow!("VICTORY_CONTAINER_DUMP_LIST is not set"))?;
+            let hashes: Vec<String> = std::fs::read_to_string(list)?
+                .lines()
+                .map(|l| l.trim().to_ascii_lowercase())
+                .filter(|l| !l.is_empty())
+                .collect();
+            Some((dir, hashes))
+        }
+        None => None,
+    };
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
@@ -372,6 +393,17 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 let container = &bytes[..size.min(bytes.len())];
                                 let hash = blake3::hash(container);
                                 if !lock(&seen).insert(hash) {
+                                    continue;
+                                }
+                                #[cfg(feature = "diagnostics")]
+                                if let Some(dump) = &dump {
+                                    let short = &hash.to_hex()[..16];
+                                    if dump.1.iter().any(|h| h == short) {
+                                        let _ = std::fs::write(
+                                            dump.0.join(format!("{short}.bin")),
+                                            container,
+                                        );
+                                    }
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
