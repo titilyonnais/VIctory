@@ -537,6 +537,117 @@ impl Module {
         }
     }
 
+    /// Which globals are written: every external one, and each internal
+    /// constant that an instruction of a block the entry reaches, or
+    /// metadata, reads ([`Module::fold_constant_branches`] may leave a
+    /// table read only on a path no longer taken).
+    fn used_globals(&self) -> Vec<bool> {
+        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
+        if used.iter().all(|&u| u) {
+            return used;
+        }
+        let mut mark = |v: V| {
+            if let V::Global(i) = v {
+                used[i as usize] = true;
+            }
+        };
+        for m in &self.mds {
+            if let MdDef::Value(_, v) = m {
+                mark(*v);
+            }
+        }
+        let mut reached = vec![false; self.blocks.len()];
+        let mut work = vec![0usize];
+        if let Some(r) = reached.first_mut() {
+            *r = true;
+        } else {
+            work.clear();
+        }
+        while let Some(b) = work.pop() {
+            let blk = &self.blocks[b];
+            for &i in blk.phis.iter().chain(&blk.body) {
+                for_each_operand(&self.insts[i as usize].op, &mut mark);
+            }
+            for s in self.successors(b) {
+                if !reached[s] {
+                    reached[s] = true;
+                    work.push(s);
+                }
+            }
+        }
+        used
+    }
+
+    /// The value of `v` if it is an `i1` constant.
+    fn const_bool(&self, v: V) -> Option<bool> {
+        let V::Const(i) = v else {
+            return None;
+        };
+        match &self.consts[i as usize] {
+            (ty, Const::Int(x)) if self.types[ty.0 as usize] == TypeDef::Int(1) => Some(*x != 0),
+            _ => None,
+        }
+    }
+
+    /// Branches on a constant condition become plain branches, and the
+    /// blocks no longer reachable leave the phis they fed. Translation
+    /// proves many uniform branches one way (an EXEC known non-empty, say)
+    /// and still branched on the constant: Grand Theft Auto VI's
+    /// `CS_ScreenProbes_ActivateRays` had 8,745 such branches among 22,312
+    /// blocks, and the AMD driver compiling it grew by gigabytes a minute
+    /// until the process ran out of memory (#1012). Unreachable blocks are
+    /// not written ([`Module::write`] lays out what the entry reaches).
+    pub fn fold_constant_branches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let mut cut: Vec<(usize, usize)> = Vec::new();
+        for b in 0..n {
+            if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term
+                && t != f
+                && let Some(taken) = self.const_bool(c)
+            {
+                let (to, dropped) = if taken { (t, f) } else { (f, t) };
+                self.blocks[b].term = Some(Term::Br(to));
+                cut.push((b, dropped));
+            }
+        }
+        if cut.is_empty() {
+            return;
+        }
+        let mut reached = vec![false; n];
+        let mut work = vec![0usize];
+        reached[0] = true;
+        while let Some(b) = work.pop() {
+            for s in self.successors(b) {
+                if !reached[s] {
+                    reached[s] = true;
+                    work.push(s);
+                }
+            }
+        }
+        // The edge each fold removed, then every edge from a block no
+        // longer reached.
+        cut.sort_unstable();
+        for b in 0..n {
+            if !reached[b] {
+                continue;
+            }
+            for id in self.blocks[b].phis.clone() {
+                let Op::Phi(incoming) = &self.insts[id as usize].op else {
+                    continue;
+                };
+                let kept: Vec<(V, usize)> = incoming
+                    .iter()
+                    .copied()
+                    .filter(|&(_, from)| reached[from] && cut.binary_search(&(from, b)).is_err())
+                    .collect();
+                self.insts[id as usize].op = Op::Phi(kept);
+            }
+        }
+    }
+
     /// Gives every loop header one back edge, as DXC's code has:
     /// vkd3d-proton's DXIL conversion keeps one per header, takes any other
     /// for a forward edge and then recurses without end over the cycle that
@@ -669,8 +780,25 @@ impl Module {
                 "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
             ),
         );
-        let first_const = (self.globals.len() + self.funcs.len()) as u64;
-        for g in &self.globals {
+        // Internal constants nothing reached reads are left out (the
+        // validator refuses an unused one): the global ids close up.
+        let kept = self.used_globals();
+        let mut gid = vec![u32::MAX; self.globals.len()];
+        let mut written = 0u32;
+        for (i, &k) in kept.iter().enumerate() {
+            if k {
+                gid[i] = written;
+                written += 1;
+            }
+        }
+        let first_const = (written as usize + self.funcs.len()) as u64;
+        for g in self
+            .globals
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k)
+            .map(|(g, _)| g)
+        {
             // [type, address space << 2 | explicit type | constant, init id
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
@@ -716,7 +844,7 @@ impl Module {
         }
 
         // Value ids: globals, functions, constants, instructions.
-        let globals = self.globals.len() as u32;
+        let globals = written;
         let funcs = globals + self.funcs.len() as u32;
         let const_id = |i: u32| u64::from(funcs + i);
         w.enter(CONSTANTS_BLOCK, 4);
@@ -814,7 +942,11 @@ impl Module {
         }
         let abs = |v: V| -> u32 {
             match v {
-                V::Global(i) => i,
+                V::Global(i) => {
+                    let id = gid[i as usize];
+                    assert_ne!(id, u32::MAX, "use of a global left out");
+                    id
+                }
                 V::Func(i) => globals + i,
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
@@ -873,7 +1005,12 @@ impl Module {
         w.exit();
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
-        let names = self.globals.iter().map(|g| &g.name);
+        let names = self
+            .globals
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k)
+            .map(|(g, _)| &g.name);
         for (i, name) in names.chain(self.funcs.iter().map(|f| &f.name)).enumerate() {
             let mut r = vec![i as u64];
             r.extend(chars(name));
@@ -1301,6 +1438,85 @@ mod tests {
 
     /// The written bytes are pinned to what the writer produced before the
     /// worklist and the reused record buffers.
+    /// A branch on a constant becomes a plain branch; the blocks it no
+    /// longer reaches (here two in a row) leave the join's phi, which keeps
+    /// what the taken path brings.
+    #[test]
+    fn constant_branches_fold_and_dead_paths_leave_phis() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [entry, taken, dead, deader, join] = [(); 5].map(|()| m.new_block());
+        let (one, two, three) = (m.i32(1), m.i32(2), m.i32(3));
+        let yes = m.bool(true);
+        m.terminate(entry, Term::CondBr(yes, taken, dead));
+        let x = m.bin(taken, Bin::Add, one, two);
+        m.terminate(taken, Term::Br(join));
+        let y = m.bin(dead, Bin::Add, two, three);
+        m.terminate(dead, Term::Br(deader));
+        m.terminate(deader, Term::Br(join));
+        let p = m.phi(join, i32t);
+        m.set_phi(p, vec![(x, taken), (y, deader)]);
+        m.terminate(join, Term::Ret);
+        m.fold_constant_branches();
+        assert_eq!(m.successors(entry), [taken]);
+        let V::Inst(id) = p else { panic!() };
+        let Op::Phi(incoming) = &m.insts[id as usize].op else {
+            panic!()
+        };
+        assert_eq!(incoming[..], [(x, taken)]);
+        let _ = m.write();
+
+        // A constant table read only on the dropped path is not written
+        // (the validator refuses an unused internal global); one read on
+        // the path taken is.
+        let table = |m: &mut Module, name: &str, block: usize| {
+            let i32t = m.int(32);
+            let arr = m.array(2, i32t);
+            let (a, b) = (m.i32(7), m.i32(8));
+            let init = m.aggregate(arr, &[a, b]);
+            let g = m.constant_global(name, init);
+            let zero = m.i32(0);
+            let at = m.element(block, g, zero);
+            m.load(block, at)
+        };
+        let mut m = Module::default();
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [entry, taken, dead] = [(); 3].map(|()| m.new_block());
+        let yes = m.bool(true);
+        m.terminate(entry, Term::CondBr(yes, taken, dead));
+        table(&mut m, "dead_table", dead);
+        table(&mut m, "used_table", taken);
+        m.terminate(taken, Term::Ret);
+        m.terminate(dead, Term::Ret);
+        let unfolded = m.write();
+        m.fold_constant_branches();
+        assert_eq!(m.used_globals(), [false, true]);
+        // Written without the dead block nor its table (no id is dangling:
+        // `write` asserts every global it refers to is kept).
+        assert!(m.write().len() < unfolded.len());
+        // A false condition takes the other way; a branch on a value stays.
+        let mut m = Module::default();
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [entry, a, b] = [(); 3].map(|()| m.new_block());
+        let no = m.bool(false);
+        m.terminate(entry, Term::CondBr(no, a, b));
+        let (one, two) = (m.i32(1), m.i32(2));
+        let c = m.cmp(a, pred::IULT, one, two);
+        m.terminate(a, Term::CondBr(c, b, b));
+        m.terminate(b, Term::Ret);
+        m.fold_constant_branches();
+        assert_eq!(m.successors(entry), [b]);
+        assert_eq!(m.successors(a), [b, b]);
+        let _ = m.write();
+    }
+
     /// A loop header with two back edges gets one, through a new block that
     /// joins what each brings (vkd3d-proton keeps one per header).
     #[test]
