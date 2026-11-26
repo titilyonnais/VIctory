@@ -3185,10 +3185,17 @@ fn crossed_parts<'a>(
 
 /// Whether a refresh waits for flights that write what it reads through
 /// another host copy ([`refreshes_cross`], [`crosses_declared`];
-/// `VICTORY_REFRESH_WAIT=0`: it does not, as before).
+/// `VICTORY_REFRESH_WAIT=1`; off by default).
+///
+/// Off: the wait cost too much. In the same build and the same part of the
+/// game (4,600-4,700 draws a frame, 350-880 s), 2.6 waits a frame took
+/// preparing out of step with the card and the copy-back: median 6.9 frames
+/// a second against 11.8 without, p10 5.1 against 11.1, worst frame 275 ms
+/// against 109 (runs tri-jouable, tri-jouable-sans). Doing those parts on
+/// the card, out of the copy that the flight writes, would not wait.
 fn refresh_wait() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Whether a refresh of `runs` reads title memory that a flight in the air
