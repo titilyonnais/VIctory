@@ -892,18 +892,10 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
-/// Ensures the vectored exception handler is installed (also used to recover
-/// from unmapped-page faults in [`crate::host`]'s fast user-space copy).
-pub(crate) fn ensure_installed() {
-    install();
-}
-
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
-    use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, NTSTATUS,
-    };
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -911,17 +903,6 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
-        // A fault inside the fast copy fails it, whatever it is (a guard page
-        // raises STATUS_GUARD_PAGE_VIOLATION): but a breakpoint or a step is
-        // the debugger's.
-        #[cfg(target_arch = "x86_64")]
-        if r.ExceptionCode != EXCEPTION_BREAKPOINT as NTSTATUS
-            && r.ExceptionCode != EXCEPTION_SINGLE_STEP as NTSTATUS
-            // SAFETY: the exception context is valid for the duration of the handler.
-            && crate::host::recover_copy(unsafe { &mut *(*info).ContextRecord })
-        {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
