@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! (host slots 0-3); the keyboard and mouse drive one stand-in gamepad
+//! ([`keyboard`]), merged into the host pads. The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod keyboard;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -61,8 +63,9 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// The keyboard's older stand-in gamepad (virtual key, button), with
+/// `VICTORY_KEYBOARD=vk`; README lists it. Sticks: W/A/S/D left, I/J/K/L
+/// right; triggers Z and C. The default is by position ([`keyboard`]).
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -111,6 +114,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The mouse since the last call; nothing while it does not steer.
+    fn mouse(&mut self) -> keyboard::Mouse {
+        keyboard::Mouse::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -351,6 +358,9 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// How keys and the mouse make the stand-in pad.
+    layout: keyboard::Layout,
+    stick: keyboard::MouseStick,
 }
 
 pub struct Hub {
@@ -384,7 +394,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool, settings: &keyboard::Settings) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -398,6 +408,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                layout: settings.layout,
+                stick: keyboard::MouseStick::new(settings),
             }),
             returned: Condvar::new(),
         }));
@@ -413,7 +425,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let hub = Hub::new(source, one_pad(), keyboard::settings());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -430,12 +442,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,20 +495,32 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: keyboard::Mouse,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let stick = self.stick.update(mouse.dx, mouse.dy, now);
+        let stand_in = keyboard::pad(self.layout, &keys, &mouse, stick);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
-        let any_pad = pads.iter().any(Option::is_some);
+        // The keyboard and mouse also play the first host pad, so they work
+        // beside a connected one; with none they have the stand-in.
+        let first = pads.iter().position(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = pad.map(|p| {
+                if Some(slot) == first {
+                    merged(p, stand_in)
+                } else {
+                    p
+                }
+            });
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = first.is_none().then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -548,7 +574,7 @@ impl State {
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
-    Box::new(host::Host::default())
+    Box::new(host::Host::new(keyboard::settings().mouse))
 }
 
 #[cfg(not(windows))]
@@ -1119,6 +1145,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1132,7 +1159,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+        SetCursorPos,
     };
 
     use super::*;
@@ -1174,9 +1202,37 @@ mod host {
         }
     }
 
+    /// Virtual keys of the mouse buttons and of the mouse's on/off key.
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    const VK_MBUTTON: i32 = 0x04;
+    const VK_F8: i32 = 0x77;
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The mouse may steer (`VICTORY_MOUSE`).
+        mouse: bool,
+        /// F8 turned it off.
+        paused: bool,
+        f8_down: bool,
+        /// It steered at the last poll: the cursor sits in the middle.
+        steering: bool,
+    }
+
+    impl Host {
+        pub(super) fn new(mouse: bool) -> Host {
+            Host {
+                mouse,
+                ..Host::default()
+            }
+        }
+    }
+
+    /// Whether a key or mouse button is down now.
+    fn down(vk: i32) -> bool {
+        // SAFETY: a plain query.
+        unsafe { GetAsyncKeyState(vk) < 0 }
     }
 
     impl Source for Host {
@@ -1233,6 +1289,58 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        /// With one of our windows in front, the cursor goes back to its
+        /// middle every poll and the way it moved is the mouse's movement;
+        /// our window hides it meanwhile. F8 lets go of it (and takes it
+        /// again). Without focus the cursor is left alone.
+        fn mouse(&mut self) -> keyboard::Mouse {
+            if !self.mouse {
+                return keyboard::Mouse::default();
+            }
+            let f8 = down(VK_F8);
+            let focused = focused();
+            if f8 && !self.f8_down && focused {
+                self.paused = !self.paused;
+                tracing::info!(steering = !self.paused, "mouse");
+            }
+            self.f8_down = f8;
+            // SAFETY: plain queries; a null window is not iconic.
+            let window = unsafe { GetForegroundWindow() };
+            let steer = focused && !self.paused && unsafe { IsIconic(window) } == 0;
+            victory_gpu::HIDE_CURSOR.store(steer, std::sync::atomic::Ordering::Relaxed);
+            let was = std::mem::replace(&mut self.steering, steer);
+            if !steer {
+                return keyboard::Mouse::default();
+            }
+            let mut rect = RECT::default();
+            let mut at = POINT::default();
+            // SAFETY: room for the answers.
+            if unsafe { GetWindowRect(window, &mut rect) == 0 || GetCursorPos(&mut at) == 0 } {
+                self.steering = false;
+                return keyboard::Mouse::default();
+            }
+            let middle = POINT {
+                x: rect.left + (rect.right - rect.left) / 2,
+                y: rect.top + (rect.bottom - rect.top) / 2,
+            };
+            if at.x != middle.x || at.y != middle.y {
+                // SAFETY: a plain call.
+                unsafe { SetCursorPos(middle.x, middle.y) };
+            }
+            // The first poll in front only takes the cursor: the window was
+            // perhaps just clicked, far from its middle.
+            if !was {
+                return keyboard::Mouse::default();
+            }
+            keyboard::Mouse {
+                dx: at.x - middle.x,
+                dy: at.y - middle.y,
+                left: down(VK_LBUTTON),
+                right: down(VK_RBUTTON),
+                middle: down(VK_MBUTTON),
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1334,6 +1442,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: keyboard::Mouse,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1346,6 +1455,9 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
+        fn mouse(&mut self) -> keyboard::Mouse {
+            self.0.lock().unwrap().mouse
+        }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
         }
@@ -1356,8 +1468,15 @@ mod tests {
     }
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_set(one_pad, keyboard::Settings::vk())
+    }
+
+    fn fake_set(
+        one_pad: bool,
+        settings: keyboard::Settings,
+    ) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad, &settings);
         hub.poll();
         (hub, host)
     }
@@ -1606,6 +1725,48 @@ mod tests {
         assert_eq!(pad(hub), PadState::default());
         assert_eq!(log.lock().unwrap().len(), 1);
         assert!(!hub.state().slots[2].connected);
+    }
+
+    #[test]
+    fn keys_by_position_play_beside_a_host_pad() {
+        use keyboard::key;
+        let at = |scan_code: u32| KeyState {
+            scan_code,
+            ..Default::default()
+        };
+        for one_pad in [true, false] {
+            let (hub, host) = fake_set(one_pad, keyboard::Settings::default());
+            let last = |hub: &Hub, index: usize| {
+                let state = hub.state();
+                match &state.slots[index].history.back().unwrap().value {
+                    Value::Pad(p) => *p,
+                    Value::Keys(_) => unreachable!(),
+                }
+            };
+            // A DualSense (through XInput) in slot 0, the stick half left.
+            host.lock().unwrap().pads[0] = Some(PadState {
+                buttons: B,
+                left_x: -0.5,
+                ..Default::default()
+            });
+            // AZERTY Z (QWERTY W) and the left mouse button.
+            host.lock().unwrap().keys = vec![at(key::W)];
+            host.lock().unwrap().mouse = keyboard::Mouse {
+                left: true,
+                ..Default::default()
+            };
+            hub.poll();
+            let p = last(hub, if one_pad { FALLBACK } else { 0 });
+            assert_eq!(
+                (p.buttons, p.left_x, p.left_y, p.right_trigger),
+                (B, -0.5, 1.0, 1.0),
+                "one pad: {one_pad}"
+            );
+            if !one_pad {
+                // The stand-in stays away beside a host pad.
+                assert!(!hub.state().slots[FALLBACK].connected);
+            }
+        }
     }
 
     #[test]

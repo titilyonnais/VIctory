@@ -9467,6 +9467,14 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_SETCURSOR
+        && (lparam.0 & 0xFFFF) as u32 == HTCLIENT
+        && crate::HIDE_CURSOR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        // SAFETY: no cursor while the mouse steers the camera.
+        unsafe { SetCursor(None) };
+        return LRESULT(1);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }

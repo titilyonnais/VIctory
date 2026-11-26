@@ -93,6 +93,11 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// Set while the mouse steers the title's camera (`gameinput`): our window
+/// shows no cursor over its client area.
+pub static HIDE_CURSOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -250,17 +250,29 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. The keyboard and mouse are a pad too while the title's
+window has focus, merged into the host pads. Keys count by position (scan
+code), so on AZERTY the WASD block is ZQSD; names below are QWERTY:
 
 | Keys | Pad |
 |------|-----|
-| W A S D / I J K L | left / right stick |
+| W A S D | left stick |
+| mouse, I J K L, keypad 8 4 5 6 | right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| Left Shift or Enter, R or Backspace, Space, F | A, B, X, Y |
+| Tab or Q, E | left, right shoulder |
+| right mouse or Z, left mouse or X | left, right trigger |
+| Left Ctrl, C or middle mouse | left, right stick click |
+| Esc, V | Menu, View |
+
+The mouse holds the cursor in the middle of the focused window; F8 lets it
+go and takes it again. `VICTORY_MOUSE=0` turns the mouse off,
+`VICTORY_MOUSE_SENS` (1: full deflection at 2000 pixels a second),
+`VICTORY_MOUSE_DEADZONE` (0.2) and `VICTORY_MOUSE_INVERT=1` tune it.
+`VICTORY_KEYBOARD=vk` brings back the older table by key label (W A S D /
+I J K L sticks, Enter Backspace X Y for A B X Y, Q / E shoulders, Z / C
+triggers, F / H stick clicks, Esc / Tab Menu / View; no mouse unless
+`VICTORY_MOUSE=1`), `VICTORY_KEYBOARD=off` no keyboard pad at all.
 
 ## Commands
 
