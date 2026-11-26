@@ -616,6 +616,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _binding = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RecordBindUs);
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -713,7 +715,11 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
+            #[cfg(feature = "diagnostics")]
+            let tabling = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RecordTablesUs);
             let made = self.tables(list, &t.used, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(tabling);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).

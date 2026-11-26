@@ -797,12 +797,15 @@ impl HostHeap {
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record already and readable as it is (what the
         // checks below find under the lock): nothing to make. A draw's
-        // placed texture takes the slow path, which re-mirrors it once a
-        // later view upgraded its host texture (`needs_remake`).
+        // placed texture is made again once a later view upgraded its host
+        // texture (`needs_remake`), which asks only the `kept` lock: every
+        // draw reading placed textures through tables took the `made` lock
+        // for this check, and title threads recording waited ~210 ms a
+        // world frame (summed) on it.
         if tag == VIEW_TAG
             && self.ready[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
-            && !(for_draw && is_placed_texture(&view))
+            && !(for_draw && is_placed_texture(&view) && self.needs_remake(index, &view, for_draw))
         {
             return Some(view);
         }
@@ -816,35 +819,7 @@ impl HostHeap {
             self.clear(&mut made, index);
             return None;
         };
-        // A placed texture's view left null below is made when a draw reads
-        // the slot through a table; until then the slot is not made again
-        // (heap syncs revisit it at every submission). Also re-mirror if a
-        // later unordered or renderable view upgraded the memory's HostTexture.
-        let needs_remake = || {
-            if !for_draw || !is_texture(&view) {
-                return false;
-            }
-            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
-                .as_ref()
-                .map(|(res, _)| windows::core::Interface::as_raw(res));
-            let Some(held) = held else {
-                return true;
-            };
-            is_placed_texture(&view)
-                && placed_texture(&view).is_some_and(|p| {
-                    let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
-                        return false;
-                    };
-                    !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
-                        windows::core::Interface::as_raw(&copy.texture) == held
-                            || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
-                                t.planes
-                                    .iter()
-                                    .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
-                            })
-                    })
-                })
-        };
+        let needs_remake = || self.needs_remake(index, &view, for_draw);
         if made[index as usize] == key && !needs_remake() {
             return Some(view);
         }
@@ -883,6 +858,36 @@ impl HostHeap {
         }
         self.install(&mut made, index, key, &view, later);
         Some(view)
+    }
+
+    /// Whether a draw (`for_draw`) reading slot `index`, made from `view`,
+    /// needs it made again: a placed texture's view left null below is made
+    /// when a draw reads the slot through a table (until then heap syncs
+    /// leave it); and a slot whose memory's host texture a later unordered
+    /// or renderable view upgraded is made again. Asks only the `kept`
+    /// lock.
+    fn needs_remake(&self, index: u32, view: &View, for_draw: bool) -> bool {
+        if !for_draw || !is_texture(view) {
+            return false;
+        }
+        let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+            .as_ref()
+            .map(|(res, _)| windows::core::Interface::as_raw(res));
+        let Some(held) = held else {
+            return true;
+        };
+        is_placed_texture(view)
+            && placed_texture(view).is_some_and(|p| {
+                let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
+                    return false;
+                };
+                !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
+                    windows::core::Interface::as_raw(&copy.texture) == held
+                        || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
+                            t.planes.iter().any(|p| windows::core::Interface::as_raw(&p.texture) == held)
+                        })
+                })
+            })
     }
 
     /// Slot `index` holds no view of ours (never written, or of a resource

@@ -167,8 +167,12 @@ pub(crate) enum C {
     /// Title threads waiting for a heap's slots lock in `mirror` (binding
     /// or writing views).
     TitleLockUs,
+    /// Of recording: binding a draw's or dispatch's pipeline and arguments
+    /// (`draw::State::bind`), and of that, its tables.
+    RecordBindUs,
+    RecordTablesUs,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 98;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -428,10 +432,13 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::GpuBusyMaxUs as usize] * frames),
     );
     tracing::info!(
-        "title threads per frame (summed): recording draws and dispatches {:.1} ms, other list calls {:.1} ms; \
+        "title threads per frame (summed): recording draws and dispatches {:.1} ms (binding {:.1} ms, \
+         of it tables {:.1} ms), other list calls {:.1} ms; \
          in ExecuteCommandLists {:.1} ms, in PresentX {:.1} ms (both with the host submissions they make); \
          waiting for heap slots' locks {:.1} ms",
         ms(c[C::RecordDrawUs as usize]),
+        ms(c[C::RecordBindUs as usize]),
+        ms(c[C::RecordTablesUs as usize]),
         ms(c[C::RecordStateUs as usize]),
         ms(c[C::QueueExecuteUs as usize]),
         ms(c[C::PresentUs as usize]),
