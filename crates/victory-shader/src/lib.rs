@@ -26,7 +26,10 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 3;
+/// 7: d16 accesses of a typed view in a table ask the host's word for its
+/// kind too (an integer view's halves are integers, not f16); 4 to 6 are
+/// other branches'.
+pub const TRANSLATOR_VERSION: u32 = 7;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

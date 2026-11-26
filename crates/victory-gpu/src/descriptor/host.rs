@@ -1009,6 +1009,11 @@ pub(crate) struct TextureQueue {
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
+    /// Slots found changed after their upload with nothing to tell of it:
+    /// textures the title rewrites in place all the time (the planes of a
+    /// video on a TV or phone screen), looked at every frame
+    /// (`crate::draw`, `VICTORY_LIVE_TEXTURES`).
+    live: std::collections::HashSet<u32>,
 }
 
 /// A bit for each slot of a heap's [`TextureQueue`], changed under its lock
@@ -1059,6 +1064,7 @@ impl TextureQueue {
         if was {
             self.queued.set(index, false);
         }
+        self.live.remove(&index);
         was
     }
 
@@ -1203,19 +1209,37 @@ impl TextureQueue {
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
     /// with fingerprint `print`: looked at again from frame `due`, for a
     /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
+    /// `looks`-th such look; `uploaded` is the upload's frame; `live`: one
+    /// the title keeps rewriting, see [`TextureQueue::live`]).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+        live: bool,
+    ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            if live {
+                self.live.insert(index);
+            } else {
+                self.live.remove(&index);
+            }
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    /// waiting for such a look, and whether it is live.
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
+        let (at, len, print, looks, uploaded) =
+            self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)?;
+        Some((at, len, print, looks, uploaded, self.live.contains(&index)))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1921,6 +1945,22 @@ impl HostHeap {
         self.count
     }
 
+    /// Writes the word of the table of element strides for the dynamic slot
+    /// `index`, which holds `view` of a table made afresh: shaders ask it
+    /// whether a typed view in a table is of an integer format
+    /// (`victory_shader::emit::VIEW_INTEGER`).
+    pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
+        if let Some((_, _, data)) = &self.strides
+            && index >= self.count
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let word = view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind);
+            // SAFETY: inside the mapping; the slot is this caller's until
+            // its flight has landed.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
@@ -1995,13 +2035,17 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        live: bool,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, live);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(
+        &self,
+        index: u32,
+    ) -> Option<(u64, u64, u64, u8, u64, bool)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -5474,6 +5518,29 @@ mod tests {
         }
     }
 
+    /// A slot rechecked as live says so when it is looked at, a plain
+    /// recheck of it clears that, and so does its leaving the queue.
+    #[test]
+    fn live_slots_say_so_until_they_are_rechecked_plain_or_taken_out() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let write = q.due(1, 10)[0].1;
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true);
+        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, true)));
+        assert!(q.due(1, 10).is_empty(), "due again from frame 2");
+        assert_eq!(q.due(2, 10), [(7, write)], "a recheck is served");
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, false);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, true);
+        q.done(7, write);
+        assert_eq!(q.checked(7), None);
+        assert!(q.live.is_empty(), "a slot out of the queue is not live");
+        // Another write: a fresh slot, not live, whatever it was.
+        q.written(7, 4, 4, false);
+        q.recheck(7, q.due(4, 10)[0].1, 5, (0x1000, 0x2000), 6, 0, 4, false);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+    }
+
     /// The queue of textures picked by index serves the slots looked at
     /// before first, then the newest write and the oldest in turns; a
     /// slot whose memory is not there is looked at again after
@@ -5890,6 +5957,38 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A dynamic slot that holds a view of a table made afresh gets its word
+    /// in the table of strides (its stride and kind, which d16 accesses ask:
+    /// the face network's `R16_UINT` views); a title slot, or one past the
+    /// table, is left alone, and no view is 0.
+    #[test]
+    fn a_tables_dynamic_slot_gets_its_views_word() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(&(_, _, data)) = heap.strides.as_ref() else {
+            return;
+        };
+        let word = |index: u32| {
+            // SAFETY: inside the mapping (index under SLOT_STRIDES_COUNT).
+            unsafe { (data as *const u32).add(index as usize).read_volatile() }
+        };
+        let uav = |format| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let at = heap.dynamic(2).expect("two dynamic slots");
+        assert!(at >= heap.count);
+        heap.dynamic_word(at, Some(&uav(57))); // R16_UINT
+        heap.dynamic_word(at + 1, Some(&uav(59))); // R16_SINT
+        assert_eq!(word(at), VIEW_INTEGER | 2);
+        assert_eq!(word(at + 1), VIEW_INTEGER | VIEW_SIGNED | 2);
+        heap.dynamic_word(at, None);
+        assert_eq!(word(at), 0, "no view");
+        // A title slot is the title's, written with its view.
+        heap.dynamic_word(1, Some(&uav(57)));
+        assert_eq!(word(1), 0);
+        heap.release(at, 2);
     }
 
     #[test]

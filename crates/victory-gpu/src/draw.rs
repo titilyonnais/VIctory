@@ -729,6 +729,20 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a texture found changed after its upload with nothing to tell
+/// of it is kept live: looked at every frame, fingerprinted whole
+/// (`VICTORY_LIVE_TEXTURES=0`: backs off along [`RECHECK_FRAMES`] as
+/// before). A TV's news video showed a colour ghost of an earlier frame:
+/// its luma and chroma planes each waited 12-44 frames on their own count.
+fn live_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Unchanged looks in a row after which a live slot goes back to the plain
+/// looks: some seconds at the world's frame rate.
+const LIVE_LOOKS: u8 = 120;
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -2446,12 +2460,48 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+            // A slot found changed after its upload stays live (looked at
+            // every frame, fingerprinted whole) across its uploads again.
+            let mut live = false;
+            if let Some((at, len, print, looks, uploaded, was_live)) =
+                host.texture_slot_checked(index)
+            {
+                if crate::texture::fingerprint_for(at, len, was_live) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if was_live {
+                        // Unchanged this frame (a 30 fps video between two of
+                        // its frames): looked at in the next one again. Backing
+                        // off to 12 and 40 frames showed each plane of a TV's
+                        // video that late, each on its own count. After
+                        // LIVE_LOOKS unchanged looks in a row (the screen is
+                        // off) it goes back to the plain looks.
+                        if looks < LIVE_LOOKS {
+                            let next = frame + 1;
+                            let looks = looks + 1;
+                            host.texture_slot_recheck(
+                                index, write, next, (at, len), print, looks, uploaded, true,
+                            );
+                        } else {
+                            let print = crate::texture::fingerprint(at, len);
+                            let next = frame + RECHECK_FRAMES[1];
+                            host.texture_slot_recheck(
+                                index, write, next, (at, len), print, 1, uploaded, false,
+                            );
+                        }
+                        continue;
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + wait,
+                                (at, len),
+                                print,
+                                looks + 1,
+                                uploaded,
+                                false,
+                            )
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -2460,6 +2510,7 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                live = live_textures();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2631,8 +2682,10 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        let print = crate::texture::fingerprint_for(at, len, live);
+                        host.texture_slot_recheck(
+                            index, write, frame + again_in, (at, len), print, 0, frame, live,
+                        );
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -2756,8 +2809,10 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    let print = crate::texture::fingerprint_for(at, len, live);
+                    host.texture_slot_recheck(
+                        index, write, frame + again_in, (at, len), print, 0, frame, live,
+                    );
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -3592,6 +3647,8 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // (What shaders ask of a typed view in a table: its kind.)
+                host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
