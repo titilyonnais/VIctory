@@ -9119,6 +9119,73 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The last frame's present, and the longest frames since the last line.
+    presented: std::time::Instant,
+    stalls: Stalls,
+}
+
+/// The longest frames between two frame-rate lines, and the slowest second:
+/// a mean of five seconds hides a turn of the camera that drops to 2 fps
+/// (new pipelines, textures, slots of the heap seen for the first time).
+#[derive(Default, Debug, PartialEq)]
+struct Stalls {
+    /// The longest time between two presents, microseconds.
+    longest_us: u64,
+    /// Frames of 100 ms or more, and of 250 ms or more.
+    over_100: u32,
+    over_250: u32,
+    /// The lowest frame rate of a whole second.
+    slowest_second: Option<f64>,
+}
+
+impl Stalls {
+    /// A frame of `us` microseconds.
+    fn frame(&mut self, us: u64) {
+        self.longest_us = self.longest_us.max(us);
+        self.over_100 += u32::from(us >= 100_000);
+        self.over_250 += u32::from(us >= 250_000);
+    }
+
+    /// A second of `fps` frames a second.
+    fn second(&mut self, fps: f64) {
+        self.slowest_second = Some(self.slowest_second.map_or(fps, |s| s.min(fps)));
+    }
+
+    /// What it says, and nothing kept.
+    fn line(&mut self) -> String {
+        let s = std::mem::take(self);
+        format!(
+            "frame times over the last seconds: the longest {:.1} ms, {} frames of 100 ms or more, {} of 250 ms or more; \
+             the slowest second {:.1} fps",
+            s.longest_us as f64 / 1e3,
+            s.over_100,
+            s.over_250,
+            s.slowest_second.unwrap_or(0.0)
+        )
+    }
+}
+
+#[cfg(test)]
+mod stalls_tests {
+    use super::Stalls;
+
+    /// The longest frame, the long ones counted, the slowest second; and
+    /// nothing of them after a line.
+    #[test]
+    fn the_longest_frames_and_the_slowest_second_are_told_once() {
+        let mut s = Stalls::default();
+        for us in [80_000, 99_999, 100_000, 260_000, 75_000] {
+            s.frame(us);
+        }
+        for fps in [12.5, 2.4, 9.8] {
+            s.second(fps);
+        }
+        assert_eq!((s.longest_us, s.over_100, s.over_250, s.slowest_second), (260_000, 2, 1, Some(2.4)));
+        let line = s.line();
+        assert!(line.contains("the longest 260.0 ms, 2 frames of 100 ms or more, 1 of 250 ms or more"), "{line}");
+        assert!(line.contains("the slowest second 2.4 fps"), "{line}");
+        assert_eq!(s, Stalls::default());
+    }
 }
 
 impl Meter {
@@ -9133,6 +9200,8 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            presented: now,
+            stalls: Stalls::default(),
         }
     }
 
@@ -9167,6 +9236,8 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.stalls.frame((now - std::mem::replace(&mut self.presented, now)).as_micros() as u64);
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -9177,6 +9248,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.stalls.second(fps);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9185,6 +9257,8 @@ impl Meter {
         let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
         if five {
             self.logged = std::time::Instant::now();
+            let stalls = self.stalls.line();
+            meter_lines(move || tracing::info!("{stalls}"));
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };

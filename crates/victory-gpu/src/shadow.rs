@@ -1490,9 +1490,24 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS=<n>`, 1 to
+/// 16; a quarter of the processors, 2 to 6, without it).
+///
+/// The refreshes of a submission's host copies and the snapshots before its
+/// shader writes are spread over them and the submitting thread, which waits
+/// for them: 24 and 10 ms of a 78 ms frame on a Ryzen 5 5600 (run
+/// prepa-base), where a quarter of twelve is three.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let processors = std::thread::available_parallelism().map_or(16, |n| n.get());
+        wide_threads_of(std::env::var("VICTORY_WIDE_THREADS").ok().as_deref(), processors)
+    })
+}
+
+/// [`wide_threads`] from what was asked and the processors there are.
+fn wide_threads_of(asked: Option<&str>, processors: usize) -> usize {
+    asked.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map_or((processors / 4).clamp(2, 6), |n| n.min(16))
 }
 
 fn workers() -> &'static Workers {
@@ -1795,9 +1810,23 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide, wide_threads_of};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A quarter of the processors, 2 to 6, unless a count is asked for.
+    #[test]
+    fn the_wide_threads_are_a_quarter_unless_asked() {
+        assert_eq!(wide_threads_of(None, 12), 3);
+        assert_eq!(wide_threads_of(None, 24), 6);
+        assert_eq!(wide_threads_of(None, 4), 2);
+        assert_eq!(wide_threads_of(None, 64), 6);
+        assert_eq!(wide_threads_of(Some(" 5 "), 12), 5);
+        assert_eq!(wide_threads_of(Some("40"), 12), 16);
+        // Nothing, or what is not a count: as without it.
+        assert_eq!(wide_threads_of(Some("0"), 12), 3);
+        assert_eq!(wide_threads_of(Some("many"), 12), 3);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
