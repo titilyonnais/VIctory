@@ -150,8 +150,13 @@ pub(crate) enum C {
     /// and the host views themselves.
     SyncPrepareUs,
     SyncMakeUs,
+    /// And taking the slots' lock, telling the bindless plans what the
+    /// slot views (`bindless::Viewed::set`), holding what it views.
+    SyncLockUs,
+    SyncSeenUs,
+    SyncKeepUs,
 }
-const COUNTERS: usize = 88;
+const COUNTERS: usize = 91;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -378,7 +383,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         concat!(
             "submission parts per frame: evicting {:.1} ms, heap syncs {:.1} ms ({:.0} slots made again in {:.1} ms: ",
-            "preparing {:.1} ms, views {:.1} ms), ",
+            "preparing {:.1} ms, views {:.1} ms, lock {:.1} ms, plans {:.1} ms, holding {:.1} ms), ",
             "gathering {:.1} ms, ",
             "texture uploads {:.1} ms, steps {:.1} ms (shader-written ranges {:.0}: their flushes {:.1} ms, ",
             "keeping bytes or arming {:.1} ms over {:.0} pages), last flush {:.1} ms, preludes {:.1} ms; ",
@@ -391,6 +396,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SyncMirrorUs as usize]),
         ms(c[C::SyncPrepareUs as usize]),
         ms(c[C::SyncMakeUs as usize]),
+        ms(c[C::SyncLockUs as usize]),
+        ms(c[C::SyncSeenUs as usize]),
+        ms(c[C::SyncKeepUs as usize]),
         ms(c[C::GatherUs as usize]),
         ms(c[C::UploadsUs as usize]),
         ms(c[C::StepsUs as usize]),
