@@ -234,12 +234,71 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// The host lists idle in [`IDLE`] and the upload bytes they keep (for the
+/// memory's posts).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_lists() -> (usize, u64) {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    (idle.0.len(), idle.1)
+}
+
+/// Lets go of the host lists idle in [`IDLE`] (the system has no memory to
+/// give, `crate::host::relieve`): how many went.
+#[cfg(windows)]
+pub(crate) fn drop_idle() -> usize {
+    let idle = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        idle.1 = 0;
+        std::mem::take(&mut idle.0)
+    };
+    // Freed outside the lock.
+    idle.len()
+}
+
+/// Puts `list` (open) among the idle ones, as [`recycle`] does.
+#[cfg(all(windows, test))]
+pub(crate) fn park_for_test(list: crate::host::HostList) {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.push(Idle(list, 0));
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
 fn pools() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether a submitted list is left without a host list until it is reset
+/// (on by default; `VICTORY_LAZY_HOSTS=0`: it is given a new, closed one at
+/// its submission, as before). Every list of ours held one between its
+/// submission and its next reset: the lists of recordings the title keeps
+/// and the ones waiting in the thin path's pool, 1,750 of the 1,900 host
+/// lists alive in run mem-base with 150 idle, at some 4.5 MB of the PC's
+/// memory each on the RX 9070 XT (a list 1.1 MB as it is made, its
+/// allocator's commands, its prelude). Taken at the reset, a list comes
+/// from the pool of those that have run, and the pool lets go of what it
+/// cannot keep ([`IDLE_MOST`]).
+#[cfg(windows)]
+fn lazy_hosts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_HOSTS").is_none_or(|v| v != "0"))
+}
+
+/// The host side of a submitted list, taken from it: with [`lazy_hosts`]
+/// the list is left without one, else with a new, closed one for its next
+/// reset. `None`: it has none (it was submitted before and not reset, or
+/// no new one could be made, and it keeps its own).
+#[cfg(windows)]
+fn take_host(list: &mut List) -> Option<crate::host::HostList> {
+    if lazy_hosts() {
+        return list.host.take();
+    }
+    let fresh = fresh_list()?;
+    // A new host list is open; the title's next call on its list is a
+    // reset, which wants it closed.
+    fresh.close();
+    list.host.replace(fresh)
 }
 
 /// A host list open for recording: one that has run, as a title's list is
@@ -397,16 +456,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -469,17 +522,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -678,6 +725,15 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // Its host side was taken at its submission ([`lazy_hosts`]): one
+        // that has run, closed as the reset below wants it.
+        if list.host.is_none()
+            && lazy_hosts()
+            && let Some(fresh) = fresh_list()
+        {
+            fresh.close();
+            list.host = Some(fresh);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -2414,6 +2470,40 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A submitted list holds no host list until it is reset
+    /// ([`lazy_hosts`]); its reset takes one that has run, and a list
+    /// submitted again without a reset gives nothing to run.
+    #[cfg(windows)]
+    #[test]
+    fn a_submitted_list_takes_a_host_list_at_its_reset() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let has_host = |l: This| {
+            // SAFETY: one of our lists.
+            unsafe { (*l.cast::<List>()).host.is_some() }
+        };
+        assert!(has_host(list));
+        assert_eq!(close(list), S_OK);
+        let (taken, order) = detach(&[list, list]);
+        assert_eq!((taken.len(), order), (1, vec![0, 0]), "taken once, named twice");
+        assert!(!has_host(list), "nothing held between the submission and the reset");
+        let (again, _) = detach(&[list]);
+        assert!(again.is_empty(), "a second submission without a reset runs nothing");
+        recycle(taken, &[0]);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(has_host(list), "the reset took one");
+        assert_eq!(close(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

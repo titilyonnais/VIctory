@@ -1004,6 +1004,91 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A creation that failed for want of memory is tried once more after
+    /// something was let go; other failures, or nothing to let go, are
+    /// given back as they came.
+    #[test]
+    fn short_of_memory_tries_once_more_after_letting_go() {
+        use super::again_short;
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        let short = || windows::core::Error::from(E_OUTOFMEMORY);
+        let mut tries = 0;
+        let made = again_short(|| { tries += 1; if tries == 1 { Err(short()) } else { Ok(7) } }, || true);
+        assert_eq!((made.ok(), tries), (Some(7), 2));
+        let mut tries = 0;
+        let made = again_short(|| { tries += 1; Err::<u8, _>(short()) }, || false);
+        assert_eq!((made.map_err(|e| e.code()), tries), (Err(E_OUTOFMEMORY), 1), "nothing let go");
+        let mut tries = 0;
+        let mut relieved = false;
+        let made = again_short(|| { tries += 1; Err::<u8, _>(E_INVALIDARG.into()) }, || { relieved = true; true });
+        assert_eq!((made.map_err(|e| e.code()), tries, relieved), (Err(E_INVALIDARG), 1, false));
+        let commit = windows::core::Error::from(windows::core::HRESULT(0x8007_05AF_u32 as i32));
+        assert!(super::out_of_memory(&commit), "the paging file is full");
+    }
+
+    /// What `relieve` lets go: the idle host lists and the spare scratch.
+    #[test]
+    fn relieving_empties_the_idle_lists() {
+        let Some(host) = super::host() else { return };
+        // (Open, as the pool keeps them.)
+        crate::list::park_for_test(host.new_list().unwrap());
+        assert!(super::relieve(), "a list was there to let go");
+    }
+
+    /// The process's committed (private) bytes.
+    fn private() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        c.PagefileUsage as u64
+    }
+
+    /// What a host list and an allocator cost in the process's committed
+    /// memory on this card (a probe: it prints, and asserts nothing).
+    #[test]
+    #[ignore = "a probe of the card's driver: cargo test -- --ignored --nocapture list_cost"]
+    fn list_cost() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = super::host() else { return };
+        const N: usize = 128;
+        let mb = |a: u64, b: u64| (b as f64 - a as f64) / N as f64 / 1048576.0;
+        let before = private();
+        let mut kept = Vec::new();
+        for _ in 0..N {
+            // SAFETY: plain object creation.
+            let a: ID3D12CommandAllocator =
+                unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+            kept.push(a);
+        }
+        let allocators = private();
+        let lists: Vec<ID3D12GraphicsCommandList> = kept
+            .iter()
+            .map(|a| {
+                // SAFETY: plain object creation.
+                let list: ID3D12GraphicsCommandList =
+                    unsafe { host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, None) }.unwrap();
+                // SAFETY: an open list.
+                unsafe { list.Close() }.unwrap();
+                list
+            })
+            .collect();
+        let listed = private();
+        let made: Vec<_> = (0..N).map(|_| host.new_list().unwrap()).collect();
+        let host_lists = private();
+        println!(
+            "per allocator {:.2} MB, per list {:.2} MB, per host list {:.2} MB",
+            mb(before, allocators),
+            mb(allocators, listed),
+            mb(listed, host_lists)
+        );
+        drop(made);
+        drop(lists);
+        drop(kept);
+        println!("after: {:.0} MB above the start", (private() as f64 - before as f64) / 1048576.0);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2666,6 +2751,14 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For the memory's posts: host lists in the flights, and landed ones not
+/// given back yet.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lists_in_line() -> (usize, usize) {
+    let line = line();
+    (line.lists, line.landed.iter().map(|(l, _)| l.len()).sum())
+}
+
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
 const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
@@ -3956,7 +4049,7 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let list = again_short(|| self.make_list(), relieve);
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -8419,39 +8512,82 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let attempt = || {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                resident(&self.device, &b)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast::<u8>()))
+            }
         };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "an upload buffer".into());
-        }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
+        match again_short(attempt, relieve) {
+            Ok((b, data)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::book::made(&b, || "an upload buffer".into());
+                Some((b, data))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
         }
     }
+}
+
+/// Whether a creation failed for want of memory (the PC's, committed, or
+/// the card's, when making a resource resident).
+fn out_of_memory(e: &windows::core::Error) -> bool {
+    // (0x800705AF: the paging file is too small, ERROR_COMMITMENT_LIMIT.)
+    e.code() == windows::Win32::Foundation::E_OUTOFMEMORY || e.code().0 as u32 == 0x8007_05AF
+}
+
+/// `make` once more after `relieve` let go of something, when its first
+/// try failed for want of memory ([`out_of_memory`]); else as it came.
+fn again_short<T>(
+    mut make: impl FnMut() -> windows::core::Result<T>,
+    relieve: impl FnOnce() -> bool,
+) -> windows::core::Result<T> {
+    match make() {
+        Err(e) if out_of_memory(&e) && relieve() => make(),
+        other => other,
+    }
+}
+
+/// What the host lets go when the system has no memory to give: the host
+/// lists idle in the pool and the scratch chunks no list holds (kept for
+/// [`keep_freed`]'s sake: with no memory, a creation would fail all the
+/// same). Whether anything went; said in the log, at most once a second.
+pub(crate) fn relieve() -> bool {
+    let lists = crate::list::drop_idle();
+    let chunks: Vec<(Chunk, u64)> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let bytes: u64 = chunks.iter().map(|(_, size)| size).sum();
+    ALIVE[3].fetch_sub(chunks.len() as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(chunks.len() as u64, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    let n = chunks.len();
+    drop(chunks);
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = coarse_ms();
+    if SAID.swap(now, Ordering::Relaxed) + 1000 <= now {
+        tracing::warn!(lists, chunks = n, mb = bytes >> 20, "out of memory: idle host lists and spare scratch let go");
+    }
+    lists > 0 || n > 0
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -9153,34 +9289,32 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let attempt = || {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                resident(&self.device, &b)?;
+                mapped(&self.device)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast::<u8>()))
+            }
         };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "a shared buffer".into());
-        }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
+        match again_short(attempt, relieve) {
+            Ok((b, data)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::book::made(&b, || "a shared buffer".into());
+                Some((b, data))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None

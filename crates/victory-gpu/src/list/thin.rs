@@ -296,7 +296,18 @@ fn back_list(kind: u32) -> This {
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
+    BACKS_MADE.fetch_add(1, Relaxed);
     list
+}
+
+/// Lists of ours made so far ([`back_list`]).
+static BACKS_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// For the memory's posts: lists of ours made, and of them those nobody
+/// uses ([`BACKS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn backs() -> (u64, usize) {
+    (BACKS_MADE.load(Relaxed), held(&BACKS).len())
 }
 
 fn start() {
