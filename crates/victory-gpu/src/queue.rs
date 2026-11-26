@@ -113,6 +113,8 @@ extern "system" fn release(this: This) -> u32 {
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(feature = "diagnostics")]
+    let _executing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::QueueExecuteUs);
     if lists.is_null() {
         return;
     }
@@ -487,6 +489,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    let _presenting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PresentUs);
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.

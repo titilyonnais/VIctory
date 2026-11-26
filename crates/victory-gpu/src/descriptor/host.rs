@@ -807,7 +807,7 @@ impl HostHeap {
             return Some(view);
         }
         #[cfg(feature = "diagnostics")]
-        let locking = syncing(crate::copystat::C::SyncLockUs);
+        let locking = lock_wait();
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(locking);
@@ -866,7 +866,7 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             drop(preparing);
             #[cfg(feature = "diagnostics")]
-            let locking = syncing(crate::copystat::C::SyncLockUs);
+            let locking = lock_wait();
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             #[cfg(feature = "diagnostics")]
             drop(locking);
@@ -1487,6 +1487,18 @@ const SYNC_RUN: usize = 64;
 // (`HostHeap::sync_slots`), whose parts are then timed.
 #[cfg(feature = "diagnostics")]
 std::thread_local!(static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// A timer of a wait for the slots' lock in `mirror`: a heap sync's, or a
+/// title thread's.
+#[cfg(feature = "diagnostics")]
+fn lock_wait() -> crate::watch::Timed {
+    let counter = if SYNCING.with(std::cell::Cell::get) {
+        crate::copystat::C::SyncLockUs
+    } else {
+        crate::copystat::C::TitleLockUs
+    };
+    crate::watch::Timed(std::time::Instant::now(), counter)
+}
 
 /// A timer of `counter` while this thread syncs heap slots.
 #[cfg(feature = "diagnostics")]

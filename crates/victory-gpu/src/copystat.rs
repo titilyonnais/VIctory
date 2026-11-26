@@ -155,8 +155,20 @@ pub(crate) enum C {
     SyncLockUs,
     SyncSeenUs,
     SyncKeepUs,
+    /// Outside the host's submissions, summed over the title's threads:
+    /// recording draws and dispatches (`list::with_state_after_read_back`),
+    /// the other list calls through `list::with_state`, and in the queue's
+    /// `ExecuteCommandLists` and `PresentX` as a whole (with the host
+    /// submissions they make).
+    RecordDrawUs,
+    RecordStateUs,
+    QueueExecuteUs,
+    PresentUs,
+    /// Title threads waiting for a heap's slots lock in `mirror` (binding
+    /// or writing views).
+    TitleLockUs,
 }
-const COUNTERS: usize = 91;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -414,6 +426,16 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuTimed as usize],
         // A maximum, not a per-frame sum.
         ms(c[C::GpuBusyMaxUs as usize] * frames),
+    );
+    tracing::info!(
+        "title threads per frame (summed): recording draws and dispatches {:.1} ms, other list calls {:.1} ms; \
+         in ExecuteCommandLists {:.1} ms, in PresentX {:.1} ms (both with the host submissions they make); \
+         waiting for heap slots' locks {:.1} ms",
+        ms(c[C::RecordDrawUs as usize]),
+        ms(c[C::RecordStateUs as usize]),
+        ms(c[C::QueueExecuteUs as usize]),
+        ms(c[C::PresentUs as usize]),
+        ms(c[C::TitleLockUs as usize]),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

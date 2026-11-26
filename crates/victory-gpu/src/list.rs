@@ -135,6 +135,8 @@ fn with_state_after_read_back(
     this: This,
     f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _recording = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RecordDrawUs);
     let Some(list) = host_list_after_read_back(this, None) else {
         return;
     };
@@ -147,6 +149,8 @@ fn with_state_after_read_back(
 /// is a host GPU.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    #[cfg(feature = "diagnostics")]
+    let _recording = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RecordStateUs);
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
