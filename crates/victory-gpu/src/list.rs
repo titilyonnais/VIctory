@@ -205,6 +205,73 @@ impl Detached {
     }
 }
 
+/// Whether a landed flight's lists give their descriptor table slots back
+/// when it lands, not with the lists after the host's bury lag
+/// (`VICTORY_EARLY_TABLES=0`: with the lists, as before).
+///
+/// Why: the lag (`VICTORY_BURY_LAG`, 64 submissions, about four frames) is
+/// for memory and lists the card may still name; a landed flight's fence is
+/// done, so the card reads its tables' slots no more. Held with the lists,
+/// four frames of tables (20,000 to 36,000 a frame in the world, outside
+/// Jason's house) ran the 2^20 dynamic slots of an RX 9070 XT out: up to
+/// 2,000 tables a frame were refused, and with each its draw or dispatch,
+/// indirect ones first, as their tables are the biggest (`indirect kind
+/// 0/1/2/10: prepare failed`, up to 1,700 a frame; trees, sky, water and
+/// textures flickered). The same cause and remedy on NVIDIA:
+/// avatarmanz/VIctory-7900XTX#70 and #237.
+#[cfg(windows)]
+fn early_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| early_tables_from(std::env::var_os("VICTORY_EARLY_TABLES").as_deref()))
+}
+
+/// [`early_tables`] for the variable's value: on unless it is `0`.
+fn early_tables_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// A flight has landed: with [`early_tables`], its lists' descriptor table
+/// slots go back now ([`crate::draw::State::tables_done`]). The lists, their
+/// upload memory and the rest of their state still wait for the bury lag.
+/// (A list cut at waits carries its state in its last part, which lands
+/// last: the earlier parts hold none.)
+#[cfg(windows)]
+pub(crate) fn tables_early(lists: &mut [Detached]) {
+    give_back_landed(lists, early_tables(), |list| list._state.tables_done());
+}
+
+/// Calls `done` on each of `lists` if `on`; how many it was called on.
+fn give_back_landed<T>(lists: &mut [T], on: bool, mut done: impl FnMut(&mut T)) -> usize {
+    if !on {
+        return 0;
+    }
+    lists.iter_mut().for_each(&mut done);
+    lists.len()
+}
+
+#[cfg(test)]
+mod early_tables_tests {
+    use super::*;
+
+    #[test]
+    fn early_tables_are_on_unless_switched_off() {
+        assert!(early_tables_from(None));
+        assert!(early_tables_from(Some(std::ffi::OsStr::new("1"))));
+        assert!(early_tables_from(Some(std::ffi::OsStr::new(""))));
+        assert!(!early_tables_from(Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
+    fn landed_lists_give_their_tables_back_only_when_on() {
+        let mut lists = vec![0u32; 3];
+        assert_eq!(give_back_landed(&mut lists, true, |n| *n += 1), 3);
+        assert_eq!(lists, [1, 1, 1]);
+        assert_eq!(give_back_landed(&mut lists, false, |n| *n += 1), 0);
+        assert_eq!(lists, [1, 1, 1]);
+        assert_eq!(give_back_landed(&mut Vec::<u32>::new(), true, |n| *n += 1), 0);
+    }
+}
+
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
