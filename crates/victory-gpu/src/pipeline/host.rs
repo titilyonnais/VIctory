@@ -525,6 +525,7 @@ impl HostPipeline {
                     // address and its fault notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_AMD_EXT
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -562,12 +563,17 @@ impl HostPipeline {
                         continue;
                     }
                     out.push((slot, params.len() as u32));
+                    let (reg, space) = if uav && slot == victory_shader::emit::SLOT_AMD_EXT {
+                        (0u32, victory_shader::emit::AMD_EXT_SPACE)
+                    } else {
+                        (u32::from(slot), ROOT_CBV_SPACE)
+                    };
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
                             Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
+                                ShaderRegister: reg,
+                                RegisterSpace: space,
                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                             },
                         },

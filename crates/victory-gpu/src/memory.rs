@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_VA_OFFSET};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -149,6 +149,8 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Host GPU virtual address of each copy in `copies` (`copies[n].buffer.GetGPUVirtualAddress()`).
+    copy_vas: Vec<u64>,
     /// Places of title buffers' copies among `copies`.
     numbers: HashMap<usize, usize>,
     /// Arenas: place in `copies`, address.
@@ -222,7 +224,8 @@ pub(crate) struct Ready {
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
-        let bytes = u64::from(MEMORY_PAGES) * 8;
+        // 16 MiB [copy, offset] directory + 16 MiB parallel 64-bit host page GPU VA table.
+        let bytes = u64::from(MEMORY_PAGES) * 16;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
@@ -238,6 +241,7 @@ impl Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
+            copy_vas: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
             pages: HashMap::new(),
@@ -266,6 +270,36 @@ impl Memory {
         debug_assert!(page < u64::from(MEMORY_PAGES));
         // SAFETY: inside the directory.
         unsafe { self.directory.0.add(page as usize * 2) }
+    }
+
+    /// The parallel 64-bit host GPU VA entry of `page` (at `MEMORY_VA_OFFSET`).
+    fn va_entry(&self, page: u64) -> *mut u64 {
+        debug_assert!(page < u64::from(MEMORY_PAGES));
+        // SAFETY: inside the second half of the 32 MiB directory buffer.
+        unsafe {
+            self.directory
+                .0
+                .cast::<u8>()
+                .add(MEMORY_VA_OFFSET as usize)
+                .cast::<u64>()
+                .add(page as usize)
+        }
+    }
+
+    /// Writes both the parallel 64-bit host GPU VA entry and the `[copy, offset]`
+    /// directory entry for `page`.
+    fn set_page(&self, page: u64, n: usize, offset: u64, read_only: bool) {
+        let page_va = self.copy_vas[n].wrapping_add(offset);
+        // Hardware BVH nodes require 64-byte alignment; bit 0 = 1 signals
+        // mapped-but-unaligned so the shader takes its software fallback.
+        let encoded_va = if page_va & 63 == 0 { page_va } else { 1 };
+        // SAFETY: inside the directory, under the mutex.
+        unsafe { self.va_entry(page).write_volatile(encoded_va) };
+        if read_only {
+            close(self.entry(page), n, offset);
+        } else {
+            fill(self.entry(page), n, offset);
+        }
     }
 
     /// The place in `copies` of the copy that holds `page`, if one does.
@@ -312,7 +346,10 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return None;
         }
+        // SAFETY: a live buffer.
+        let gpu_va = unsafe { shadow.buffer.GetGPUVirtualAddress() };
         self.copies.push(shadow);
+        self.copy_vas.push(gpu_va);
         let n = self.copies.len() - 1;
         self.numbers.insert(key, n);
         Some(n)
@@ -343,17 +380,17 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    let entry = self.entry(at / PAGE);
+                    let p = at / PAGE;
                     // SAFETY: an entry of the directory.
-                    if unsafe { entry.read() } == 0 {
-                        close(entry, n, at - first);
+                    if unsafe { self.entry(p).read() } == 0 {
+                        self.set_page(p, n, at - first, true);
                     }
                     at += PAGE;
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+                self.set_page(page, n, start - shadow.span().0, true);
             }
             return true;
         }
@@ -364,7 +401,7 @@ impl Memory {
                 && let Some(n) = self.number(shadow)
             {
                 self.windows += 1;
-                fill(self.entry(page), n, 0);
+                self.set_page(page, n, 0, false);
                 return true;
             }
             return false;
@@ -406,7 +443,8 @@ impl Memory {
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
-        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        let offset = at as u64 - self.copies[copy].span().0;
+        self.set_page(page, copy, offset, false);
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -419,8 +457,11 @@ impl Memory {
             if held.owners == 0 && held.theirs {
                 self.free.push((held.copy, held.at));
                 self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+                // SAFETY: entries of the directory, under the mutex.
+                unsafe {
+                    self.va_entry(page).write_volatile(0);
+                    self.entry(page).write_volatile(0);
+                }
             }
         }
         self.stats.gone += 1;
@@ -482,7 +523,7 @@ impl Memory {
         );
         for page in first.div_ceil(PAGE)..(first + len) / PAGE {
             if self.copy_of(page) == Some(n) {
-                fill(self.entry(page), n, page * PAGE - first);
+                self.set_page(page, n, page * PAGE - first, false);
             }
         }
     }
@@ -626,6 +667,7 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        crate::watch::wrote(self.va_entry(page) as usize, 8);
         self.take(page, 0, PAGE as usize, true);
         true
     }

@@ -37,6 +37,11 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The tests' stand-in for AMD hardware BVH ([`Lower::bvh_hw`]): the guest
+    /// base address corresponding to the 64-bit host GPU VA stored at byte 0
+    /// of `SLOT_MEMORY`.
+    pub(in crate::emit) static TEST_HW_BVH_BASE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Where the instruction's node is.
@@ -134,6 +139,25 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        let hw_op = super::host_hw_bvh();
+        if matches!(nodes, BvhNodes::Memory { .. }) && hw_op != 0 {
+            let Operand::Scalar { code, .. } = *rsrc else {
+                return Err("a ray-tracing structure descriptor not in SGPRs");
+            };
+            let mut words = [pointer; 2];
+            for (k, w) in words.iter_mut().enumerate() {
+                let v = inst
+                    .read(Reg::S(code + k as u8))
+                    .ok_or("an unread operand")?;
+                *w = self.i32_of(v)?;
+            }
+            let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+            let results = self.bvh_hw((low, high, pointer), &ray, sort, guard, hw_op);
+            for (k, &r) in results.iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
@@ -221,6 +245,279 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// Hardware BVH ray-node intersection via AMD D3D12 shader intrinsics
+    /// (`AmdExtD3DShaderIntrinsics_IntersectBvhNode`, opcode `0x22`).
+    ///
+    /// Translates the guest 64-bit node address `(low, high)` to a 64-bit host
+    /// GPU VA using the page VA table at `SLOT_MEMORY + MEMORY_VA_OFFSET`,
+    /// handles unmapped pages cleanly (noting faults in `SLOT_FAULTS`), and
+    /// falls back to the software path for the rare (<0.1%) case of a 128-byte
+    /// 32-bit box node straddling a 64 KiB page boundary or an unaligned host
+    /// buffer.
+    fn bvh_hw(
+        &mut self,
+        (low, high, pointer): (V, V, V),
+        ray: &Ray,
+        sort: bool,
+        guard: Option<V>,
+        opcode: u8,
+    ) -> Vec<V> {
+        use super::super::bitcode::Tag;
+        use super::super::shader::{
+            MEMORY_FAULTS, MEMORY_PAGES, MEMORY_VA_OFFSET, SLOT_AMD_EXT, SLOT_FAULTS, SLOT_MEMORY,
+        };
+
+        let zero = self.s.m.i32(0);
+        let gate = self.begin_guarded(guard);
+        let head = self.cur;
+        let i32t = self.s.t.i32;
+        let (k4, k5, k6, k7) = (
+            self.s.m.i32(4),
+            self.s.m.i32(5),
+            self.s.m.i32(6),
+            self.s.m.i32(7),
+        );
+        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
+        let is_valid = self.s.m.cmp(head, pred::IULT, kind, k6);
+        let lookup_block = self.s.m.new_block();
+        let miss_block = self.s.m.new_block();
+        let mapped_block = self.s.m.new_block();
+        let hw_block = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(head, Term::CondBr(is_valid, lookup_block, join));
+
+        // Look up the host 64-bit GPU VA for this guest page.
+        self.cur = lookup_block;
+        #[cfg(test)]
+        let test_base = TEST_HW_BVH_BASE.get();
+        #[cfg(not(test))]
+        let test_base: Option<u64> = None;
+
+        let directory = self.s.root_srv_handle(SLOT_MEMORY);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let (page, va_lo, va_hi, within) = if let Some(base) = test_base {
+            let entry = self.s.op(
+                lookup_block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[directory, zero, iu, both, align],
+            );
+            let f_lo = self.s.m.extract(lookup_block, entry, 0);
+            let f_hi = self.s.m.extract(lookup_block, entry, 1);
+            let va_lo = self.as_int(f_lo);
+            let va_hi = self.as_int(f_hi);
+            let base_lo = self.s.m.i32(base as u32);
+            let base_hi = self.s.m.i32((base >> 32) as u32);
+            let within = self.s.m.bin(lookup_block, Bin::Sub, low, base_lo);
+            let in_lo = self.s.m.cmp(lookup_block, pred::IUGE, low, base_lo);
+            let in_hi = self.s.m.cmp(lookup_block, pred::EQ, high, base_hi);
+            let inside = self.s.m.bin(lookup_block, Bin::And, in_lo, in_hi);
+            let va_lo = self.s.m.select(lookup_block, inside, va_lo, zero);
+            let va_hi = self.s.m.select(lookup_block, inside, va_hi, zero);
+            (zero, va_lo, va_hi, within)
+        } else {
+            let (k16, kff) = (self.s.m.i32(16), self.s.m.i32(0xFF));
+            let p_lo = self.s.m.bin(lookup_block, Bin::LShr, low, k16);
+            let p_hi = self.s.m.bin(lookup_block, Bin::And, high, kff);
+            let p_hi = self.s.m.bin(lookup_block, Bin::Shl, p_hi, k16);
+            let page = self.s.m.bin(lookup_block, Bin::Or, p_lo, p_hi);
+            let last = self.s.m.i32(MEMORY_PAGES - 1);
+            let page = self.s.op(
+                lookup_block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[page, last],
+            );
+            self.s.m.tag(page, Tag::Clamp);
+            let k3 = self.s.m.i32(3);
+            let off = self.s.m.bin(lookup_block, Bin::Shl, page, k3);
+            let va_base = self.s.m.i32(MEMORY_VA_OFFSET);
+            let va_at = self.s.m.bin(lookup_block, Bin::Add, off, va_base);
+            let entry = self.s.op(
+                lookup_block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[directory, va_at, iu, both, align],
+            );
+            let f_lo = self.s.m.extract(lookup_block, entry, 0);
+            let f_hi = self.s.m.extract(lookup_block, entry, 1);
+            let va_lo = self.as_int(f_lo);
+            let va_hi = self.as_int(f_hi);
+            let k64k = self.s.m.i32(0xFFFF);
+            let within = self.s.m.bin(lookup_block, Bin::And, low, k64k);
+            (page, va_lo, va_hi, within)
+        };
+        let va_or = self.s.m.bin(lookup_block, Bin::Or, va_lo, va_hi);
+        let mapped = self.s.m.cmp(lookup_block, pred::NE, va_or, zero);
+        self.s
+            .m
+            .terminate(lookup_block, Term::CondBr(mapped, mapped_block, miss_block));
+
+        // Unmapped page: record fault (in production) and return clean miss.
+        self.cur = miss_block;
+        if test_base.is_none() {
+            let faults = self.s.root_uav_handle(SLOT_FAULTS);
+            let places = self.s.m.i32(MEMORY_FAULTS - 1);
+            let place = self.s.m.bin(miss_block, Bin::URem, page, places);
+            let one = self.s.m.i32(1);
+            let place = self.s.m.bin(miss_block, Bin::Add, place, one);
+            let k2 = self.s.m.i32(2);
+            let place = self.s.m.bin(miss_block, Bin::Shl, place, k2);
+            let mask = self.s.m.i8(1);
+            self.s.op(
+                miss_block,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                self.s.t.void,
+                140,
+                &[faults, place, iu, page, iu, iu, iu, mask, align],
+            );
+        }
+        let pair_miss = self.s.m.bin(miss_block, Bin::And, kind, k6);
+        let is_box_miss = self.s.m.cmp(miss_block, pred::EQ, pair_miss, k4);
+        let none_v = self.s.m.i32(bvh::NONE);
+        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        let miss_vals: [V; 4] =
+            std::array::from_fn(|k| self.s.m.select(miss_block, is_box_miss, none_v, other[k]));
+        self.s.m.terminate(miss_block, Term::Br(join));
+
+        // Mapped page: check alignment and 128-byte box32 page straddle.
+        let mut sw_incoming: Vec<([V; 4], usize)> = Vec::new();
+        self.cur = mapped_block;
+        if test_base.is_some() {
+            self.s.m.terminate(mapped_block, Term::Br(hw_block));
+        } else {
+            let mask63 = self.s.m.i32(63);
+            let va_or_within = self.s.m.bin(mapped_block, Bin::Or, va_lo, within);
+            let low6 = self.s.m.bin(mapped_block, Bin::And, va_or_within, mask63);
+            let aligned = self.s.m.cmp(mapped_block, pred::EQ, low6, zero);
+            let is_box32 = self.s.m.cmp(mapped_block, pred::EQ, kind, k5);
+            let max_box32 = self.s.m.i32(0xFF80);
+            let max_node64 = self.s.m.i32(0xFFC0);
+            let max_within = self.s.m.select(mapped_block, is_box32, max_box32, max_node64);
+            let fits_in_page = self.s.m.cmp(mapped_block, pred::IULE, within, max_within);
+            let hw_ok = self.s.m.bin(mapped_block, Bin::And, aligned, fits_in_page);
+            let sw_block = self.s.m.new_block();
+            self.s
+                .m
+                .terminate(mapped_block, Term::CondBr(hw_ok, hw_block, sw_block));
+
+            // Rare software fallback (<0.1% straddling box32 or unaligned host buffer).
+            self.cur = sw_block;
+            let (handle, byte, sw_mapped) = self.bvh_memory(low, high, None);
+            let at = NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped: sw_mapped,
+            };
+            let sw_head = self.cur;
+            let sw_pair = self.s.m.bin(sw_head, Bin::And, kind, k6);
+            let sw_is_box = self.s.m.cmp(sw_head, pred::EQ, sw_pair, k4);
+            let (sw_box_blk, sw_tri_blk) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s
+                .m
+                .terminate(sw_head, Term::CondBr(sw_is_box, sw_box_blk, sw_tri_blk));
+            self.cur = sw_box_blk;
+            let sw_boxes = self.bvh_boxes(at, kind, ray, sort);
+            let sw_box_end = self.cur;
+            self.s.m.terminate(sw_box_end, Term::Br(join));
+            self.cur = sw_tri_blk;
+            let sw_tri = self.bvh_triangle(at, kind, ray);
+            let sw_tri_end = self.cur;
+            self.s.m.terminate(sw_tri_end, Term::Br(join));
+            sw_incoming.push((sw_boxes, sw_box_end));
+            sw_incoming.push((sw_tri, sw_tri_end));
+        }
+
+        // Hardware BVH path: compute 64-bit RDNA nodePointer = ((page_va + within) >> 3) | kind
+        // and invoke AmdExtD3DShaderIntrinsics_IntersectBvhNode (opcode 0x22).
+        self.cur = hw_block;
+        let i64t = self.s.m.int(64);
+        let base_va = self.join64(va_lo, va_hi);
+        let within64 = self.join64(within, zero);
+        let node_va = self.s.m.bin(hw_block, Bin::Add, base_va, within64);
+        let k3_64 = self.s.m.int_const(i64t, 3);
+        let ptr_base = self.s.m.bin(hw_block, Bin::LShr, node_va, k3_64);
+        let kind64 = self.join64(kind, zero);
+        let node_ptr = self.s.m.bin(hw_block, Bin::Or, ptr_base, kind64);
+        let (ptr_lo, ptr_hi) = self.split64(node_ptr);
+        self.s.flags |= flags::INT64;
+
+        let uav = self.s.root_uav_handle(SLOT_AMD_EXT);
+        // MakeAmdShaderIntrinsicsInstruction(opcode, phase=0/1, data=0)
+        let phase0 = self.s.m.i32(0x5000_0000 | u32::from(opcode));
+        let phase1 = self.s.m.i32(0x5100_0000 | u32::from(opcode));
+        // AmdExtIntersectBvhNodeFlag_BoxSortEnable (1) | ReturnBarycentrics (2)
+        let flags_val = self.s.m.i32(u32::from(sort) | 2);
+        let inputs: [V; 14] = [
+            ptr_lo,
+            ptr_hi,
+            self.as_int(ray.extent),
+            self.as_int(ray.origin[0]),
+            self.as_int(ray.origin[1]),
+            self.as_int(ray.origin[2]),
+            self.as_int(ray.direction[0]),
+            self.as_int(ray.direction[1]),
+            self.as_int(ray.direction[2]),
+            self.as_int(ray.inverse[0]),
+            self.as_int(ray.inverse[1]),
+            self.as_int(ray.inverse[2]),
+            flags_val,
+            zero,
+        ];
+        for (idx, &val) in inputs.iter().enumerate() {
+            let idx_v = self.s.m.i32(idx as u32);
+            self.s.op(
+                hw_block,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[uav, phase0, iu, iu, idx_v, val],
+            );
+        }
+        let hw_out: [V; 4] = std::array::from_fn(|idx| {
+            let idx_v = self.s.m.i32(idx as u32);
+            self.s.op(
+                hw_block,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[uav, phase1, iu, iu, idx_v, zero],
+            )
+        });
+        self.s.m.terminate(hw_block, Term::Br(join));
+
+        // Join all paths.
+        self.cur = join;
+        let mut results = Vec::with_capacity(4);
+        for k in 0..4 {
+            let phi = self.s.m.phi(join, i32t);
+            let mut inc = vec![
+                (other[k], head),
+                (miss_vals[k], miss_block),
+                (hw_out[k], hw_block),
+            ];
+            for &(vals, blk) in &sw_incoming {
+                inc.push((vals[k], blk));
+            }
+            self.s.m.set_phi(phi, inc);
+            results.push((phi, zero));
+        }
+        self.end_guarded(gate, &results)
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

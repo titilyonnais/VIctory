@@ -140,6 +140,12 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    // Key hardware BVH dynamically (after host_settings) so calling `build()`
+    // before `Host::create()` cannot lock in a stale off state.
+    if victory_shader::emit::host_hw_bvh_active() {
+        hash.update(b"VICTORY_HW_BVH=1");
+        hash.update(&[victory_shader::emit::host_hw_bvh_opcode()]);
+    }
     *hash.finalize().as_bytes()
 }
 

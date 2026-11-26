@@ -1,20 +1,167 @@
 //! Host D3D12 checks for emitted shaders: pipeline creation and, for
 //! tests, drawing a full-screen triangle and reading the target back.
 
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::{Interface, PCSTR};
+use windows::core::{GUID, HRESULT, Interface, PCSTR};
 
 use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+/// Live COM objects that keep AMD D3D12 shader intrinsics enabled on a device
+/// (`IntersectBvhNode` opcode `0x22` or `IntersectInternal` opcode `0x16`, via
+/// `u0, space2147420894`).
+pub struct AmdExtGuard {
+    intrinsics: *mut c_void,
+    factory: *mut c_void,
+    /// Active AMD shader-intrinsic opcode (`0x22` or `0x16`).
+    pub opcode: u8,
+}
+
+// SAFETY: AMD extension COM objects are device-scoped and only released on drop.
+unsafe impl Send for AmdExtGuard {}
+unsafe impl Sync for AmdExtGuard {}
+
+impl Drop for AmdExtGuard {
+    fn drop(&mut self) {
+        // SAFETY: valid COM pointers obtained from `AmdExtD3DCreateInterface`.
+        unsafe {
+            com_release(self.intrinsics);
+            com_release(self.factory);
+        }
+    }
+}
+
+unsafe fn com_release(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    let vtbl = unsafe { *(ptr as *const *const *const c_void) };
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { std::mem::transmute(*vtbl.add(2)) };
+    unsafe {
+        release(ptr);
+    }
+}
+
+/// Probes `amdxc64.dll` for AMD's `IAmdExtD3DShaderIntrinsics` interface on
+/// `device`, checks `IntersectBvhNode` support (`0x19`), and calls `Enable()`.
+/// Returns a guard that keeps the extension enabled for the device's lifetime.
+pub fn enable_amd_bvh(device: &ID3D12Device) -> Option<AmdExtGuard> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    // IID_IAmdExtD3DFactory: {014937EC-9288-446F-A9AC-D75A8E3A984F}
+    const IID_FACTORY: GUID = GUID::from_u128(0x0149_37EC_9288_446F_A9AC_D75A_8E3A_984F);
+    // IID_IAmdExtD3DShaderIntrinsics: {BA019D53-CCAB-4CBD-B56A-7230ED4330AD}
+    const IID_INTRINSICS: GUID = GUID::from_u128(0xBA01_9D53_CCAB_4CBD_B56A_7230_ED43_30AD);
+    // AmdExtD3DShaderIntrinsicsSupport_IntersectBvhNode = 0x19 (opcode 0x22)
+    // AmdExtD3DShaderIntrinsicsSupport_IntersectInternal = 0x0D
+    const SUPPORT_INTERSECT_BVH_NODE: u32 = 0x19;
+    const SUPPORT_INTERSECT_INTERNAL: u32 = 0x0D;
+    const OPCODE_INTERSECT_BVH_NODE: u8 = 0x22;
+
+    type CreateInterfaceFn =
+        unsafe extern "C" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+
+    // SAFETY: queries DXGI/D3D12 feature support on `device`, then calls the
+    // exported AMD driver factory on a verified AMD hardware RT device and
+    // invokes documented COM vtable slots (IUnknown + CreateInterface /
+    // CheckSupport / Enable), releasing objects on any failure path.
+    unsafe {
+        // Guard against mixed-GPU systems (e.g. AMD iGPU + NVIDIA dGPU) where
+        // `amdxc64.dll` may already be loaded in-process: never hand a foreign
+        // or software `ID3D12Device` to `AmdExtD3DCreateInterface`.
+        let luid = device.GetAdapterLuid();
+        let Ok(dxgi) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return None;
+        };
+        let Ok(adapter) = dxgi.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return None;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return None;
+        };
+        if desc.VendorId != 0x1002
+            || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+        {
+            return None;
+        }
+        // Require hardware ray-tracing support (DXR tier >= 1.0, i.e. RDNA 2+)
+        // so pre-RDNA 2 AMD GPUs (GCN / RDNA 1) cannot pass the 0x0D fallback.
+        let mut opts5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut opts5).cast(),
+                size_of_val(&opts5) as u32,
+            )
+            .is_err()
+            || opts5.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_0.0
+        {
+            return None;
+        }
+
+        let module = GetModuleHandleA(c"amdxc64.dll".as_ptr().cast());
+        if module.is_null() {
+            return None;
+        }
+        let proc = GetProcAddress(module, c"AmdExtD3DCreateInterface".as_ptr().cast())?;
+        let create_ext: CreateInterfaceFn = std::mem::transmute(proc);
+
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        if create_ext(device.as_raw(), &IID_FACTORY, &mut factory).is_err() || factory.is_null() {
+            return None;
+        }
+        let f_vtbl = *(factory as *const *const *const c_void);
+        let create_iface: unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(*f_vtbl.add(3));
+
+        let mut intrinsics: *mut c_void = std::ptr::null_mut();
+        if create_iface(factory, device.as_raw(), &IID_INTRINSICS, &mut intrinsics).is_err()
+            || intrinsics.is_null()
+        {
+            com_release(factory);
+            return None;
+        }
+        let i_vtbl = *(intrinsics as *const *const *const c_void);
+        let check_support: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT =
+            std::mem::transmute(*i_vtbl.add(4));
+        let enable: unsafe extern "system" fn(*mut c_void) -> HRESULT =
+            std::mem::transmute(*i_vtbl.add(5));
+
+        let supported = check_support(intrinsics, SUPPORT_INTERSECT_BVH_NODE) == HRESULT(0)
+            || check_support(intrinsics, SUPPORT_INTERSECT_INTERNAL) == HRESULT(0);
+        if !supported {
+            com_release(intrinsics);
+            com_release(factory);
+            return None;
+        }
+        // On RDNA 2/3, CheckSupport(0x19) is S_OK; on RDNA 4 (gfx1201),
+        // CheckSupport(0x19) returns E_NOINTERFACE while CheckSupport(0x0D)
+        // is S_OK and opcode 0x22 (IntersectBvhNode) still compiles to native
+        // hardware BVH4 intersection.
+        let opcode = OPCODE_INTERSECT_BVH_NODE;
+        if enable(intrinsics).is_err() {
+            com_release(intrinsics);
+            com_release(factory);
+            return None;
+        }
+        Some(AmdExtGuard { intrinsics, factory, opcode })
+    }
+}
+
 pub struct Host {
     pub device: ID3D12Device,
+    amd_ext: Option<AmdExtGuard>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -206,8 +353,21 @@ impl Host {
             if sm.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!("the device supports SM {:#x} only", sm.0));
             }
-            Ok(Host { device })
+            Ok(Host { device, amd_ext: None })
         }
+    }
+
+    /// Enables AMD D3D12 shader intrinsics (`IntersectBvhNode` /
+    /// `IntersectInternal`) on this device if supported by `amdxc64.dll`.
+    /// Returns the active intrinsic opcode (`0x22` or `0x16`), or `0` if
+    /// unsupported. Must be called before creating pipelines that use
+    /// [`super::SLOT_AMD_EXT`].
+    pub fn enable_amd_bvh(&mut self) -> u8 {
+        if let Some(ref ext) = self.amd_ext {
+            return ext.opcode;
+        }
+        self.amd_ext = enable_amd_bvh(&self.device);
+        self.amd_ext.as_ref().map_or(0, |e| e.opcode)
     }
 
     /// The name of the adapter that actually created the device.
@@ -286,6 +446,11 @@ impl Host {
         views.sort_unstable();
         views.dedup();
         for (slot, kind) in views {
+            let (reg, space) = if kind == 2 && slot == super::SLOT_AMD_EXT {
+                (0u32, super::AMD_EXT_SPACE)
+            } else {
+                (u32::from(slot), super::ROOT_CBV_SPACE)
+            };
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -294,8 +459,8 @@ impl Host {
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        ShaderRegister: reg,
+                        RegisterSpace: space,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -747,6 +912,13 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root SRV holding the 64-bit host GPU VA of a default-heap copy of
+    /// `data` ([`Host::dispatch`] only, for testing AMD HW BVH).
+    BvhNodesVa {
+        data: Vec<u32>,
+    },
+    /// A dummy root UAV (for AMD shader intrinsics `u0, space2147420894`).
+    DummyUav,
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -984,7 +1156,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::BvhNodesVa { .. } | Root::DummyUav => {
+                        return Err("root views in a draw".into())
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1522,6 +1696,36 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::BvhNodesVa { data } => {
+                        let bytes = (data.len() * 4).max(256) as u64;
+                        let src = upload(data)?;
+                        let dst = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        list.CopyBufferRegion(&dst, 0, &src, 0, (data.len() * 4) as u64);
+                        list.ResourceBarrier(&[transition(
+                            &dst,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        let va = dst.GetGPUVirtualAddress();
+                        let dir = upload(&[va as u32, (va >> 32) as u32, 0, 0])?;
+                        list.SetComputeRootShaderResourceView(*param, dir.GetGPUVirtualAddress());
+                        keep.push(src);
+                        keep.push(dst);
+                        keep.push(dir);
+                    }
+                    Root::DummyUav => {
+                        let dummy = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, dummy.GetGPUVirtualAddress());
+                        keep.push(dummy);
                     }
                 }
             }

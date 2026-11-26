@@ -65,8 +65,18 @@ pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Sentinel slot in [`HostShader::root_uavs`] for the AMD D3D12 shader
+/// intrinsics magic UAV (`u0, space2147420894`), used by hardware BVH
+/// ray-node intersection (`VICTORY_HW_BVH=1`).
+pub const SLOT_AMD_EXT: u8 = 252;
+/// AMD D3D12 shader intrinsics designated register space (`0x7FFF0ADE`).
+pub const AMD_EXT_SPACE: u32 = 2_147_420_894;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
+/// Byte offset in [`SLOT_MEMORY`] where the parallel 64-bit host GPU VA table
+/// starts (one `u64` per 64 KiB page, 0 if unmapped; bit 0 set if mapped but
+/// not 64-byte aligned so hardware BVH falls back to software).
+pub const MEMORY_VA_OFFSET: u32 = MEMORY_PAGES * 8;
 /// In a directory entry's first dword: shaders do not store there by address
 /// (a title buffer the structure builder has not been given to write).
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
@@ -403,13 +413,19 @@ impl Shader {
     }
 
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
-    /// `u<slot>` in [`ROOT_CBV_SPACE`].
+    /// `u<slot>` in [`ROOT_CBV_SPACE`], or `u0` in [`AMD_EXT_SPACE`] when
+    /// `slot == SLOT_AMD_EXT`.
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
         }
-        let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let (reg, space) = if slot == SLOT_AMD_EXT {
+            (0u32, AMD_EXT_SPACE)
+        } else {
+            (u32::from(slot), ROOT_CBV_SPACE)
+        };
+        let r = self.m.i32(reg);
+        let bind = [r, r, self.m.i32(space), self.m.i8(1)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -691,6 +707,11 @@ impl Shader {
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    let (reg, space) = if slot == SLOT_AMD_EXT {
+                        (0u32, AMD_EXT_SPACE)
+                    } else {
+                        (u32::from(slot), ROOT_CBV_SPACE)
+                    };
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
@@ -698,8 +719,8 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, reg)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(no),
@@ -710,8 +731,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register: reg,
                         dxil_kind: 11,
                     });
                 }

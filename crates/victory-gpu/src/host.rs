@@ -61,6 +61,9 @@ pub(crate) struct Host {
     /// no sampler heap ([`fallback_heaps`]).
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    /// Keeps AMD D3D12 shader intrinsics (`IntersectBvhNode`) alive for the
+    /// lifetime of `device` when `VICTORY_HW_BVH=1`.
+    _amd_ext: Option<victory_shader::emit::host::AmdExtGuard>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -1054,6 +1057,26 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        let amd_ext = if victory_shader::emit::hw_bvh_switch() {
+            match victory_shader::emit::host::enable_amd_bvh(&device) {
+                Some(guard) => {
+                    victory_shader::emit::set_host_hw_bvh(guard.opcode);
+                    tracing::info!(
+                        opcode = format_args!("{:#04x}", guard.opcode),
+                        "AMD hardware BVH ray-node intersection enabled (VICTORY_HW_BVH=1)"
+                    );
+                    Some(guard)
+                }
+                None => {
+                    tracing::warn!(
+                        "VICTORY_HW_BVH=1 requested, but AMD IntersectBvhNode extension is unavailable on this adapter; using software BVH"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -1111,6 +1134,7 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            _amd_ext: amd_ext,
         })
     }
 }

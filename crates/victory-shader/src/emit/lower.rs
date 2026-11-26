@@ -1580,6 +1580,51 @@ pub fn set_host_rdna(on: bool) {
     HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static HOST_HW_BVH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tells the translator which AMD `IAmdExtD3DShaderIntrinsics` BVH-intersect
+/// opcode is enabled on the host device (`0x22` for `IntersectBvhNode`, `0x16`
+/// for `IntersectInternal`, `0` for disabled).
+pub fn set_host_hw_bvh(opcode: u8) {
+    HOST_HW_BVH.store(opcode, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `VICTORY_HW_BVH=1` is set in the environment.
+pub fn hw_bvh_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HW_BVH").is_some_and(|v| v == "1"))
+}
+
+/// The active AMD hardware BVH intrinsic opcode (`0x22` or `0x16`), or `0` if
+/// hardware BVH is inactive.
+pub fn host_hw_bvh_opcode() -> u8 {
+    if hw_bvh_switch() {
+        HOST_HW_BVH.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Whether hardware BVH ray-node intersection is currently active on this host.
+pub fn host_hw_bvh_active() -> bool {
+    host_hw_bvh_opcode() != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_hw_bvh`], for its thread only (`0` = off).
+    pub(super) static TEST_HW_BVH: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// The AMD hardware BVH opcode to emit during this lowering (`0` = software).
+pub(super) fn host_hw_bvh() -> u8 {
+    #[cfg(test)]
+    if let Some(op) = TEST_HW_BVH.get() {
+        return op;
+    }
+    host_hw_bvh_opcode()
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`host_rdna`], for its thread only.

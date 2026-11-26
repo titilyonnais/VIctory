@@ -670,6 +670,185 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
+/// Guard that enables AMD hardware BVH lowering on this thread until dropped.
+struct HwBvhTest;
+
+impl HwBvhTest {
+    fn new(opcode: u8, test_base: Option<u64>) -> Self {
+        super::lower::TEST_HW_BVH.set(Some(opcode));
+        super::lower::intersect::TEST_HW_BVH_BASE.set(test_base);
+        Self
+    }
+}
+
+impl Drop for HwBvhTest {
+    fn drop(&mut self) {
+        super::lower::TEST_HW_BVH.set(None);
+        super::lower::intersect::TEST_HW_BVH_BASE.set(None);
+    }
+}
+
+#[test]
+fn amd_hw_bvh_directory_form_lowers_and_validates() {
+    for opcode in [0x22u8, 0x16u8] {
+        let _hw = HwBvhTest::new(opcode, None);
+        for wide in [true, false] {
+            let (shader, _) = build(wide, WHOLE).expect("hw bvh lowers and validates");
+            assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+            assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+            assert!(shader.root_uavs.contains(&super::SLOT_AMD_EXT));
+        }
+    }
+}
+
+#[test]
+fn amd_hw_bvh_matches_the_reference_on_the_card() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(mut host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let opcode = host.enable_amd_bvh();
+    if opcode == 0 {
+        eprintln!("AMD IntersectBvhNode/IntersectInternal extension not available on this adapter; skipped");
+        return;
+    }
+    eprintln!("AMD HW BVH enabled on {} with opcode {opcode:#04x}", host.adapter_name().unwrap_or_default());
+    let (scene, batches) = scene();
+    for (wide, descriptor, pointers, sort) in [
+        (true, WHOLE, BASE + u64::from(NODES), true),
+        (
+            false,
+            Descriptor::Numbers(((BASE + u64::from(NODES)) >> 8) as u32, ((BASE + u64::from(NODES)) >> 40) as u32),
+            0,
+            false,
+        ),
+        (
+            false,
+            Descriptor::Numbers(
+                ((BASE + u64::from(NODES)) >> 8) as u32,
+                ((BASE + u64::from(NODES)) >> 40) as u32 | bvh::BOX_SORT,
+            ),
+            0,
+            true,
+        ),
+    ] {
+        let _hw = HwBvhTest::new(opcode, Some(BASE));
+        let (shader, _) = build(wide, descriptor).expect("hw bvh lowers and validates");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(shader.root_uavs.contains(&super::SLOT_AMD_EXT));
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("AMD hw bvh compute_pipeline failed: {e}"));
+        let mut total = 0usize;
+        let mut exact = 0usize;
+        let mut boundary_diffs = 0usize;
+        for (b, batch) in batches.iter().enumerate() {
+            let data = buffer(&scene, batch, pointers);
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0; 5])),
+                            (1, Root::DummyUav),
+                            (2, Root::BvhNodesVa { data: data.clone() }),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("AMD hw bvh dispatch failed: {e}"));
+            for t in 0..THREADS as usize {
+                total += 1;
+                let case = batch.get(t).copied().flatten();
+                let want = match batch.get(t) {
+                    Some(c) => expected(&scene, c, sort),
+                    None => BEFORE,
+                };
+                let got = &out[0][4 * t..4 * t + 4];
+                match case {
+                    None | Some((_, 6 | 7, _)) => {
+                        assert_eq!(got, want, "masked/non-bvh mismatch (wide={wide} sort={sort}) b={b} t={t}");
+                        exact += 1;
+                    }
+                    Some((_, 4 | 5, ray)) => {
+                        if got == want {
+                            exact += 1;
+                        } else {
+                            // Only exact box-face / extent==face ties differ between HW `<=` and CPU `<`.
+                            let is_face_tie = ray.extent == 19.0
+                                || (ray.direction[1] == 0.0 && ray.origin[1].abs() == 1.0);
+                            assert!(
+                                is_face_tie,
+                                "unexpected box mismatch (wide={wide} sort={sort}) b={b} t={t} {case:x?}\n got {got:08x?}\nwant {want:08x?}"
+                            );
+                            boundary_diffs += 1;
+                        }
+                    }
+                    Some((_, 0..=3, _)) => {
+                        let g = [
+                            f32::from_bits(got[0]),
+                            f32::from_bits(got[1]),
+                            f32::from_bits(got[2]),
+                            f32::from_bits(got[3]),
+                        ];
+                        let w = [
+                            f32::from_bits(want[0]),
+                            f32::from_bits(want[1]),
+                            f32::from_bits(want[2]),
+                            f32::from_bits(want[3]),
+                        ];
+                        let gt = g[0] / g[1];
+                        let wt = w[0] / w[1];
+                        let matched = if wt.is_infinite() && gt.is_infinite() && gt.is_sign_positive() {
+                            true
+                        } else if wt.is_finite() && gt.is_finite() {
+                            let (gu, gv) = (g[2] / g[1], g[3] / g[1]);
+                            let (wu, wv) = (w[2] / w[1], w[3] / w[1]);
+                            (gt - wt).abs() < 1e-4
+                                && (gu - wu).abs() < 1e-4
+                                && (gv - wv).abs() < 1e-4
+                        } else {
+                            false
+                        };
+                        if matched {
+                            exact += 1;
+                        } else {
+                            // Exact triangle edge / vertex tie-breaking (barycentric ~0 or ~1).
+                            let (u, v) = if wt.is_finite() {
+                                (w[2] / w[1], w[3] / w[1])
+                            } else {
+                                (g[2] / g[1], g[3] / g[1])
+                            };
+                            let on_edge = u.abs() < 1e-3
+                                || v.abs() < 1e-3
+                                || (1.0 - u - v).abs() < 1e-3;
+                            assert!(
+                                on_edge,
+                                "unexpected interior triangle mismatch (wide={wide} sort={sort}) b={b} t={t} {case:x?}\n got {got:08x?} = {g:?}\nwant {want:08x?} = {w:?}"
+                            );
+                            boundary_diffs += 1;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(exact > 300 && boundary_diffs < 30, "unexpected counts: {exact}/{total}, {boundary_diffs} boundary");
+    }
+}
+
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two

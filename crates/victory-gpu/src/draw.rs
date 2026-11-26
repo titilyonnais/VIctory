@@ -1801,8 +1801,13 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
-                if slot == victory_shader::emit::SLOT_FAULTS {
-                    // Ours: where shaders note the pages they found empty.
+                if slot == victory_shader::emit::SLOT_FAULTS
+                    || slot == victory_shader::emit::SLOT_AMD_EXT
+                {
+                    // Ours: where shaders note empty pages (`SLOT_FAULTS`) or
+                    // AMD's shader-intrinsics magic UAV (`u0, space2147420894`,
+                    // intercepted by the driver at compile time; binding the
+                    // live faults buffer VA keeps D3D12 happy).
                     if let Some(m) = &memory {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
