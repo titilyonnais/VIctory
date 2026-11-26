@@ -1040,6 +1040,7 @@ mod tests {
             token: 0,
             count: 1,
             resources,
+            _rest: [0; 6],
         };
         let black_res = black;
         let p_black = plane(&raw const black_res);
