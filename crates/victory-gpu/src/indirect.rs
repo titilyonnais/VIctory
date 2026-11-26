@@ -19,7 +19,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -203,8 +203,14 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+pub(crate) fn bound(
+    list: &HostList,
+    args: (&ID3D12Resource, u64),
+    count: Option<&ID3D12Resource>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    let (args_res, gpu) = args;
+    let (Some(c), Some((budget_res, budget))) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
@@ -212,15 +218,34 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
+    if records == 0 {
+        // Zero records run no clamp dispatch and need no UAV barriers; keep
+        // the `COMMON -> INDIRECT_ARGUMENT` state paired with `done()`.
+        // SAFETY: an open list and live buffer in COMMON.
+        unsafe {
+            l.ResourceBarrier(&[transition(
+                &out,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        return Some(out);
+    }
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        // Order earlier title UAV writes into `args` (and any distinct
+        // `count` buffer) without issuing a global NULL-resource UAV flush.
+        let out_to_uav = transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        match count.filter(|c_res| c_res.as_raw() != args_res.as_raw()) {
+            Some(count_res) => l.ResourceBarrier(&[
+                uav_barrier_for(args_res),
+                uav_barrier_for(count_res),
+                out_to_uav,
+            ]),
+            None => l.ResourceBarrier(&[uav_barrier_for(args_res), out_to_uav]),
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
@@ -228,9 +253,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
+        l.Dispatch(1, 1, 1);
+        // `out` transitions UAV -> INDIRECT_ARGUMENT; `budget` only needs a
+        // targeted UAV barrier for the next clamp in this list or submission.
         l.ResourceBarrier(&[
-            uav_barrier(),
+            uav_barrier_for(budget_res),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
@@ -249,18 +276,34 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    #[cfg(test)]
+    tests::UAV_BARRIERS.with(|l| l.borrow_mut().push(resource.as_raw() as usize));
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed COM pointer; `ManuallyDrop` never releases it,
+                // and the caller keeps `resource` alive through `ResourceBarrier`.
+                pResource: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(resource) })),
+            }),
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static UAV_BARRIERS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn take_uav_barriers() -> Vec<usize> {
+        UAV_BARRIERS.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -297,7 +340,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
+                let clamped = super::bound(&list, (&buffer, gpu), None, spec).unwrap();
                 super::done(&list, &clamped);
                 out = Some(clamped);
             }
@@ -379,7 +422,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    let out = super::bound(l, (&title, gpu), None, (2, 12, 1)).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
@@ -416,5 +459,72 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// Clamps emit targeted UAV barriers only on `args`, any distinct `count`
+    /// buffer, and `budget` (never a global NULL-resource flush), and zero
+    /// records emit no UAV barriers while keeping `out` transitions balanced.
+    #[test]
+    fn scoped_uav_barriers_and_zero_record_skip() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (args, args_data) = host.shared_buffer(256).unwrap();
+        let (count, _) = host.shared_buffer(256).unwrap();
+        // SAFETY: our mapped buffer; a live buffer.
+        let gpu = unsafe {
+            args_data.cast::<[u32; 3]>().write_volatile([70_000, 1, 1]);
+            args.GetGPUVirtualAddress()
+        };
+        let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
+        let list = host.new_list().unwrap();
+        let budget_key = key(list.budget().unwrap().0);
+
+        // 1. No count buffer -> [args, budget].
+        take_uav_barriers();
+        issued();
+        let out = super::bound(&list, (&args, gpu), None, (2, 12, 1)).unwrap();
+        super::done(&list, &out);
+        assert_eq!(take_uav_barriers(), [key(&args), budget_key]);
+        let mut states: std::collections::HashMap<usize, u32> = [(key(&out), 0)].into_iter().collect();
+        replay(&issued(), &mut states).unwrap();
+        assert_eq!(states[&key(&out)], 0);
+
+        // 2. Count buffer aliased with args -> deduplicated [args, budget].
+        take_uav_barriers();
+        let out = super::bound(&list, (&args, gpu), Some(&args), (2, 12, 1)).unwrap();
+        super::done(&list, &out);
+        assert_eq!(take_uav_barriers(), [key(&args), budget_key]);
+
+        // 3. Distinct count buffer -> [args, count, budget].
+        take_uav_barriers();
+        let out = super::bound(&list, (&args, gpu), Some(&count), (2, 12, 1)).unwrap();
+        super::done(&list, &out);
+        assert_eq!(take_uav_barriers(), [key(&args), key(&count), budget_key]);
+
+        // 4. Zero records -> no UAV barriers, balanced COMMON -> INDIRECT -> COMMON.
+        take_uav_barriers();
+        issued();
+        let out = super::bound(&list, (&args, gpu), Some(&count), (2, 12, 0)).unwrap();
+        super::done(&list, &out);
+        assert!(take_uav_barriers().is_empty());
+        let mut states: std::collections::HashMap<usize, u32> = [(key(&out), 0)].into_iter().collect();
+        replay(&issued(), &mut states).unwrap();
+        assert_eq!(states[&key(&out)], 0);
+
+        // Execute the list once, then execute again after completion (never
+        // re-submitting an in-flight list in the same ExecuteCommandLists call).
+        list.close();
+        host.execute(&[&list]);
+        host.execute(&[&list]);
+        let mut p = std::ptr::null_mut();
+        // SAFETY: our mapped argument buffer, after execution completed.
+        let clamped = unsafe {
+            out.Map(0, None, Some(&mut p)).unwrap();
+            p.cast::<[u32; 3]>().read_volatile()
+        };
+        assert_eq!(clamped, [65_535, 1, 1]);
     }
 }
