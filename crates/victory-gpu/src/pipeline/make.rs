@@ -103,11 +103,18 @@ impl Pending {
 /// crashes on.
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
-/// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
+/// The keys of the pipelines the driver's compiler crashed on under this
+/// translator and driver (`warm-bad.txt` beside the pipeline library, see
+/// [`super::known::bad_keys`]), loaded on first use. `VICTORY_WARM_BAD=0`
 /// leaves the file unread.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// What the lines of `warm-bad.txt` are written under: the translator with
+/// its settings, and the driver ([`super::known::fingerprint`]).
+fn bad_fingerprint() -> &'static str {
+    static PRINT: OnceLock<String> = OnceLock::new();
+    PRINT.get_or_init(super::known::fingerprint)
+}
 
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
@@ -118,12 +125,22 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
+        let keys: std::collections::HashSet<String> =
+            super::known::bad_keys(&listed, bad_fingerprint()).map(str::to_owned).collect();
+        let lines = listed
             .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .count();
+        let others = lines.saturating_sub(super::known::bad_keys(&listed, bad_fingerprint()).count());
+        if others > 0 {
+            tracing::info!(
+                kept = keys.len(),
+                others,
+                fingerprint = bad_fingerprint(),
+                "pipelines the driver's compiler crashed on: those of another translation or driver are made again"
+            );
+        }
+        keys
     });
     f(keys)
 }
@@ -298,7 +315,8 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let why = format!("ended the compiler in a run: {:?}", p.shaders);
+            let _ = writeln!(f, "{}", super::known::bad_line(&p.key, bad_fingerprint(), &why));
         }
     }
     let _ = p.made.set(None);

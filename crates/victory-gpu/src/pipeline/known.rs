@@ -257,6 +257,27 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// The keys of the pipelines `warm-bad.txt`'s text (`text`) names for
+/// `fingerprint` ([`fingerprint`]): a line is the key, the fingerprint it
+/// was written under, then why; `#` begins a comment. A line of another
+/// translator or driver, or one written before lines held a fingerprint,
+/// names none: a compiler crash belongs to what the driver was given, and a
+/// change of the translation can take it away (31 compute programs that
+/// crashed AMD's compiler built once a clean-up pass shared handles within
+/// their block only). A crash again is caught and listed again.
+pub fn bad_keys<'a>(text: &'a str, fingerprint: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(move |l| {
+        let mut words = l.split_whitespace();
+        let key = words.next()?;
+        (words.next() == Some(fingerprint)).then_some(key)
+    })
+}
+
+/// A line of `warm-bad.txt` for `key`, under `fingerprint` (see [`bad_keys`]).
+pub fn bad_line(key: &str, fingerprint: &str, why: &str) -> String {
+    format!("{key} {fingerprint} {why}")
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
@@ -467,6 +488,19 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the lines of this translator and driver name a pipeline.
+    #[test]
+    fn bad_pipelines_are_those_of_this_fingerprint() {
+        let text = format!(
+            "# a comment\n{}\n{}\nold1 ended the compiler in a run: [compute 842de0c32bc8dcc5]\n",
+            bad_line("now1", "aaaa", "ended the compiler in a run: [compute 1]"),
+            bad_line("then1", "bbbb", "ended the compiler in a run: [compute 2]"),
+        );
+        assert_eq!(bad_keys(&text, "aaaa").collect::<Vec<_>>(), ["now1"]);
+        assert_eq!(bad_keys(&text, "bbbb").collect::<Vec<_>>(), ["then1"]);
+        assert_eq!(bad_keys(&text, "cccc").count(), 0);
+    }
 
     #[test]
     fn failed_open_retries_before_later_records() {
