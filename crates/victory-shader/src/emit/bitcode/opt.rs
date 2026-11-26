@@ -897,6 +897,10 @@ impl Module {
                     changed = true;
                     continue;
                 }
+                if self.kept.contains(&i) {
+                    kept.push(i);
+                    continue;
+                }
                 if passes & FOLD != 0
                     && let Some(v) = self.simplify(i, &mut changed)
                 {

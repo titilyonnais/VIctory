@@ -48,6 +48,10 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    // The size queries as RDNA 4 hosts have them (`raw_size_own_handle`): the
+    // tests read sizes on the host's GPU, and on RDNA 4 the other form faults
+    // AMD's compiler (the record count of a buffer read by index did).
+    super::lower::TEST_RAW_SIZE.set(Some(true));
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
