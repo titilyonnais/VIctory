@@ -803,15 +803,35 @@ pub(crate) fn write_back(
     len: usize,
     write: impl FnOnce(),
 ) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let waited = Timed(std::time::Instant::now(), crate::copystat::C::BackLockUs);
     let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     if let Some(t) = tracked
         && (first..last).any(|p| t.was_remapped(p))
     {
         return false;
     }
-    let _writing = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::BackWrites, 1);
+        crate::copystat::add(crate::copystat::C::BackWriteBytes, len as u64);
+    }
+    #[cfg(feature = "diagnostics")]
+    let opening = Timed(std::time::Instant::now(), crate::copystat::C::BackOpenUs);
+    let writing = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    drop(opening);
+    #[cfg(feature = "diagnostics")]
+    let copying = Timed(std::time::Instant::now(), crate::copystat::C::BackCopyUs);
     write();
+    #[cfg(feature = "diagnostics")]
+    drop(copying);
+    #[cfg(feature = "diagnostics")]
+    let _closing = Timed(std::time::Instant::now(), crate::copystat::C::BackCloseUs);
+    drop(writing);
     true
 }
 

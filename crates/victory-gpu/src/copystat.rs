@@ -104,8 +104,23 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Copying back marked pages, by part: preparing the slices (title
+    /// memory read as the baseline), reading title memory in the commits,
+    /// merging, waiting for the remap lock, opening the pages
+    /// (`watch::writing`), the write itself, closing them (`Writing`'s
+    /// drop), taking the pages again, and the writes made.
+    MarkedPrepUs,
+    MarkedReadUs,
+    MarkedMergeUs,
+    BackLockUs,
+    BackOpenUs,
+    BackCopyUs,
+    BackCloseUs,
+    MarkedTakenUs,
+    BackWrites,
+    BackWriteBytes,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 71;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -304,6 +319,19 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "copy-back parts per frame: marked slices prepared {:.1} ms, title read {:.1} ms, merged {:.1} ms, taken again {:.1} ms; writes {:.0} ({:.1} MB): remap lock {:.1} ms, opening {:.1} ms, copying {:.1} ms, closing {:.1} ms",
+        ms(c[C::MarkedPrepUs as usize]),
+        ms(c[C::MarkedReadUs as usize]),
+        ms(c[C::MarkedMergeUs as usize]),
+        ms(c[C::MarkedTakenUs as usize]),
+        c[C::BackWrites as usize],
+        mb(c[C::BackWriteBytes as usize]),
+        ms(c[C::BackLockUs as usize]),
+        ms(c[C::BackOpenUs as usize]),
+        ms(c[C::BackCopyUs as usize]),
+        ms(c[C::BackCloseUs as usize]),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

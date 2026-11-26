@@ -979,10 +979,16 @@ impl MarkedSlice<'_> {
                 continue;
             }
             let mut title = vec![0u8; n];
+            #[cfg(feature = "diagnostics")]
+            let reading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedReadUs);
             if !crate::host::read_into(from as *const u8, &mut title) {
                 synced = false;
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            drop(reading);
+            #[cfg(feature = "diagnostics")]
+            let merging = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedMergeUs);
             let mut changed = false;
             for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
                 if *h != *b && *t != *h {
@@ -991,6 +997,8 @@ impl MarkedSlice<'_> {
                 }
                 *h = *t;
             }
+            #[cfg(feature = "diagnostics")]
+            drop(merging);
             #[cfg(test)]
             tests::before_copy_back_write();
             // Under the remap lock: a page remapped meanwhile keeps its new
@@ -1117,6 +1125,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     // Prepare all slices before any `watch::writing` opens shared pages.
+    #[cfg(feature = "diagnostics")]
+    let preparing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedPrepUs);
     let prepared: Vec<MarkedSlice<'_>> = pages
         .iter()
         .filter_map(|(copy, page)| {
@@ -1130,6 +1140,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             copy.prepare_marked(*page, held)
         })
         .collect();
+    #[cfg(feature = "diagnostics")]
+    drop(preparing);
     let mut results = Vec::with_capacity(prepared.len());
     for entry in &prepared {
         let res = entry.commit();
@@ -1141,6 +1153,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         results.push(res);
     }
+    #[cfg(feature = "diagnostics")]
+    let _taking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedTakenUs);
     // After all `Writing` guards have dropped, re-take every synced slice's
     // page (even sub-page copies cover their entire tracked slice in `page`),
     // unless a later write in this batch overlapped its bytes or a withheld
