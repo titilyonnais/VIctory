@@ -606,8 +606,9 @@ unsafe impl Send for Own {}
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills and copies done on the card, their
-/// bytes, and submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// bytes, submissions that waited instead, refused by a check, and refreshes
+/// through another host copy done on the card.
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -616,11 +617,20 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// Whether the refreshes of the submission that read what flights write
+    /// through another host copy are done here ([`refresh_on_card`]).
+    refreshes: bool,
 }
 
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
+    }
+
+    /// Whether what [`crossed_by`] finds for the submission is done by this:
+    /// the bytes are copied on the card from the host copy the flights write.
+    pub(super) fn refreshes_done(&self) -> bool {
+        self.refreshes
     }
 
     /// Whether step `i` of `list` is done by this.
@@ -663,13 +673,17 @@ impl Host {
             (line.written.clone(), copies(&line))
         };
         let looked = crate::timeline::span("steps on the card: whether in the way");
-        blocked_by(&written, runs, false)?;
+        let blocked = blocked_by(&written, runs, false).is_some();
+        let crossed = crossed_refreshes(&written, runs);
+        if !blocked && crossed.is_empty() {
+            return None;
+        }
         let read = copied_read(&copies, runs);
         looked.end();
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, runs, blocked, &crossed)
         };
         match taken {
             Ok(taken) => taken,
@@ -683,11 +697,20 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    /// `blocked`: whether [`blocked_by`] stops the submission; `crossed`: what
+    /// [`crossed_refreshes`] found.
+    fn take_steps(
+        &self,
+        written: &[(usize, usize)],
+        runs: &[&HostList],
+        blocked: bool,
+        crossed: &[(Arc<Shadow>, usize, usize)],
+    ) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
-        if chosen.is_empty() {
+        let chosen = if blocked { plan(&does, stage(), placed_order(), &mut None)? } else { Vec::new() };
+        // (Stopped by more than refreshes, with nothing taken: the old wait.)
+        if chosen.is_empty() && (blocked || crossed.is_empty()) {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
@@ -777,6 +800,58 @@ impl Host {
                 to,
             });
         }
+        // Refreshes that read what flights write through another host copy
+        // ([`refresh_on_card`]): the bytes go from the host copy that holds
+        // them on the card to the one refreshed, which declares them written
+        // (its refreshes leave them alone from there on, the relay compares).
+        // Not counted as copies done here ([`copied_read`]): title memory gets
+        // the same bytes from the flights' own landing.
+        let mut seen: HashMap<(usize, usize, usize), ()> = HashMap::default();
+        let mut refreshed = Vec::new();
+        for (to, a, b) in crossed {
+            let (a, b, len) = (*a, *b, *b - *a);
+            if len == 0 || seen.insert((Arc::as_ptr(to) as usize, a, b), ()).is_some() {
+                continue;
+            }
+            let meets = |op: &Op| {
+                meet((op.from.1, op.from.1 + op.len), (a, b)) || matches!(&op.to, To::Copy(_, dst) if meet((*dst, *dst + op.len), (a, b)))
+            };
+            if ops.iter().any(meets) {
+                return Err("a refresh through another host copy meets a step done on the card");
+            }
+            let from = holder(&writers, a, b)?;
+            if Arc::ptr_eq(&from, to) || to.in_place() {
+                return Err("a refresh through another host copy has no other copy to take it from");
+            }
+            let (start, span) = to.span();
+            if (a as u64) < start || b as u64 > start + span {
+                return Err("a refresh through another host copy is not all in its copy");
+            }
+            if !mapped(a, b, &mut room) {
+                return Err("not all of what a refresh reads is mapped");
+            }
+            let place = (Arc::as_ptr(&from) as usize, a, len, 0);
+            let at = match places.get(&place) {
+                Some(&at) => at,
+                None => {
+                    if end + len as u64 > BETWEEN {
+                        return Err("too much at once");
+                    }
+                    let at = end;
+                    end = (end + len as u64).next_multiple_of(256);
+                    places.insert(place, at);
+                    at
+                }
+            };
+            refreshed.push(ops.len());
+            ops.push(Op {
+                from: (from, a),
+                len,
+                at,
+                level: 0,
+                to: To::Copy(to.clone(), a),
+            });
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -800,10 +875,12 @@ impl Host {
             shadow.refresh(&own.list, from as u64, (to - from) as u64);
         }
         let mut copied = Vec::new();
-        for op in &ops {
+        for (i, op) in ops.iter().enumerate() {
             if let To::Copy(to, dst) = &op.to {
                 to.gpu_writes(&own.list, *dst as u64, op.len as u64);
-                copied.push((to.clone(), *dst, *dst + op.len));
+                if !refreshed.contains(&i) {
+                    copied.push((to.clone(), *dst, *dst + op.len));
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -847,8 +924,9 @@ impl Host {
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
-        DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
+        DONE[1].fetch_add((copies - refreshed.len()) as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[4].fetch_add(refreshed.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
@@ -856,6 +934,7 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            refreshes: !crossed.is_empty(),
         }))
     }
 
@@ -903,12 +982,13 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} refreshes through another host copy (VICTORY_REFRESH_WAIT=2)",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        d[4],
     );
     #[cfg(feature = "diagnostics")]
     {
