@@ -9,6 +9,7 @@
 
 | Branche | Contenu | Vérifié en jeu |
 |---|---|---|
+| `jouable` | `avatar-maj` + `memoire-32g` + entrées fluides (Raw Input, curseur gardé dans la fenêtre) + correction des triangles étirés (`VICTORY_REFRESH_WAIT`) | 2 essais avec virages de caméra (25 et 15 min), aucune panne ; correction des triangles coupée (`VICTORY_REFRESH_WAIT=0`) : 11,8 images/s en médiane, 11 au plus bas, pire image 180 ms ; avec la correction : 6,9 en médiane. Version de jeu (release) : démarre sans erreur. Ressenti clavier et souris à confirmer |
 | `avatar-maj` | Branche `rx9070xt` de Belobug (code d'AvatarManz + correctifs RX 9070 XT) + nouveautés d'AvatarManz du 26/11 + clavier AZERTY et souris | 13 images/s en médiane (12,1 au plus bas) sur 15 min, aucune panne |
 | `memoire-32g` | `rx9070xt` + clavier + correctif mémoire pour 32 Go (`VICTORY_SHELVE_BACKS`, `VICTORY_IDLE_TRIM`, actifs par défaut) | 60 min sans panne, 12,8 images/s stables, mémoire engagée stable (30,0 → 30,3 Go) |
 | `clavier` | `rx9070xt` + clavier par position (ZQSD en AZERTY), souris pour la caméra, clavier et manette ensemble | tests unitaires ; contrôle en jeu à confirmer |
@@ -18,7 +19,7 @@ Avant ce changement de base, l'ancienne branche (main officiel + ~45 demandes de
 ### Compiler et lancer
 
 ```powershell
-git switch memoire-32g      # ou avatar-maj
+git switch jouable          # ou memoire-32g, avatar-maj
 copy victory.example.toml victory.toml   # puis régler game_dir, cache_dir, data_dir
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <chemin de game_scarlett_master.exe>
@@ -35,11 +36,13 @@ scripts\play.ps1 -Exe <chemin de game_scarlett_master.exe>
 | Sauter | Espace |
 | Menu | Échap |
 
-`VICTORY_KEYBOARD=vk` remet l'ancienne table par lettre ; `VICTORY_MOUSE_SENS` règle la sensibilité.
+`VICTORY_KEYBOARD=vk` remet l'ancienne table par lettre ; `VICTORY_MOUSE_SENS` règle la sensibilité. Sur `jouable` : `VICTORY_RAW_INPUT=0` remet l'ancienne lecture du clavier et de la souris, `VICTORY_TITLE_KEYS=0` cache le clavier au jeu (seule la manette simulée reste).
 
 ### Défauts connus
 
-- Environ 340 dessins par image sont encore écartés (pipelines sur lesquels le compilateur du pilote AMD plante) : correction en cours.
+- Environ 340 dessins par image sont écartés : ce sont les étapes du constructeur de structures de lancer de rayons, coupé exprès. Une trentaine de calculs de personnages que le compilateur du pilote AMD refusait compilent sur la branche `pipelines-amd` (non reprise : gain non mesuré).
+- Triangles étirés intermittents (grande forme sombre quelques images de suite) : cause probable trouvée (rafraîchissements qui lisent des octets encore en vol avec `VICTORY_RELAY=2`). La correction existe, mais elle coûte environ 40 % des images/s : elle est coupée dans le script de jeu.
+- Chutes d'images/s en tournant la caméra vers une zone jamais vue : c'est le jeu qui charge du contenu (son temps par image passe de 34 à 87 ms).
 - RAM libre faible sur 32 Go (0,4-0,7 Go) : la mémoire n'augmente plus, mais la marge reste mince.
 - Pas de lancer de rayons : l'éclairage indirect est remplacé par une lumière de remplacement.
 
