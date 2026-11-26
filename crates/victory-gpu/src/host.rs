@@ -5833,6 +5833,8 @@ impl Host {
             None => late_blocked(runs),
             Some(_) if !crossed.is_empty() => {
                 LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                blame("a refresh through another host copy", &crossed, crossed[0].0, crossed[0].1 - crossed[0].0);
                 Some(WHY_READ)
             }
             Some(_) => None,
