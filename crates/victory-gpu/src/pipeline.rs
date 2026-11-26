@@ -613,6 +613,7 @@ pub(crate) extern "system" fn create_graphics(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    crate::parts::note_usual(crate::parts::Kind::Graphics, desc.root);
     let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
     hand_out(
@@ -635,6 +636,7 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    crate::parts::note_usual(crate::parts::Kind::Compute, desc.root);
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
@@ -713,10 +715,17 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    let mut root: This = std::ptr::null();
+    let mut compute = false;
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
+        compute |= kind == 6;
+        if kind == 0 {
+            // SAFETY: a root signature subobject has its pointer at +8.
+            root = unsafe { desc.stream.add(at + 8).cast::<This>().read_unaligned() };
+        }
         let Some((size, stage)) = subobject(kind) else {
             tracing::warn!(
                 kind,
@@ -737,6 +746,12 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    let kind = if compute {
+        crate::parts::Kind::Compute
+    } else {
+        crate::parts::Kind::Graphics
+    };
+    crate::parts::note_usual(kind, root);
     hand_out(
         shaders,
         #[cfg(windows)]

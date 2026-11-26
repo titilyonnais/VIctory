@@ -346,16 +346,15 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 (a graphics pipeline) and 0x218 (a compute one),
+/// `(this, description, interface id, out)`: pipelines given as bare console
+/// code blocks with their metadata, not containers (`crate::parts` has the
+/// layouts and what the title does on failure: 0x218 makes the same
+/// pipeline through 0x1f0 straight after, 0x1c8 fills a prebuilt cache).
+/// shortcut: not implemented, on purpose: a success makes the title skip
+/// its own fallback, which translates where these blocks mostly do not.
+/// The calls fail with `out` null; `crate::parts` counts them against the
+/// pipelines then made the usual way, and the first ones log the words.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -369,6 +368,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    let kind = if SLOT == 0x218 {
+        crate::parts::Kind::Compute
+    } else {
+        crate::parts::Kind::Graphics
+    };
+    crate::parts::note_failed(kind, crate::parts::root(desc));
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
@@ -393,7 +398,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            shape = %crate::parts::shape(kind, desc),
+            "a pipeline creation method that is not implemented: the title makes this pipeline the usual way, see the 0x1c8/0x218 tally"
         );
     }
     E_NOTIMPL
