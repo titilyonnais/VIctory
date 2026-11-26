@@ -745,6 +745,24 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
 }
 
+/// Whether `ranges` (in any order, overlapping or not) hold all of `[from,
+/// to)`.
+pub(crate) fn covered(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+    let mut near: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+    near.sort_unstable();
+    let mut at = from;
+    for (a, b) in near {
+        if a > at {
+            return false;
+        }
+        at = at.max(b);
+        if at >= to {
+            return true;
+        }
+    }
+    at >= to
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     // (The sort that finds what is in order already: they come as a few
@@ -3644,6 +3662,13 @@ impl Shadow {
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
+    /// Whether those submissions' ranges hold all of title memory `[from,
+    /// to)`: a refresh of the copy leaves it alone (`Shadow::update`), and
+    /// the copy already holds what they write there.
+    pub(crate) fn writes_pending_cover(&self, from: usize, to: usize) -> bool {
+        covered(&self.pending.lock().unwrap_or_else(|e| e.into_inner()), from, to)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
