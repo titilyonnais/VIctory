@@ -265,9 +265,17 @@ code), so on AZERTY the WASD block is ZQSD; names below are QWERTY:
 | Left Ctrl, C or middle mouse | left, right stick click |
 | Esc, V | Menu, View |
 
-The mouse holds the cursor in the middle of the focused window; F8 lets it
-go and takes it again. `VICTORY_MOUSE=0` turns the mouse off,
-`VICTORY_MOUSE_SENS` (1: full deflection at 2000 pixels a second),
+Keys and mouse come from Raw Input: a key is held from its press to its
+release (auto-repeats change nothing), and the mouse's own counts turn the
+right stick, averaged over `VICTORY_MOUSE_SMOOTH` milliseconds (48) so the
+stick holds between reports and comes back to the middle smoothly. While it
+steers, the hidden cursor is held inside the focused window; F8 lets it go
+and takes it again. A remote desktop's input (TeamViewer) works too: its
+absolute mouse positions become movement, and the release of an injected key
+waits `VICTORY_KEY_GRACE` milliseconds (60) for a press again.
+`VICTORY_RAW_INPUT=0` brings back polling (the cursor put back in the middle
+of the window every poll). `VICTORY_MOUSE=0` turns the mouse off,
+`VICTORY_MOUSE_SENS` (1: full deflection at 2000 counts a second),
 `VICTORY_MOUSE_DEADZONE` (0.2) and `VICTORY_MOUSE_INVERT=1` tune it.
 `VICTORY_KEYBOARD=vk` brings back the older table by key label (W A S D /
 I J K L sticks, Enter Backspace X Y for A B X Y, Q / E shoulders, Z / C

@@ -22,6 +22,7 @@ use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
 mod keyboard;
+mod raw;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -574,7 +575,7 @@ impl State {
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
-    Box::new(host::Host::new(keyboard::settings().mouse))
+    Box::new(host::Host::new(keyboard::settings()))
 }
 
 #[cfg(not(windows))]
@@ -1146,6 +1147,7 @@ mod host {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1159,8 +1161,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-        SetCursorPos,
+        ClipCursor, GetClientRect, GetClipCursor, GetCursorPos, GetForegroundWindow, GetWindowRect,
+        GetWindowThreadProcessId, IsIconic, SetCursorPos,
     };
 
     use super::*;
@@ -1218,14 +1220,75 @@ mod host {
         f8_down: bool,
         /// It steered at the last poll: the cursor sits in the middle.
         steering: bool,
+        /// Keys and mouse from Raw Input; none: polled, the older way.
+        raw: Option<&'static super::raw::Shared>,
+        /// We hold the cursor inside the window (`ClipCursor`).
+        clipped: bool,
     }
 
     impl Host {
-        pub(super) fn new(mouse: bool) -> Host {
+        pub(super) fn new(settings: &keyboard::Settings) -> Host {
+            let raw = settings.raw && settings.layout != keyboard::Layout::Off;
             Host {
-                mouse,
+                mouse: settings.mouse,
+                raw: raw.then(|| super::raw::start(settings.key_grace)).flatten(),
                 ..Host::default()
             }
+        }
+
+        /// Lets go of the cursor, if we held it.
+        fn unclip(&mut self) {
+            if std::mem::take(&mut self.clipped) {
+                // SAFETY: a plain call.
+                unsafe { ClipCursor(std::ptr::null()) };
+            }
+        }
+
+        /// Holds the (hidden) cursor inside `window`'s client area, so a
+        /// click stays in the title and the camera turns on: checked every
+        /// poll, so set again after focus comes back, the window moves or
+        /// is resized, or F8. The client area on the screen (left, top,
+        /// right, bottom).
+        fn clip(
+            &mut self,
+            window: windows_sys::Win32::Foundation::HWND,
+        ) -> Option<(i32, i32, i32, i32)> {
+            let mut client = RECT::default();
+            // SAFETY: room for the answers.
+            let want = unsafe {
+                if GetClientRect(window, &mut client) == 0 {
+                    return None;
+                }
+                let mut corners = [
+                    POINT {
+                        x: client.left,
+                        y: client.top,
+                    },
+                    POINT {
+                        x: client.right,
+                        y: client.bottom,
+                    },
+                ];
+                for corner in &mut corners {
+                    ClientToScreen(window, corner);
+                }
+                let want = RECT {
+                    left: corners[0].x,
+                    top: corners[0].y,
+                    right: corners[1].x,
+                    bottom: corners[1].y,
+                };
+                let mut now = RECT::default();
+                GetClipCursor(&mut now);
+                let same = (now.left, now.top, now.right, now.bottom)
+                    == (want.left, want.top, want.right, want.bottom);
+                if !same && want.right > want.left && want.bottom > want.top {
+                    ClipCursor(&want);
+                }
+                want
+            };
+            self.clipped = true;
+            Some((want.left, want.top, want.right, want.bottom))
         }
     }
 
@@ -1269,6 +1332,27 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            if let Some(raw) = self.raw {
+                let mut keys: Vec<KeyState> = down.into_iter().map(by_vk).collect();
+                if !focused() {
+                    raw.forget_keys();
+                    return keys;
+                }
+                // Each key held from its press to its release, as Raw Input
+                // reported them.
+                let held: Vec<KeyState> = raw
+                    .keys(super::now())
+                    .into_iter()
+                    .filter(|&(scan, _)| !keys.iter().any(|k| k.scan_code == scan))
+                    .map(|(scan_code, virtual_key)| KeyState {
+                        scan_code,
+                        virtual_key,
+                        ..Default::default()
+                    })
+                    .collect();
+                keys.extend(held);
+                return keys;
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1279,16 +1363,7 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
+            down.into_iter().map(by_vk).collect()
         }
 
         /// With one of our windows in front, the cursor goes back to its
@@ -1297,6 +1372,9 @@ mod host {
         /// again). Without focus the cursor is left alone.
         fn mouse(&mut self) -> keyboard::Mouse {
             if !self.mouse {
+                if let Some(raw) = self.raw {
+                    raw.forget_mouse();
+                }
                 return keyboard::Mouse::default();
             }
             let f8 = down(VK_F8);
@@ -1311,6 +1389,43 @@ mod host {
             let steer = focused && !self.paused && unsafe { IsIconic(window) } == 0;
             victory_gpu::HIDE_CURSOR.store(steer, std::sync::atomic::Ordering::Relaxed);
             let was = std::mem::replace(&mut self.steering, steer);
+            if let Some(raw) = self.raw {
+                // Raw Input: the mouse's own counts, the cursor left where
+                // it is, only held inside the window.
+                if !steer {
+                    self.unclip();
+                    raw.forget_mouse();
+                    return keyboard::Mouse::default();
+                }
+                let client = self.clip(window);
+                // A remote desktop moves the mouse to absolute positions:
+                // held in the window, the cursor would stop at its edge and
+                // the camera with it. Near an edge it goes back to the
+                // middle; a real mouse's counts need none of that.
+                if let Some(client) = client
+                    && raw.absolute()
+                {
+                    let mut at = POINT::default();
+                    // SAFETY: room for the answer.
+                    if unsafe { GetCursorPos(&mut at) } != 0
+                        && super::raw::needs_recentering(true, (at.x, at.y), client)
+                    {
+                        let (x, y) = super::raw::middle(client);
+                        // SAFETY: a plain call.
+                        raw.recenter(|| unsafe {
+                            SetCursorPos(x, y);
+                        });
+                    }
+                }
+                let mouse = raw.mouse();
+                // The first poll in front only takes the mouse: the click
+                // that brought the window forward is no shot.
+                if !was {
+                    raw.forget_mouse();
+                    return keyboard::Mouse::default();
+                }
+                return mouse;
+            }
             if !steer {
                 return keyboard::Mouse::default();
             }
@@ -1335,8 +1450,8 @@ mod host {
                 return keyboard::Mouse::default();
             }
             keyboard::Mouse {
-                dx: at.x - middle.x,
-                dy: at.y - middle.y,
+                dx: (at.x - middle.x) as f32,
+                dy: (at.y - middle.y) as f32,
                 left: down(VK_LBUTTON),
                 right: down(VK_RBUTTON),
                 middle: down(VK_MBUTTON),
@@ -1393,6 +1508,18 @@ mod host {
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
             .collect()
+    }
+
+    /// A key by its virtual key, as polling sees it.
+    fn by_vk(vk: u8) -> KeyState {
+        KeyState {
+            // SAFETY: plain query.
+            scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+            virtual_key: vk,
+            // shortcut: no characters (code point 0);
+            // the title reads scan codes and virtual keys only.
+            ..Default::default()
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
