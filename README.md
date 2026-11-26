@@ -9,6 +9,7 @@
 
 | Branch | What it has | Checked in game |
 |---|---|---|
+| `jouable4` | `pipelines-rdna4` + `indirect` (a landed flight's descriptor table slots go back when it lands, not after the bury lag; `VICTORY_EARLY_TABLES=0` restores the old behaviour) + `rendu` (avatarmanz/VIctory-7900XTX #353 early depth, #354 killed lanes of a live quad, #314 reflection stand-in; `TRANSLATOR_VERSION` 3) | played outdoors at Jason's house: no more sky/texture glitches, no black character, no ghosting; 0 indirect executions dropped (1,000-1,700 a frame before), 0 compiler crash; about 8.5 fps on average (1.6 to 11.9) |
 | `pipelines-rdna4` | `jouable` + the AMD compiler-crash fixes: resource handles reused within their block only, a raw view's size through a handle of its own (avatarmanz/VIctory-7900XTX #357), RDNA 4 detected by both the game host and `victory translate`; `TRANSLATOR_VERSION` 2 | 43 of 43 compute programs that crashed `amdxc64.dll` (+0x861b9f, read of 0x8) now build (0 of 43 before); a 10-minute run: no compiler crash, no pipeline left out, stable picture indoors. Outdoors not checked yet |
 | `jouable` | `avatar-maj` + `memoire-32g` + smooth input (Raw Input, cursor kept in the window) + stretched-triangle fix (`VICTORY_REFRESH_WAIT`) | two runs with camera turns (25 and 15 min), no crash; with the triangle fix off (`VICTORY_REFRESH_WAIT=0`): 11.8 fps median, 11 at worst, worst frame 180 ms; with it on: 6.9 median. One device removal after 26 minutes of play in the release build |
 | `avatar-maj` | Belobug's `rx9070xt` branch (AvatarManz's code + RX 9070 XT fixes) + AvatarManz's 2026-11-26 updates + AZERTY keyboard and mouse | 13 fps median (12.1 at worst) over 15 min, no crash |
@@ -19,7 +20,7 @@ Before this change of base, the older branch (official main + ~45 pull requests,
 ### Build and run
 
 ```powershell
-git switch pipelines-rdna4    # or jouable, memoire-32g, avatar-maj
+git switch jouable4           # or pipelines-rdna4, jouable, memoire-32g, avatar-maj
 copy victory.example.toml victory.toml   # then set game_dir, cache_dir, data_dir
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders   # translate every shader once per translator version
@@ -46,8 +47,7 @@ Keys are read by position, so the layout below is the AZERTY one (ZQSD = WASD on
 ### Known defects
 
 - About 340 draws a frame are left out: the ray-tracing structure builder's steps, turned off on purpose.
-- Many indirect executions are dropped outdoors (being looked into).
-- White specks on floors and in the air, white mirrors, exposure swinging from dark to bright; the window glass drawn over Lucia's hair in the prison. Fixes from open AvatarManz pull requests (#353, #354, #314) are being tried.
+- White specks floating in the air indoors; rooms get dark when not looking towards a window (no ray-traced indirect light); some shadows flicker now and then; distant trees sometimes pop in late.
 - Stretched triangles now and then (a large dark shape for a few frames): probable cause found (refreshes reading bytes still in flight with `VICTORY_RELAY=2`). The fix exists but costs about 40 % of the frame rate, so it is off in the play script.
 - Frame-rate drops when the camera turns towards a place never seen: the game itself is loading content (its own frame time goes from 34 to 87 ms).
 - Low free RAM on 32 GB (0.4-0.9 GB).
