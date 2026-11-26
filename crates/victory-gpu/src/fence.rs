@@ -91,6 +91,17 @@ extern "system" fn completed(this: This) -> u64 {
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
+    // A null event blocks until reached: a queue's signal behind the
+    // submission in flight (`VICTORY_ASYNC_SUBMIT`) is, once it finishes.
+    #[cfg(windows)]
+    if event.is_null()
+        && fence.value.load(Ordering::Acquire) < value
+        && crate::host::async_submit()
+        && let Some(host) = crate::host::host()
+    {
+        host.drain();
+        crate::queue::pump_held(crate::queue::Why::Fence);
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {

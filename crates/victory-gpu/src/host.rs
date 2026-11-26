@@ -75,6 +75,92 @@ unsafe impl Sync for Host {}
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// `VICTORY_ASYNC_SUBMIT`, since the last frame-rate line: microseconds a
+/// submission (or a page mapping, a present) waited for the one in flight,
+/// and submissions the finisher thread finished.
+static ASYNC_US: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Whether the title's submissions are left in flight
+/// (`VICTORY_ASYNC_SUBMIT=1`, off by default): the submitting thread goes
+/// back to the title once its lists are submitted, and records its next
+/// ones while the host GPU runs them. What tells the title they ran (the
+/// copy-backs, then the bottom-of-pipe writes, then the fence signals
+/// queued behind them) is done once the GPU has finished, in that order
+/// (`crate::timeline`); the next submission is prepared only after that.
+pub(crate) fn async_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_ASYNC_SUBMIT");
+        if on {
+            tracing::info!("title submissions left in flight (VICTORY_ASYNC_SUBMIT): their signals follow their copy-backs");
+        }
+        on
+    })
+}
+
+/// The submissions in flight (at most one: each is prepared after a drain).
+static TIMELINE: crate::timeline::Timeline<Pending> = crate::timeline::Timeline::new();
+
+/// A submission in flight: what [`Host::land`] needs once it has run.
+struct Pending {
+    /// The host fence value it signals.
+    value: u64,
+    /// The queue's segments, and how they go back once run.
+    lists: Vec<std::sync::Arc<HostList>>,
+    recycle: fn(std::sync::Arc<HostList>),
+    /// The upload list run first (`crate::bindless`), by address.
+    uploads: Option<usize>,
+    batch: Batch,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    /// Staging buffers and textures its uploads read, kept as a waited-for
+    /// submission keeps them.
+    textures: Vec<(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)>,
+    prepared: std::time::Instant,
+}
+
+// SAFETY: D3D12 objects are free-threaded; a pending submission is only
+// landed once, under the submission lock, by the thread that finishes it.
+unsafe impl Send for Pending {}
+
+/// Starts, once, the thread that finishes submissions in flight as soon as
+/// the host GPU has run them (so their signals are not later than a waited
+/// submission's), then runs held work their writes and signals let go.
+fn finisher() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new().name("victory finisher".into()).spawn(|| {
+            let Some(host) = host() else { return };
+            // SAFETY: an event of this thread's own.
+            let event = match unsafe { CreateEventW(None, false, false, None) } {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no finisher event; submissions finish when drained");
+                    return;
+                }
+            };
+            loop {
+                let value = TIMELINE.next();
+                host.wait_fence(value, event);
+                {
+                    let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                    TIMELINE.finish(value, |p| host.land_pending(p));
+                }
+                ASYNC_US[1].fetch_add(1, Ordering::Relaxed);
+                // Memory waits on its bottom-of-pipe writes and fence waits
+                // on its signals may hold now (`crate::hold`). Not blocked
+                // on a pump running elsewhere (it tests the heads again
+                // after each piece; the held-work timer after it): the next
+                // submission in flight is this thread's to finish.
+                crate::queue::pump_held_if_free(crate::queue::Why::Signal);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no finisher thread; submissions finish when drained");
+        }
+    });
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1148,9 +1234,126 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.run(runs, None);
+    }
+
+    /// Runs a queue's segments (`crate::queue`), each given to `recycle`
+    /// once it has run. With `VICTORY_ASYNC_SUBMIT` the call returns once
+    /// they are submitted, and what tells the title they ran (copy-backs,
+    /// bottom-of-pipe writes, then fence signals queued behind them,
+    /// [`Host::after`]) is done when the host GPU has finished them; else
+    /// as [`Host::execute`].
+    pub(crate) fn execute_owned(&self, lists: Vec<std::sync::Arc<HostList>>, recycle: fn(std::sync::Arc<HostList>)) {
+        self.execute_owned_as(lists, recycle, async_submit());
+    }
+
+    /// [`Host::execute_owned`], left in flight if `in_flight` (tests).
+    fn execute_owned_as(&self, lists: Vec<std::sync::Arc<HostList>>, recycle: fn(std::sync::Arc<HostList>), in_flight: bool) {
+        let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+        let keep = in_flight.then(|| (lists.clone(), recycle));
+        let in_flight = self.run(&runs, keep);
+        drop(runs);
+        if in_flight {
+            // The submission holds them until it has finished.
+            drop(lists);
+        } else {
+            lists.into_iter().for_each(recycle);
+        }
+    }
+
+    /// Runs `signal` once every submission made so far has finished (copied
+    /// back, bottom-of-pipe writes done): at once if none is in flight.
+    pub(crate) fn after(&self, signal: impl FnOnce() + Send + 'static) {
+        TIMELINE.after(signal);
+    }
+
+    /// Finishes the submission in flight, if any (`VICTORY_ASYNC_SUBMIT`):
+    /// for queue work that must come after it (page mappings, presents).
+    pub(crate) fn drain(&self) {
+        if TIMELINE.len() == 0 {
+            return;
+        }
+        let _one = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain_locked();
+    }
+
+    /// [`Host::drain`] under the submission lock.
+    fn drain_locked(&self) {
+        let Some(value) = TIMELINE.newest() else { return };
+        let waited = std::time::Instant::now();
+        self.wait_fence(value, self.event);
+        ASYNC_US[0].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+        TIMELINE.finish(value, |p| self.land_pending(p));
+    }
+
+    /// Blocks until the host GPU has finished the submission signalling
+    /// `value`, with `event` (one the caller alone waits on).
+    fn wait_fence(&self, value: u64, event: HANDLE) {
+        // SAFETY: our fence; `event` is the caller's.
+        unsafe {
+            if self.fence.GetCompletedValue() >= value {
+                return;
+            }
+            match self.fence.SetEventOnCompletion(value, event) {
+                Ok(()) => {
+                    WaitForSingleObject(event, INFINITE);
+                }
+                Err(e) => tracing::warn!(error = %e, "host fence event not set; polled"),
+            }
+            // A removed device reads as done (all ones).
+            while self.fence.GetCompletedValue() < value {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+    }
+
+    /// A submission in flight has run: what [`Host::run`] does after the
+    /// GPU, then its lists go back.
+    fn land_pending(&self, p: Pending) {
+        let Pending {
+            value,
+            lists,
+            recycle,
+            uploads,
+            batch,
+            heaps,
+            textures,
+            prepared,
+        } = p;
+        // SAFETY: the upload list lives in its static holder, which the next
+        // submission's uploads take only after this one has finished
+        // (submissions are prepared under the lock, after a drain).
+        let uploads = uploads.map(|u| unsafe { &*(u as *const HostList) });
+        let runs: Vec<&HostList> = uploads.into_iter().chain(lists.iter().map(|l| &**l)).collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::resource::life::note(0, crate::resource::life::RAN, value, 0);
+            if crate::capture::present_1440p_on()
+                && let Some(copy) = runs.iter().rev().find_map(|list| {
+                    list.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                })
+            {
+                crate::capture::publish_1440p_target(copy);
+            }
+        }
+        let _ = value;
+        self.land(&runs, batch, heaps, prepared.elapsed(), None);
+        drop(runs);
+        drop(textures);
+        lists.into_iter().for_each(recycle);
+    }
+
+    /// Runs closed lists: waits for them, or with `owned` (a queue's
+    /// segments to keep and how they go back, `VICTORY_ASYNC_SUBMIT`)
+    /// leaves them in flight when it can. Whether they were left so.
+    fn run(&self, runs: &[&HostList], owned: Option<(Vec<std::sync::Arc<HostList>>, fn(std::sync::Arc<HostList>))>) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The one in flight finishes first: this one's preparation reads
+        // and writes the host copies, heaps and staging it uses, and title
+        // memory its copy-back writes.
+        self.drain_locked();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1259,6 +1462,58 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // In flight (`VICTORY_ASYNC_SUBMIT`): one group, outside listed
+        // frames (their dumps read what the lists drew at once).
+        #[cfg(feature = "diagnostics")]
+        let single = groups.len() == 1 && !traced;
+        #[cfg(not(feature = "diagnostics"))]
+        let single = true;
+        if let Some((keep, recycle)) = owned.filter(|_| single) {
+            *submitted += 1;
+            let value = *submitted;
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, value, 0);
+            // SAFETY: closed lists; the fence is ours.
+            let signalled = unsafe {
+                self.queue.ExecuteCommandLists(&lists);
+                self.queue.Signal(&self.fence, value)
+            };
+            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            match signalled {
+                Ok(()) => {
+                    // The upload list stays in its holder; the lock on it
+                    // goes with this thread (the next submission's uploads
+                    // take it only after a drain).
+                    let uploads = uploads.map(|u| {
+                        let at = std::ptr::from_ref(u.list()) as usize;
+                        drop(u);
+                        at
+                    });
+                    TIMELINE.push(
+                        value,
+                        Pending {
+                            value,
+                            lists: keep,
+                            recycle,
+                            uploads,
+                            batch,
+                            heaps,
+                            textures,
+                            prepared,
+                        },
+                    );
+                    finisher();
+                    return true;
+                }
+                Err(e) => {
+                    // Not waited for, as below: landed at once.
+                    tracing::warn!(error = %e, "host submission not signalled");
+                    drop(keep);
+                    self.land(runs, batch, heaps, prepared.elapsed(), None);
+                    return false;
+                }
+            }
+        }
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1314,8 +1569,40 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        self.land(runs, batch, heaps, prepared.elapsed(), removed_in);
+        drop(textures);
+        // A listed frame: what this submission's lists drew, as it is now
+        // (the dumps submit lists of their own).
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let sub = *submitted;
+            drop(submitted);
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            crate::capture::dump_submission(sub, &targets);
+        }
+        false
+    }
+
+    /// What follows a submission's run, `gpu` after its preparation ended,
+    /// under the submission lock: checks, then what shaders wrote goes back
+    /// to title memory, then the lists' work after their run and their
+    /// bottom-of-pipe writes.
+    fn land(
+        &self,
+        runs: &[&HostList],
+        batch: Batch,
+        heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+        gpu: std::time::Duration,
+        removed_in: Option<usize>,
+    ) {
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -1445,22 +1732,6 @@ impl Host {
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = *submitted;
-            drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            crate::capture::dump_submission(sub, &targets);
-        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -3071,6 +3342,14 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if async_submit() {
+                let waited = ASYNC_US[0].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
+                let finished = ASYNC_US[1].swap(0, Ordering::Relaxed) as f64 / frames;
+                tracing::info!(
+                    "submissions in flight: {waited:.1} ms/frame waited for the one before, \
+                     {finished:.1}/frame finished by the finisher thread"
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
@@ -3174,6 +3453,8 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // The frame's last submission first (`VICTORY_ASYNC_SUBMIT`).
+        self.drain();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -3978,5 +4259,118 @@ mod copy_order {
         for &p in &pools {
             crate::watch::tests::free(p);
         }
+    }
+}
+
+/// `VICTORY_ASYNC_SUBMIT` on the host GPU: submissions left in flight.
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    /// A thread polling a fence that a queued signal moves never sees it
+    /// before the work its submission does once run (where the copy-backs
+    /// land) and its bottom-of-pipe writes: whichever thread finishes it,
+    /// and however late in the landing the signal is queued.
+    #[test]
+    fn a_signal_is_never_seen_before_the_copy_back_before_it() {
+        let Some(host) = host() else { return };
+        // Title memory the work and the bottom-of-pipe write store, and the
+        // fence value the signal moves.
+        static COPIED: AtomicU64 = AtomicU64::new(0);
+        static LABEL: AtomicU64 = AtomicU64::new(0);
+        static FENCE: AtomicU64 = AtomicU64::new(0);
+        let base = FENCE.load(Ordering::Acquire);
+        for round in base + 1..=base + 24 {
+            let list = Arc::new(host.new_list().unwrap());
+            list.defer_after(move || {
+                // A slow copy-back.
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                COPIED.store(round, Ordering::Release);
+            });
+            list.defer_write(LABEL.as_ptr().cast(), crate::queue::Written::Value(round), 8);
+            list.close();
+            let watcher = std::thread::spawn(move || {
+                let since = std::time::Instant::now();
+                while FENCE.load(Ordering::Acquire) < round {
+                    assert!(since.elapsed() < std::time::Duration::from_secs(20), "the signal never came");
+                    std::hint::spin_loop();
+                }
+                // Read only once the fence moved: the signal's release
+                // orders what landed before it.
+                assert!(COPIED.load(Ordering::Acquire) >= round, "fence {round} seen before its copy-back");
+                assert!(LABEL.load(Ordering::Acquire) >= round, "fence {round} seen before its bottom-of-pipe write");
+            });
+            host.execute_owned_as(vec![list], |_| {}, true);
+            // Queued as the title's Signal is, behind the submission.
+            host.after(move || FENCE.store(round, Ordering::Release));
+            if round % 2 == 0 {
+                // The submitting thread drains it itself this time.
+                host.drain();
+                assert_eq!(FENCE.load(Ordering::Acquire), round, "drained: signalled");
+            }
+            watcher.join().unwrap();
+        }
+    }
+
+    /// Copy-backs land in submission order, each submission's signals
+    /// between its copy-back and the next one's, and a waited-for
+    /// submission lands the one in flight first.
+    #[test]
+    fn copy_backs_land_in_submission_order() {
+        let Some(host) = host() else { return };
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        for k in 0..8 {
+            let list = Arc::new(host.new_list().unwrap());
+            let l = log.clone();
+            list.defer_after(move || l.lock().unwrap().push(format!("copy back {k}")));
+            list.close();
+            host.execute_owned_as(vec![list], |_| {}, true);
+            let l = log.clone();
+            host.after(move || l.lock().unwrap().push(format!("signal {k}")));
+        }
+        let last = Arc::new(host.new_list().unwrap());
+        let l = log.clone();
+        last.defer_after(move || l.lock().unwrap().push("copy back 8".into()));
+        last.close();
+        host.execute_owned_as(vec![last], |_| {}, true);
+        let waited = host.new_list().unwrap();
+        let l = log.clone();
+        waited.defer_after(move || l.lock().unwrap().push("waited".into()));
+        waited.close();
+        host.execute(&[&waited]);
+        let mut want: Vec<String> = (0..8).flat_map(|k| [format!("copy back {k}"), format!("signal {k}")]).collect();
+        want.extend(["copy back 8".into(), "waited".into()]);
+        assert_eq!(*log.lock().unwrap(), want);
+    }
+
+    /// A segment left in flight goes back (`recycle`) only once it has
+    /// run, and a list kept by the title meanwhile is not reset under it.
+    #[test]
+    fn segments_go_back_once_they_ran() {
+        let Some(host) = host() else { return };
+        static BACK: AtomicU64 = AtomicU64::new(0);
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        let list = Arc::new(host.new_list().unwrap());
+        list.defer_after(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            RAN.fetch_add(1, Ordering::AcqRel);
+        });
+        list.close();
+        let before = (RAN.load(Ordering::Acquire), BACK.load(Ordering::Acquire));
+        host.execute_owned_as(
+            vec![list.clone()],
+            |l| {
+                assert!(RAN.load(Ordering::Acquire) > 0, "back before it ran");
+                assert!(Arc::strong_count(&l) >= 2, "the test still holds it");
+                BACK.fetch_add(1, Ordering::AcqRel);
+            },
+            true,
+        );
+        assert!(Arc::strong_count(&list) >= 1);
+        host.drain();
+        assert_eq!(RAN.load(Ordering::Acquire), before.0 + 1);
+        assert_eq!(BACK.load(Ordering::Acquire), before.1 + 1);
     }
 }

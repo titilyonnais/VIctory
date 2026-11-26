@@ -113,7 +113,9 @@ pub(crate) struct World<'a, S> {
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
     /// Runs a piece (a queue, its segments in order) to completion, the
-    /// bottom-of-pipe writes included.
+    /// bottom-of-pipe writes included; or, with `VICTORY_ASYNC_SUBMIT`,
+    /// submits it, its writes and the signals after it done once it has
+    /// run (waits on them hold at a later pump).
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Whether a segment writes title memory after its submission finishes
     /// (`read_back`), so following segments must run in a later piece.

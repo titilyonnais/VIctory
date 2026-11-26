@@ -205,16 +205,24 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        // Waited for, or left in flight (`VICTORY_ASYNC_SUBMIT`): each
+        // segment goes back once it has run.
+        host.execute_owned(segments, crate::list::recycle);
         ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        if crate::host::async_submit() {
+            // Behind the pieces before it, once they have run and their
+            // writes have gone back.
+            host.after(move || {
+                crate::fence::set(f as This, value);
+                crate::fence::let_go(f as This);
+            });
+        } else {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        }
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
@@ -382,6 +390,16 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if crate::host::async_submit()
+            && let Some(host) = crate::host::host()
+        {
+            // Behind the submission in flight, if any (at once otherwise).
+            crate::fence::keep(fence);
+            let f = fence as usize;
+            host.after(move || {
+                crate::fence::set(f as This, value);
+                crate::fence::let_go(f as This);
+            });
         } else {
             crate::fence::set(fence, value);
         }
@@ -491,6 +509,14 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // What is in flight finishes before the frame is taken
+    // (`VICTORY_ASYNC_SUBMIT`): its target and its writes are the frame's.
+    #[cfg(windows)]
+    if crate::host::async_submit()
+        && let Some(host) = crate::host::host()
+    {
+        host.drain();
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -677,6 +703,14 @@ extern "system" fn copy_page_mappings(
     #[cfg(windows)]
     if held().holds_work(this as usize) {
         account().mappings += 1;
+    }
+    // After the submission in flight (`VICTORY_ASYNC_SUBMIT`): what it
+    // writes and copies back goes to the pages mapped when it was made.
+    #[cfg(windows)]
+    if crate::host::async_submit()
+        && let Some(host) = crate::host::host()
+    {
+        host.drain();
     }
     #[cfg(not(windows))]
     let _ = this;
