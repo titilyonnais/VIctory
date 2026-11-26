@@ -1,54 +1,61 @@
-# Fork de titilyonnais : GTA 6 sur RX 9070 XT (Windows 11)
+# titilyonnais fork: GTA VI on an RX 9070 XT (Windows 11)
 
-> Cette section est tenue à jour au fil des essais. Seul ce qui a été **essayé en jeu et vérifié** y figure.
-> Aucune donnée du jeu n'est dans ce dépôt : il faut son propre dump, et tout se compile depuis les sources.
+> This section is kept up to date as runs are made. Only what was **run in game and checked** is listed here.
+> No game data is in this repository: you need your own dump, and everything builds from source.
 
-**Machine d'essai** : RX 9070 XT 16 Go (pilote AMD), Ryzen 5 5600 (6 cœurs), 32 Go de RAM, SSD SATA, Windows 11, profil Series X.
+**Test machine**: RX 9070 XT 16 GB (AMD driver, RDNA 4), Ryzen 5 5600 (6 cores), 32 GB RAM, SATA SSD, Windows 11, Series X profile.
 
-## Branches recommandées (26/11/2026)
+## Branches (2026-11-26)
 
-| Branche | Contenu | Vérifié en jeu |
+| Branch | What it has | Checked in game |
 |---|---|---|
-| `jouable` | `avatar-maj` + `memoire-32g` + entrées fluides (Raw Input, curseur gardé dans la fenêtre) + correction des triangles étirés (`VICTORY_REFRESH_WAIT`) | 2 essais avec virages de caméra (25 et 15 min), aucune panne ; correction des triangles coupée (`VICTORY_REFRESH_WAIT=0`) : 11,8 images/s en médiane, 11 au plus bas, pire image 180 ms ; avec la correction : 6,9 en médiane. Version de jeu (release) : démarre sans erreur. Ressenti clavier et souris à confirmer |
-| `avatar-maj` | Branche `rx9070xt` de Belobug (code d'AvatarManz + correctifs RX 9070 XT) + nouveautés d'AvatarManz du 26/11 + clavier AZERTY et souris | 13 images/s en médiane (12,1 au plus bas) sur 15 min, aucune panne |
-| `memoire-32g` | `rx9070xt` + clavier + correctif mémoire pour 32 Go (`VICTORY_SHELVE_BACKS`, `VICTORY_IDLE_TRIM`, actifs par défaut) | 60 min sans panne, 12,8 images/s stables, mémoire engagée stable (30,0 → 30,3 Go) |
-| `clavier` | `rx9070xt` + clavier par position (ZQSD en AZERTY), souris pour la caméra, clavier et manette ensemble | tests unitaires ; contrôle en jeu à confirmer |
+| `pipelines-rdna4` | `jouable` + the AMD compiler-crash fixes: resource handles reused within their block only, a raw view's size through a handle of its own (avatarmanz/VIctory-7900XTX #357), RDNA 4 detected by both the game host and `victory translate`; `TRANSLATOR_VERSION` 2 | 43 of 43 compute programs that crashed `amdxc64.dll` (+0x861b9f, read of 0x8) now build (0 of 43 before); a 10-minute run: no compiler crash, no pipeline left out, stable picture indoors. Outdoors not checked yet |
+| `jouable` | `avatar-maj` + `memoire-32g` + smooth input (Raw Input, cursor kept in the window) + stretched-triangle fix (`VICTORY_REFRESH_WAIT`) | two runs with camera turns (25 and 15 min), no crash; with the triangle fix off (`VICTORY_REFRESH_WAIT=0`): 11.8 fps median, 11 at worst, worst frame 180 ms; with it on: 6.9 median. One device removal after 26 minutes of play in the release build |
+| `avatar-maj` | Belobug's `rx9070xt` branch (AvatarManz's code + RX 9070 XT fixes) + AvatarManz's 2026-11-26 updates + AZERTY keyboard and mouse | 13 fps median (12.1 at worst) over 15 min, no crash |
+| `memoire-32g` | `rx9070xt` + keyboard + memory fix for 32 GB (`VICTORY_SHELVE_BACKS`, `VICTORY_IDLE_TRIM`, on by default) | 60 min without a crash, 12.8 fps, committed memory flat (30.0 → 30.3 GB) |
 
-Avant ce changement de base, l'ancienne branche (main officiel + ~45 demandes de fusion, `combo-stable3`, `vitesse-gpu`) tournait à environ 2 images/s.
+Before this change of base, the older branch (official main + ~45 pull requests, `combo-stable3`, `vitesse-gpu`) ran at about 2 fps.
 
-### Compiler et lancer
+### Build and run
 
 ```powershell
-git switch jouable          # ou memoire-32g, avatar-maj
-copy victory.example.toml victory.toml   # puis régler game_dir, cache_dir, data_dir
+git switch pipelines-rdna4    # or jouable, memoire-32g, avatar-maj
+copy victory.example.toml victory.toml   # then set game_dir, cache_dir, data_dir
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <chemin de game_scarlett_master.exe>
+target\diag\victory.exe shaders   # translate every shader once per translator version
+scripts\play.ps1 -Exe <path to game_scarlett_master.exe>
 ```
 
-### Clavier (branches `clavier`, `avatar-maj`, `memoire-32g`)
+To avoid hitches when a scene is met again: play once with `VICTORY_PIPELINE_BOOK=1` (the game's pipelines are written down in the cache), then run `victory warm --used` before the next session (3,850 pipelines in about 2 minutes here).
 
-| Action | Touche |
+### Keyboard (branches `clavier`, `avatar-maj`, `memoire-32g`, `jouable`, `pipelines-rdna4`)
+
+Keys are read by position, so the layout below is the AZERTY one (ZQSD = WASD on QWERTY).
+
+| Action | Key |
 |---|---|
-| Se déplacer | Z Q S D |
-| Caméra | souris (F8 la libère ou la reprend), ou I J K L |
-| Viser / tirer | clic droit / clic gauche |
-| Courir | Maj gauche |
-| Sauter | Espace |
-| Menu | Échap |
+| Move | Z Q S D |
+| Camera | mouse (F8 frees or takes it back), or I J K L |
+| Aim / shoot | right click / left click |
+| Run | left Shift |
+| Jump | Space |
+| Menu | Esc |
 
-`VICTORY_KEYBOARD=vk` remet l'ancienne table par lettre ; `VICTORY_MOUSE_SENS` règle la sensibilité. Sur `jouable` : `VICTORY_RAW_INPUT=0` remet l'ancienne lecture du clavier et de la souris, `VICTORY_TITLE_KEYS=0` cache le clavier au jeu (seule la manette simulée reste).
+`VICTORY_KEYBOARD=vk` brings back the older table by letter; `VICTORY_MOUSE_SENS` sets the sensitivity. On `jouable` and later: `VICTORY_RAW_INPUT=0` brings back the older keyboard and mouse polling, `VICTORY_TITLE_KEYS=0` hides the keyboard from the game (only the stand-in pad is left).
 
-### Défauts connus
+### Known defects
 
-- Environ 340 dessins par image sont écartés : ce sont les étapes du constructeur de structures de lancer de rayons, coupé exprès. Une trentaine de calculs de personnages que le compilateur du pilote AMD refusait compilent sur la branche `pipelines-amd` (non reprise : gain non mesuré).
-- Triangles étirés intermittents (grande forme sombre quelques images de suite) : cause probable trouvée (rafraîchissements qui lisent des octets encore en vol avec `VICTORY_RELAY=2`). La correction existe, mais elle coûte environ 40 % des images/s : elle est coupée dans le script de jeu.
-- Chutes d'images/s en tournant la caméra vers une zone jamais vue : c'est le jeu qui charge du contenu (son temps par image passe de 34 à 87 ms).
-- RAM libre faible sur 32 Go (0,4-0,7 Go) : la mémoire n'augmente plus, mais la marge reste mince.
-- Pas de lancer de rayons : l'éclairage indirect est remplacé par une lumière de remplacement.
+- About 340 draws a frame are left out: the ray-tracing structure builder's steps, turned off on purpose.
+- Many indirect executions are dropped outdoors (being looked into).
+- White specks on floors and in the air, white mirrors, exposure swinging from dark to bright; the window glass drawn over Lucia's hair in the prison. Fixes from open AvatarManz pull requests (#353, #354, #314) are being tried.
+- Stretched triangles now and then (a large dark shape for a few frames): probable cause found (refreshes reading bytes still in flight with `VICTORY_RELAY=2`). The fix exists but costs about 40 % of the frame rate, so it is off in the play script.
+- Frame-rate drops when the camera turns towards a place never seen: the game itself is loading content (its own frame time goes from 34 to 87 ms).
+- Low free RAM on 32 GB (0.4-0.9 GB).
+- No ray tracing: indirect lighting is replaced by a fallback light.
 
-### Crédits
+### Credits
 
-Marvisak (VIctory), Belobug (fork AMD, branche `rx9070xt`), AvatarManz (VIctory-7900XTX), fxceless, DexNom et tous les auteurs des demandes de fusion reprises. Chaque commit garde son auteur et sa source.
+Marvisak (VIctory), Belobug (AMD fork, `rx9070xt` branch), AvatarManz (VIctory-7900XTX) and the authors of its pull requests, fxceless, DexNom, and every author of the pull requests brought in. Every commit keeps its author and source.
 
 ---
 
