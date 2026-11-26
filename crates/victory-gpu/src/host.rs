@@ -2848,8 +2848,9 @@ const WHY_FENCE: usize = 10;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// copy, a fill of upload memory, a texture, a refresh through another host
+/// copy than the flight writes, [`refreshes_cross`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2901,7 +2902,9 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, true)
+        .or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+        .or_else(|| refreshes_cross(&written, runs, true).then_some(WHY_READ))
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3161,6 +3164,79 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
 }
 
+/// Whether refreshing title memory `[from, to)` reads bytes that flights in
+/// the air may write (`written`: in order, joined) outside the ranges that
+/// `own(from, to)` holds whole: those the flights write through the copy
+/// that is refreshed, which [`crate::shadow::Shadow::update`] leaves alone.
+fn refresh_crosses<'a>(written: &'a [(usize, usize)], from: usize, to: usize, own: impl Fn(usize, usize) -> bool + 'a) -> bool {
+    crossed_parts(written, from, to, own).next().is_some()
+}
+
+/// The parts of `[from, to)` that [`refresh_crosses`] finds.
+fn crossed_parts<'a>(
+    written: &'a [(usize, usize)],
+    from: usize,
+    to: usize,
+    own: impl Fn(usize, usize) -> bool + 'a,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let at = if from < to { written.partition_point(|r| r.1 <= from) } else { written.len() };
+    written[at..].iter().take_while(move |r| r.0 < to).map(move |r| (r.0.max(from), r.1.min(to))).filter(move |&(a, b)| !own(a, b))
+}
+
+/// Whether a refresh waits for flights that write what it reads through
+/// another host copy ([`refreshes_cross`], [`crosses_declared`];
+/// `VICTORY_REFRESH_WAIT=0`: it does not, as before).
+fn refresh_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a refresh of `runs` reads title memory that a flight in the air
+/// may write through another host copy of the same bytes (a title buffer
+/// inside another, each with a copy of its own; a window and a buffer).
+///
+/// Such a refresh took what title memory held before the flight, nothing
+/// waited for it, and no later refresh knew that it had been too early
+/// until the flight's landing wrote those bytes: for some frames the draws
+/// read last frame's bytes there (the up-copy check, `upcheck::reads`,
+/// counts these refreshes). `count`: whether it is counted for the frame
+/// line.
+fn refreshes_cross(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> bool {
+    !crossed_by(written, runs, count, true).is_empty()
+}
+
+/// The parts of title memory that refreshes of `runs` read and flights
+/// write through another host copy ([`refreshes_cross`]): all of them, or
+/// the first found if `first`. Takes the copies' locks: not to be called
+/// under the line's lock (the wait for landings looks at these parts
+/// against what the flights still write).
+fn crossed_by(written: &[(usize, usize)], runs: &[&HostList], count: bool, first: bool) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    if written.is_empty() || !refresh_wait() {
+        return parts;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::Refresh(shadow, at, len) = step else {
+                continue;
+            };
+            let before = parts.len();
+            parts.extend(crossed_parts(written, *at, *at + *len, |a, b| shadow.writes_pending_cover(a, b)));
+            if parts.len() > before {
+                if count {
+                    LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    blame("a refresh through another host copy", written, *at, *len);
+                }
+                if first {
+                    return parts;
+                }
+            }
+        }
+    }
+    parts
+}
+
 /// Since the last frame-rate line, ns of [`stale_under_flights`] looking
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3250,7 +3326,11 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    let declared = declared_writes(&ahead);
+    if crosses_declared(&declared, next) {
+        return false;
+    }
+    let mut written: Vec<(usize, usize)> = declared.into_iter().flat_map(|(_, ranges)| ranges).collect();
     for list in &ahead {
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
@@ -3259,6 +3339,31 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
     blocked_by(&joined, next, false).is_none()
+}
+
+/// Whether a refresh of `next` reads title memory that shaders of the parts
+/// ahead of it write through another host copy (`declared`): prepared
+/// together, it would take those bytes before the shaders ran, as a
+/// refresh behind flights would ([`refreshes_cross`]). A refresh of the copy
+/// they write through leaves their ranges alone.
+fn crosses_declared(declared: &[Declared], next: &[&HostList]) -> bool {
+    if declared.is_empty() || !refresh_wait() {
+        return false;
+    }
+    let mut all = Vec::new();
+    join_ranges(&mut all, declared.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+    next.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| {
+            let Step::Refresh(shadow, at, len) = step else {
+                return false;
+            };
+            let (from, to) = (*at, *at + *len);
+            touches(&all, from, to)
+                && declared.iter().any(|(writer, ranges)| {
+                    !std::sync::Arc::ptr_eq(writer, shadow) && ranges.iter().any(|&(a, b)| a < to && from < b)
+                })
+        })
+    })
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
@@ -3720,7 +3825,7 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}, a refresh through another host copy {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -3735,6 +3840,7 @@ fn late_line(frames: f64) {
         s[15],
         s[16],
         s[17],
+        s[18],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],
@@ -3860,7 +3966,46 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, join_ranges, refresh_crosses, touches};
+    use crate::shadow::covered;
+
+    /// A refresh behind flights waits for them where they write the bytes it
+    /// reads through another host copy, and not where they write them
+    /// through the copy it refreshes (that refresh leaves those alone) or
+    /// where they write nothing it reads.
+    #[test]
+    fn a_refresh_waits_for_flights_that_write_its_bytes_through_another_copy() {
+        // What flights in the air write, in order and joined.
+        let written = [(100usize, 200usize), (300, 400)];
+        // The refreshed copy's own flights write [100, 200) and [300, 350).
+        let own = [(100usize, 200usize), (300, 350)];
+        let own = |a: usize, b: usize| covered(&own, a, b);
+        assert!(!refresh_crosses(&written, 0, 100, own), "nothing written there");
+        assert!(!refresh_crosses(&written, 200, 300, own), "between the writes");
+        assert!(!refresh_crosses(&written, 120, 180, own), "written through the same copy");
+        assert!(!refresh_crosses(&written, 50, 340, own), "all of it through the same copy");
+        assert!(refresh_crosses(&written, 340, 360, own), "[350, 360) through another copy");
+        assert!(refresh_crosses(&written, 0, 1000, own));
+        assert!(!refresh_crosses(&written, 150, 150, own), "an empty refresh");
+        // A copy no flight writes: every written byte it reads is another's.
+        let none = |a: usize, b: usize| covered(&[], a, b);
+        assert!(refresh_crosses(&written, 150, 160, none));
+        assert!(!refresh_crosses(&[], 150, 160, none));
+    }
+
+    /// Ranges hold a span only if together they leave no gap in it, in
+    /// whatever order they come.
+    #[test]
+    fn ranges_cover_a_span_without_gaps() {
+        assert!(covered(&[(0, 10)], 2, 8));
+        assert!(covered(&[(5, 10), (0, 6)], 0, 10));
+        assert!(covered(&[(0, 5), (5, 10)], 0, 10), "touching ends leave no gap");
+        assert!(!covered(&[(0, 5), (6, 10)], 0, 10));
+        assert!(!covered(&[(0, 9)], 0, 10));
+        assert!(!covered(&[(1, 10)], 0, 10));
+        assert!(!covered(&[], 0, 10));
+        assert!(covered(&[], 4, 4), "an empty span");
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5672,16 +5817,41 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        // (The steps on the card do the reads they were made for behind the
+        // flights; a refresh is not one of them: it reads title memory on
+        // the CPU when the submission is prepared.)
+        // What refreshes read that flights write through another copy:
+        // found here, not under the line's lock (it takes the copies').
+        let crossed: Vec<(usize, usize)> = if late {
+            let written = line().written.clone();
+            crossed_by(&written, runs, false, false)
+        } else {
+            Vec::new()
+        };
+        let blocked = match &own {
+            _ if !late => None,
+            None => late_blocked(runs),
+            Some(_) if !crossed.is_empty() => {
+                LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                Some(WHY_READ)
+            }
+            Some(_) => None,
+        };
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if own.is_none()
-            && let Some(why) = late_blocked(runs)
-        {
+        } else if let Some(why) = blocked {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
+                let own = own.is_some();
                 relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    let landed = !crossed.iter().any(|&(a, b)| touches(&line.written, a, b));
+                    if own {
+                        return landed;
+                    }
+                    landed
+                        && blocked_by(&line.written, runs, false).is_none()
+                        && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
                 self.settle(&mut submitted, why);
