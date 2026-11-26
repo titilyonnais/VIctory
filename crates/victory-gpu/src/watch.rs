@@ -1076,10 +1076,13 @@ pub(crate) fn light() -> bool {
 /// is, written, told so at the next asking), so no two wait for each other.
 ///
 /// Also with the switch:
-/// - a block the title writes again soon after each time it was taken rests
-///   longer ([`hot_rest`]; `VICTORY_GUARD_HOT=0`: 3 ms as before);
 /// - view memory is not asked of the kernel, which refuses it
-///   ([`VIEWS`]; ~300 refused askings a frame).
+///   ([`VIEWS`]; ~300 refused askings a frame);
+/// - the planning of a submission's refreshes is made beside the submitting
+///   thread ([`port_guard_plan`]);
+/// - only if asked for (`VICTORY_GUARD_HOT=<ms>`, [`hot_rest`]): a block the
+///   title writes again soon after each time it was taken rests longer.
+///   Measured worse (run guard-6: 45.6 -> 47.8 ms a frame): off.
 pub(crate) fn port_guard() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PORT_GUARD") {
