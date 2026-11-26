@@ -1065,12 +1065,11 @@ fn merge_from_host(title: &mut [u8], host: &[u8]) -> Vec<(usize, usize)> {
     while at < title.len() {
         let end = (at + MERGE_CHUNK).min(title.len());
         if title[at..end] != host[at..end] {
-            for i in at..end {
-                if title[i] != host[i] {
-                    title[i] = host[i];
-                    note_span(&mut spans, i);
-                }
-            }
+            let first = (at..end).find(|&i| title[i] != host[i]).unwrap_or(at);
+            let last = (at..end).rev().find(|&i| title[i] != host[i]).unwrap_or(at);
+            title[at..end].copy_from_slice(&host[at..end]);
+            note_span(&mut spans, first);
+            note_span(&mut spans, last);
         }
         at = end;
     }
@@ -1100,12 +1099,21 @@ fn merge_into_title(title: &mut [u8], host: &mut [u8], before: &[u8]) -> Vec<(us
                 host[at..end].copy_from_slice(&title[at..end]);
             }
         } else {
-            for i in at..end {
-                if host[i] != before[i] && title[i] != host[i] {
-                    title[i] = host[i];
-                    note_span(&mut spans, i);
-                }
-                host[i] = title[i];
+            // Branch-free over the chunk (vectorized), then the first and
+            // last bytes taken bound its span.
+            let mut taken = [false; MERGE_CHUNK];
+            let n = end - at;
+            let (t, h, b) = (&mut title[at..end], &mut host[at..end], &before[at..end]);
+            for i in 0..n {
+                let take = (h[i] != b[i]) & (t[i] != h[i]);
+                taken[i] = take;
+                let v = if take { h[i] } else { t[i] };
+                t[i] = v;
+                h[i] = v;
+            }
+            if let (Some(first), Some(last)) = (taken[..n].iter().position(|&x| x), taken[..n].iter().rposition(|&x| x)) {
+                note_span(&mut spans, at + first);
+                note_span(&mut spans, at + last);
             }
         }
         at = end;
