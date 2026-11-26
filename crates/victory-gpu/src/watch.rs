@@ -596,6 +596,12 @@ impl Tracked {
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
+
+    /// Whether [`Tracked::saved`] holds bytes of `page` (a page number),
+    /// leaving them.
+    pub(crate) fn has_saved(&self, page: usize) -> bool {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.contains_key(&page)
+    }
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those
