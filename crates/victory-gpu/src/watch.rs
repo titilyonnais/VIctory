@@ -454,6 +454,12 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 /// Parts are taken in order, the journal's lock before them and never while
 /// holding them, and no holder of a part waits for anything else: no two
 /// wait for each other. Tests: `port7_tests`.
+///
+/// Measured (Series S, ports 1, 2, 5, 6 on; reports/PORT-PATCH-7.md): the
+/// journal's waits 8-9 ms a frame of all threads -> ~0.8 ms (for parts), the
+/// lane's 1.0 -> 0.0 ms; with the heaps' records (`crate::port_journal`)
+/// the lane works 42.9 -> 40.4 ms and the frame is 1.3-2.9 ms faster in the
+/// same run (A/B p7-1, p7-2), 46.1 -> 45.1-45.2 ms across runs.
 pub(crate) fn port_journal() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
