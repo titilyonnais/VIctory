@@ -171,6 +171,14 @@ fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
 }
 
+/// Whether the title also reads the keyboard as a keyboard, beside the
+/// stand-in pad the keys drive (on by default; `VICTORY_TITLE_KEYS=0` hides
+/// the keys from it, for when its own key bindings clash with the pad's).
+fn title_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_KEYS").is_none_or(|v| v != "0"))
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -502,6 +510,7 @@ impl State {
         let mut events = std::mem::take(&mut self.pending);
         let stick = self.stick.update(mouse.dx, mouse.dy, now);
         let stand_in = keyboard::pad(self.layout, &keys, &mouse, stick);
+        let keys = if title_keys() { keys } else { Vec::new() };
         if one_pad {
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
