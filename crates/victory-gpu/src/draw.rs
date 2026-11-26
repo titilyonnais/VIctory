@@ -1044,6 +1044,13 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A host library recorded into the list: its heaps, root signatures
+    /// and pipeline are set again before the next draw or dispatch.
+    pub(crate) fn host_state_lost(&mut self) {
+        // No title heaps (0) differ from what the host list has, too.
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -3044,6 +3051,7 @@ impl State {
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();
         for stage in &p.stages {
+            trace_constant_buffer(stage, self.roots_ref(compute));
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
@@ -3720,6 +3728,25 @@ impl State {
         out
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn record_framegen_camera(&self, list: &HostList) {
+        if !crate::framegen::ml_enabled() {
+            return;
+        }
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        // The confirmed 1.0.2.1 velocity pass, identified by both shaders.
+        if !pipeline.stages.iter().any(|s| s.shader.hash == "4adcfeaa24ae6450")
+            || !pipeline.stages.iter().any(|s| s.shader.hash == "9ab96b7a002d6ac8")
+        {
+            return;
+        }
+        let Some(Root::Table(table)) = self.roots_ref(false).get(1) else { return };
+        let Some(handle) = table.checked_add(8 * 4) else { return };
+        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else { return };
+        let Some(viewport) = self.viewports.first() else { return };
+        crate::framegen::camera::record(list, address, size, [viewport.Width, viewport.Height]);
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -3745,6 +3772,10 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            if count == 3 && instances == 1 {
+                self.record_framegen_camera(list);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4597,6 +4628,116 @@ fn describe(view: Option<&View>) -> String {
 
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
+/// Read one nominated matrix-sized range from a constant buffer in
+/// each listed frame. This is a diagnostic for identifying camera data.
+#[cfg(feature = "diagnostics")]
+fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+
+    static TRACE: OnceLock<Option<ConstantBufferTrace>> = OnceLock::new();
+    static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+    let Some(trace) = TRACE.get_or_init(|| {
+        let value = std::env::var("VICTORY_TRACE_CBV").ok()?;
+        let trace = ConstantBufferTrace::parse(&value);
+        if trace.is_none() {
+            tracing::warn!("VICTORY_TRACE_CBV expects shader-hash:slot[+table-dwords]:byte-offset[:float-count]");
+        }
+        trace
+    }) else {
+        return;
+    };
+    if !stage.shader.hash.eq_ignore_ascii_case(&trace.hash) {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    static ARM_FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let arm = ARM_FILE.get_or_init(|| std::env::var_os("VICTORY_TRACE_CBV_ARM").map(Into::into));
+    if LAST_FRAME.load(Ordering::Relaxed) >= frame
+        || !arm.as_ref().map_or_else(|| crate::capture::listed(frame), |path| path.is_file())
+    {
+        return;
+    }
+    let mut buffer = [0; 512];
+    let bytes = &mut buffer[..trace.float_count * 4];
+    let end = trace.offset + bytes.len() as u64;
+    let base = match (trace.table_offset, roots.get(usize::from(trace.slot))) {
+        (None, Some(Root::View(base)))
+            if stage.root_cbvs.iter().any(|&(slot, _)| slot == trace.slot) => *base,
+        (Some(offset), Some(Root::Table(table))) => {
+            if !stage.translated().used.iter().any(|use_| {
+                use_.root == RootType::Table
+                    && use_.kind == ResourceType::Cbv
+                    && use_.slot == trace.slot
+                    && use_.table_offset_dwords == offset
+            }) {
+                return;
+            }
+            let Some(handle) = table.checked_add(u64::from(offset) * 4) else { return };
+            let Some(View::Constant(base, len)) = crate::descriptor::view(handle) else { return };
+            if end > u64::from(len) {
+                return;
+            }
+            base
+        }
+        _ => return,
+    };
+    let Some(address) = base.checked_add(trace.offset) else { return };
+    if crate::host::read_into(address as *const u8, bytes)
+        && LAST_FRAME.fetch_max(frame, Ordering::Relaxed) < frame
+    {
+        let floats: Vec<f32> = bytes.as_chunks::<4>().0.iter().copied()
+            .map(f32::from_le_bytes)
+            .collect();
+        tracing::info!(
+            next_present = frame,
+            shader = %trace.hash,
+            root_slot = trace.slot,
+            table_offset_dwords = ?trace.table_offset,
+            byte_offset = trace.offset,
+            values = ?floats,
+            "constant buffer sample"
+        );
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+struct ConstantBufferTrace {
+    hash: String,
+    slot: u8,
+    table_offset: Option<u32>,
+    offset: u64,
+    float_count: usize,
+}
+
+#[cfg(feature = "diagnostics")]
+impl ConstantBufferTrace {
+    fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.split(':');
+        let hash = parts.next()?;
+        let binding = parts.next()?;
+        let (slot, table_offset) = match binding.split_once('+') {
+            Some((slot, offset)) => (slot.parse().ok()?, Some(offset.parse().ok()?)),
+            None => (binding.parse().ok()?, None),
+        };
+        let offset: u64 = parts.next()?.parse().ok()?;
+        let float_count: usize = match parts.next() {
+            Some(count) => count.parse().ok()?,
+            None => 16,
+        };
+        if parts.next().is_some()
+            || hash.len() != 16
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !offset.is_multiple_of(4)
+            || !(1..=128).contains(&float_count)
+            || offset > 65_536 - (float_count as u64 * 4)
+        {
+            return None;
+        }
+        Some(Self { hash: hash.to_owned(), slot, table_offset, offset, float_count })
+    }
+}
+
 const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
@@ -4687,7 +4828,26 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+    #[cfg(feature = "diagnostics")]
+    use super::ConstantBufferTrace;
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn constant_buffer_trace_requires_a_bounded_aligned_window() {
+        const HASH: &str = "1234abcdef567890";
+        let trace = ConstantBufferTrace::parse(&format!("{HASH}:2:65472")).unwrap();
+        assert_eq!(trace.slot, 2);
+        assert_eq!(trace.offset, 65472);
+        assert_eq!(trace.table_offset, None);
+        let table = ConstantBufferTrace::parse(&format!("{HASH}:1+8:64")).unwrap();
+        assert_eq!((table.slot, table.table_offset, table.offset), (1, Some(8), 64));
+        assert_eq!(table.float_count, 16);
+        assert_eq!(ConstantBufferTrace::parse(&format!("{HASH}:1+8:0:120")).unwrap().float_count, 120);
+        assert!(ConstantBufferTrace::parse(&format!("{HASH}:1+8:0:129")).is_none());
+        assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:65476")).is_none());
+        assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:3")).is_none());
+        assert!(ConstantBufferTrace::parse("1234:2:0").is_none());
+    }
     #[test]
     fn staging_budget_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;

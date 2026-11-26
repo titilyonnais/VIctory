@@ -9,6 +9,8 @@ mod inspect;
 mod replay;
 mod run;
 mod shader;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod title_patch;
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -262,6 +264,7 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

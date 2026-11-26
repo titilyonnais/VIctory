@@ -53,6 +53,9 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Before the import registry is first used: it holds the module only
+    // when the host's FidelityFX serves.
+    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -213,7 +216,7 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    diagnostics(&image, &cfg)?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -235,10 +238,14 @@ pub fn run(
     Ok(())
 }
 
-/// The debugging aids (README): scheduled stack dumps, watched values and
-/// memory saved on a crash.
+/// The debugging aids (README): title code patches, scheduled stack dumps,
+/// watched values and memory saved on a crash. An error stops the launch.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
+fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
+    // First, before any thread started below can read or write the image.
+    if victory_hle::modules::fidelityfx::serving() {
+        crate::title_patch::apply(image)?;
+    }
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
@@ -262,6 +269,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+    Ok(())
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each

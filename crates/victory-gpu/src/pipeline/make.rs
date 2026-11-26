@@ -59,13 +59,21 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let made = OnceLock::new();
+        // A listed shader's pipeline is never handed to the driver (one the
+        // RDNA 4 compiler crashes on): it is done, with no host pipeline.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let Some(hash) = super::skipped_among(&shaders) {
+            tracing::info!(hash, "VICTORY_SKIP_PIPELINES: host pipeline not made");
+            let _ = made.set(None);
+        }
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
-            made: OnceLock::new(),
+            made,
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }

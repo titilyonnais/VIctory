@@ -107,6 +107,16 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   to title memory (from fxceless and Geckomacabre, on by default here).
 - **Frame record and replay** with per-pass times and shader variants compared
   turn by turn ([docs/replay.md](docs/replay.md)).
+- **Series X can upscale with AMD FidelityFX on the host** (diagnostics build):
+  `VICTORY_UPSCALER=7` switches the title's upscaler to it and
+  `VICTORY_FFX_SCALE=<scale>` sets the render scale (`0.5` renders 1080p for a
+  4K output). Run with `--console series-x` and point `VICTORY_FIDELITYFX_DIR`
+  at the FidelityFX SDK's `Kits/FidelityFX/signedbin` folder.
+  The Series X patches, extra device feature answers and compiler-crash
+  guard take effect only after a host upscaler loads from that folder.
+  `VICTORY_FIDELITYFX_FRAMEGEN=1` adds AMD frame generation with the built-in
+  Frame Generation 3.x providers of `amd_fidelityfx_framegeneration_dx12.dll`
+  from the same folder (RGBA8 swap chains only).
 
 ## Credits
 
