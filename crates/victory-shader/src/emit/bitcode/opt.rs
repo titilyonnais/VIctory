@@ -14,8 +14,9 @@
 //!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
-//!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   result (an index clamped again, a register read as a float again). A
+//!   descriptor handle is one within its block only: AMD's compiler crashes
+//!   on handles shared across most of a large program.
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
@@ -694,6 +695,15 @@ impl Module {
         }
     }
 
+    /// Whether `i` makes a resource handle (`dx.op.createHandle*`,
+    /// `dx.op.annotateHandle`).
+    fn is_handle(&self, i: u32) -> bool {
+        matches!(&self.insts[i as usize].op, Op::Call(f, _) if {
+            let name = &self.funcs[*f as usize].name;
+            name.starts_with("dx.op.createHandle") || name.starts_with("dx.op.annotateHandle")
+        })
+    }
+
     /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32) -> Effect {
         match &self.insts[i as usize].op {
@@ -895,8 +905,18 @@ impl Module {
                     continue;
                 }
                 let class = self.class(&effects, i);
+                // A resource handle is reused within its block only: one
+                // made early and used across most of a large program crashes
+                // AMD's compiler on RDNA4 (amdxc64.dll, a read of 0x8, in
+                // CreateComputePipelineState: fxceless/victory-fork#120,
+                // bisected to this pass on two RDNA4 cards; on an RX 9070 XT,
+                // 31 of the world's compute programs crashed it, and all 31
+                // build with handles kept to their block), as DXC's GVN
+                // making handle phis gets pipelines refused on NVIDIA.
+                let handle = self.is_handle(i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
+                    && !handle
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = known.get(&key) {
@@ -909,8 +929,8 @@ impl Module {
                 }
                 // Reads of memory, and wave operations (the same lanes run
                 // the whole block): the block's own earlier one.
-                if passes & LOADS != 0
-                    && matches!(class, Effect::Reads | Effect::Lanes)
+                if (passes & LOADS != 0 && matches!(class, Effect::Reads | Effect::Lanes)
+                    || passes & REUSE != 0 && handle)
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = read.get(&key) {
@@ -1500,6 +1520,31 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write();
+    }
+
+    /// A handle is made once within its block, and again below it (AMD's
+    /// compiler crashes on handles shared across a large program).
+    #[test]
+    fn a_handle_is_reused_within_its_block_only() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let handle = m.function("dx.op.createHandleFromHeap", fty, Some(Attr::ReadNone), false);
+        let top = m.call(b, handle, vec![x, y]);
+        let twice = m.call(b, handle, vec![x, y]);
+        m.call(b, writes, vec![top, twice]);
+        let below = m.call(then, handle, vec![x, y]);
+        m.call(then, writes, vec![below, below]);
+        m.optimise(REUSE);
+        assert_eq!(stores(&m, b), [[top, top]]);
+        assert_eq!(stores(&m, then), [[below, below]]);
         m.write();
     }
 
