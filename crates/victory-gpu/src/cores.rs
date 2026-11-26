@@ -173,6 +173,16 @@ fn lane_core() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the thread `what` asks for a core of its own where all cores are
+/// alike: the submitting thread, with [`lane_core`], and six cores or more.
+/// Without this `VICTORY_LANE_CORE=1` did nothing on such a processor (a
+/// Ryzen 5 5600: six cores, twelve threads), as nothing asked at all; yet that
+/// thread is the one a frame waits for (95 ms of a 95 ms frame, run
+/// rx-chaud-diag) and shared its core with the eight that translate lists.
+fn lane_alone(sets: &[(u32, u8, u8)], lane: bool, what: &str) -> bool {
+    lane && what == "victory-submit" && fast_sets(sets, false).is_empty() && one_core(sets).is_some()
+}
+
 /// Threads that asked: a handle of each, and whether it is the submitting one.
 static ASKED: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
 
@@ -260,8 +270,9 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but the submitting
+    // thread's own core ([`lane_alone`]).
+    if fast.is_empty() && !lane_alone(&cpu_sets(), lane_core(), what) {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -320,6 +331,22 @@ mod tests {
         // A larger cache of under eight sets: nothing.
         let few: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 4 { 64 * MB } else { 32 * MB })).collect();
         assert!(fast_by_cache(&sets, &few).is_empty());
+    }
+
+    #[test]
+    fn the_submitting_thread_has_a_core_of_its_own_where_all_are_alike() {
+        // A Ryzen 5 5600: six cores alike, two sets each.
+        let sets = alike(12);
+        assert!(lane_alone(&sets, true, "victory-submit"));
+        let (own, others) = one_core(&sets).unwrap();
+        assert_eq!((own, others.len()), (vec![266, 267], 10));
+        // Not asked for, another thread, or fewer than six cores: nothing.
+        assert!(!lane_alone(&sets, false, "victory-submit"));
+        assert!(!lane_alone(&sets, true, "victory-heap-sync"));
+        assert!(!lane_alone(&alike(8), true, "victory-submit"));
+        // Two kinds of cores: the fast ones are asked for as before.
+        let hybrid: Vec<(u32, u8, u8)> = (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
+        assert!(!lane_alone(&hybrid, true, "victory-submit"));
     }
 
     #[test]
