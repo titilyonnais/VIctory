@@ -545,6 +545,28 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        // Diagnostics, `VICTORY_PRESENT_1440P`: a 4K primary that came out
+        // black is replaced by the frame's last finished 2560x1440 color
+        // target (issue #841: the world renders there, the 4K output stays
+        // zero). A primary that is not black is shown as usual (menus,
+        // subtitles).
+        #[cfg(feature = "diagnostics")]
+        let fallback = crate::capture::take_1440p_target()
+            .filter(|c| is_4k(&texture) && c.copy.texture != texture)
+            .filter(|_| crate::capture::probe_now(host, &texture, state) == Some(true));
+        #[cfg(feature = "diagnostics")]
+        let shown = match &fallback {
+            Some(c) => {
+                // The candidate's tracked host state, moved for the copy and back.
+                let before = c.copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
+                let shown = host.present(&c.copy.texture, before, frame);
+                c.copy.state.store(before, Ordering::Relaxed);
+                note_fallback(frame);
+                shown
+            }
+            None => host.present(&texture, state, frame),
+        };
+        #[cfg(not(feature = "diagnostics"))]
         let shown = host.present(&texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
@@ -588,6 +610,25 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
     *last = (black, drawn, last.2);
+}
+
+/// Whether a presented texture is the console's 3840x2160 output.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn is_4k(primary: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    // SAFETY: a live host texture.
+    let desc = unsafe { primary.GetDesc() };
+    (desc.Width, desc.Height) == (3840, 2160)
+}
+
+/// Counts presents that showed the 2560x1440 fallback, logged at powers
+/// of two.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_fallback(frame: u64) {
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    let n = SHOWN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(frame, shown = n, "a black 4K primary presented as the last 2560x1440 target");
+    }
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from
@@ -807,5 +848,108 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn present_fallback_uses_completed_work_once_and_only_at_4k() {
+        if !crate::capture::present_1440p_on() {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null_mut();
+        let make = |width, height| {
+            let heap = windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES {
+                Type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+                Dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
+            );
+            let mut out: This = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &raw mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let record = |list: &crate::host::HostList, r, color| {
+            crate::list::ensure_state(list, r, windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let rtv = host.rtv(&crate::resource::host_resource(r).unwrap(), None);
+            // SAFETY: live RTV in render-target state when the list executes.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+            list.note_1440p_target(r);
+        };
+        let black = make(3840, 2160);
+        let overlay = make(3840, 2160);
+        let small = make(32, 32);
+        let red = make(2560, 1440);
+        let green = make(2560, 1440);
+        let list = host.new_list().unwrap();
+        let discarded = host.new_list().unwrap();
+        record(&list, black, [0.0, 0.0, 0.0, 1.0]);
+        record(&list, overlay, [0.0, 0.0, 0.5, 0.5]);
+        record(&list, small, [0.0, 1.0, 0.0, 1.0]);
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        record(&discarded, green, [0.0, 1.0, 0.0, 1.0]);
+        list.close();
+        discarded.close();
+        assert!(crate::capture::take_1440p_target().is_none());
+        host.execute(&[&list]);
+        discarded.reset();
+        discarded.close();
+        host.execute(&[&discarded]);
+        let plane = |resources: *const This| Plane {
+            token: 0,
+            count: 1,
+            resources,
+        };
+        let black_res = black;
+        let p_black = plane(&raw const black_res);
+        assert_eq!(present(null, 1, &p_black, null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+
+        list.reset();
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        list.close();
+        host.execute(&[&list]);
+        let small_res = small;
+        let p_small = plane(&raw const small_res);
+        assert_eq!(present(null, 1, &p_small, null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+        for resource in [black, overlay, small, red, green] {
+            let release = object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+            assert_eq!(release(resource), 0);
+        }
     }
 }

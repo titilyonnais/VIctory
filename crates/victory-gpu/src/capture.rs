@@ -224,6 +224,63 @@ pub(crate) fn save_read_back(
     }
 }
 
+/// `VICTORY_PRESENT_1440P`: a 2560x1440 color target of finished work, to
+/// present in place of a black 4K primary (see `crate::queue`).
+#[derive(Clone)]
+pub(crate) struct PresentCandidate {
+    /// Held so that eviction cannot give the host texture up meanwhile.
+    pub(crate) copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+/// The most recent eligible target from completed work since the last present.
+static SUBMITTED_1440P: std::sync::Mutex<Option<PresentCandidate>> = std::sync::Mutex::new(None);
+
+pub(crate) fn present_1440p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PRESENT_1440P");
+        if on {
+            tracing::info!("a black 4K primary is presented as the last 2560x1440 target (VICTORY_PRESENT_1440P)");
+        }
+        on
+    })
+}
+
+pub(crate) fn publish_1440p_target(copy: PresentCandidate) {
+    *SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+}
+
+pub(crate) fn take_1440p_target() -> Option<PresentCandidate> {
+    if !present_1440p_on() {
+        return None;
+    }
+    SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Whether `texture` (in host state `state`) reads (near) black now, on a
+/// list of its own: [`probe`] for a texture that is not presented.
+pub(crate) fn probe_now(host: &crate::host::Host, texture: &ID3D12Resource, state: u32) -> Option<bool> {
+    let list = host.new_list().ok()?;
+    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: an open list of ours and a live texture.
+    let buffer = unsafe {
+        if state != copy {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+        }
+        let buffer = probe(&host.device, &list.list, texture);
+        if state != copy {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+        }
+        buffer
+    };
+    list.close();
+    host.execute(&[&list]);
+    Some(level(&buffer?)? < 8)
+}
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
@@ -816,12 +873,23 @@ pub(crate) fn probe(
 
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+    let Some(level) = level(buffer) else {
+        return false;
+    };
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    if levels.len() == 12 {
+        levels.pop_front();
+    }
+    levels.push_back(level);
+    level < 8
+}
+
+/// The brightest channel of the pixels [`probe`] read.
+fn level(buffer: &ID3D12Resource) -> Option<u8> {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
+        buffer.Map(0, None, Some(&mut data)).ok()?;
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
@@ -830,12 +898,7 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        level < 8
+        Some(level)
     }
 }
 

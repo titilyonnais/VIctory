@@ -572,6 +572,8 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            #[cfg(feature = "diagnostics")]
+            list.note_1440p_target(t as This);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
@@ -1877,6 +1879,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             // Read by the title's CPU code: copied back into title memory.
             list.texture_written(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            #[cfg(feature = "diagnostics")]
+            list.note_1440p_target(*resource as This);
         }
         _ => {}
     }
