@@ -4,8 +4,11 @@
 //! the older table by virtual key, `off` no stand-in at all). The mouse,
 //! while one of our windows has focus, turns the right stick and pulls the
 //! triggers (`VICTORY_MOUSE`, `VICTORY_MOUSE_SENS`, `VICTORY_MOUSE_DEADZONE`,
-//! `VICTORY_MOUSE_INVERT`). `touches-clavier.md` lists every key.
+//! `VICTORY_MOUSE_INVERT`, `VICTORY_MOUSE_SMOOTH`). Keys and the mouse come
+//! from Raw Input ([`super::raw`]) unless `VICTORY_RAW_INPUT=0`.
+//! `touches-clavier.md` lists every key.
 
+use std::collections::VecDeque;
 use std::sync::LazyLock;
 
 use super::{
@@ -87,12 +90,13 @@ pub(super) enum Layout {
     Off,
 }
 
-/// The mouse since the last poll: movement in pixels, buttons held. All
-/// zero while the mouse does not steer (no focus, or turned off).
+/// The mouse since the last poll: movement in pixels (counts with Raw
+/// Input), buttons held. All zero while the mouse does not steer (no focus,
+/// or turned off).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Mouse {
-    pub dx: i32,
-    pub dy: i32,
+    pub dx: f32,
+    pub dy: f32,
     pub left: bool,
     pub right: bool,
     pub middle: bool,
@@ -111,14 +115,21 @@ pub(super) struct Settings {
     pub dead_zone: f32,
     /// Mouse forward looks down.
     pub invert: bool,
+    /// Keys and the mouse from Raw Input, not polled (`VICTORY_RAW_INPUT`).
+    pub raw: bool,
+    /// The span, in milliseconds, over which mouse movement averages into
+    /// the stick's speed (`VICTORY_MOUSE_SMOOTH`).
+    pub smoothing_ms: f32,
+    /// How long the release of an injected key (a remote desktop) waits for
+    /// a press again, in microseconds (`VICTORY_KEY_GRACE`, milliseconds).
+    pub key_grace: u64,
 }
 
 /// Mouse speed, in pixels a second, that pushes the stick all the way at
 /// sensitivity 1.
 pub(super) const FULL_SPEED: f32 = 2000.0;
-/// Smoothing time of the mouse stick, in seconds: a 125 Hz mouse moves the
-/// cursor every other poll.
-const SMOOTHING: f32 = 0.03;
+/// The poll period, in microseconds: the span of a first movement.
+const POLL_US: u64 = 8_000;
 
 impl Default for Settings {
     fn default() -> Settings {
@@ -128,6 +139,11 @@ impl Default for Settings {
             sensitivity: 1.0,
             dead_zone: 0.2,
             invert: false,
+            raw: true,
+            // Six polls: a 125 Hz mouse, or a remote desktop's 30 to 60
+            // updates a second, still moves within every span.
+            smoothing_ms: 48.0,
+            key_grace: 60_000,
         }
     }
 }
@@ -170,6 +186,15 @@ impl Settings {
             sensitivity: number("VICTORY_MOUSE_SENS", 0.01, 100.0, default.sensitivity),
             dead_zone: number("VICTORY_MOUSE_DEADZONE", 0.0, 0.9, default.dead_zone),
             invert: get("VICTORY_MOUSE_INVERT").is_some_and(|v| !off(&v)),
+            raw: get("VICTORY_RAW_INPUT").is_none_or(|v| !off(&v)),
+            smoothing_ms: number("VICTORY_MOUSE_SMOOTH", 8.0, 250.0, default.smoothing_ms),
+            key_grace: number(
+                "VICTORY_KEY_GRACE",
+                0.0,
+                500.0,
+                default.key_grace as f32 / 1e3,
+            ) as u64
+                * 1_000,
         }
     }
 }
@@ -184,14 +209,20 @@ pub(super) fn settings() -> &'static Settings {
     &SETTINGS
 }
 
-/// Mouse movement as a stick: speed, smoothed, past a dead zone.
-#[derive(Clone, Copy, Debug)]
+/// Mouse movement as a stick: its speed over the last span (a moving
+/// average, each poll's movement spread evenly over the time it took), past a
+/// dead zone. The stick so moves continuously: it holds between two mouse
+/// reports or two polls, and comes back to the middle over one span once the
+/// mouse stops, never in steps.
+#[derive(Clone, Debug)]
 pub(super) struct MouseStick {
     sensitivity: f32,
     dead_zone: f32,
     invert: bool,
-    x: f32,
-    y: f32,
+    /// The span, in microseconds.
+    span: u64,
+    /// Movement of the polls within the span: from, to (microseconds), x, y.
+    moves: VecDeque<(u64, u64, f32, f32)>,
     /// The last update, in microseconds.
     last: Option<u64>,
 }
@@ -202,33 +233,46 @@ impl MouseStick {
             sensitivity: settings.sensitivity,
             dead_zone: settings.dead_zone,
             invert: settings.invert,
-            x: 0.0,
-            y: 0.0,
+            span: ((settings.smoothing_ms * 1e3) as u64).max(1_000),
+            moves: VecDeque::new(),
             last: None,
         }
     }
 
-    /// The stick for movement `dx`, `dy` (pixels, down positive) at `now`
-    /// (microseconds): -1 to 1, up positive.
-    pub fn update(&mut self, dx: i32, dy: i32, now: u64) -> (f32, f32) {
-        let dt = self
+    /// The stick for movement `dx`, `dy` (pixels, down positive) since the
+    /// last update, at `now` (microseconds): -1 to 1, up positive.
+    pub fn update(&mut self, dx: f32, dy: f32, now: u64) -> (f32, f32) {
+        let start = now.saturating_sub(self.span);
+        // The movement happened since the last poll, but within one span:
+        // after a pause it is not thinned out to nothing.
+        let from = self
             .last
-            .map_or(0.008, |last| now.saturating_sub(last) as f32 / 1e6)
-            .clamp(0.001, 0.1);
+            .map_or(now.saturating_sub(POLL_US), |last| last.min(now))
+            .max(start)
+            .min(now.saturating_sub(1));
         self.last = Some(now);
-        let scale = self.sensitivity / (FULL_SPEED * dt);
-        let target_x = dx as f32 * scale;
-        let target_y = if self.invert { dy } else { -dy } as f32 * scale;
-        let k = (dt / SMOOTHING).min(1.0);
-        self.x += (target_x - self.x) * k;
-        self.y += (target_y - self.y) * k;
-        let length = self.x.hypot(self.y);
+        if dx != 0.0 || dy != 0.0 {
+            self.moves.push_back((from, now, dx, dy));
+        }
+        while self.moves.front().is_some_and(|&(_, to, ..)| to <= start) {
+            self.moves.pop_front();
+        }
+        let (mut x, mut y) = (0.0, 0.0);
+        for &(from, to, dx, dy) in &self.moves {
+            let inside = to.min(now).saturating_sub(from.max(start)) as f32;
+            let share = inside / to.saturating_sub(from).max(1) as f32;
+            x += dx * share;
+            y += dy * share;
+        }
+        let scale = self.sensitivity / (FULL_SPEED * self.span as f32 / 1e6);
+        let x = x * scale;
+        let y = if self.invert { y } else { -y } * scale;
+        let length = x.hypot(y);
         if length < 0.01 {
-            (self.x, self.y) = (0.0, 0.0);
             return (0.0, 0.0);
         }
         let out = (self.dead_zone + (1.0 - self.dead_zone) * length).min(1.0);
-        (self.x / length * out, self.y / length * out)
+        (x / length * out, y / length * out)
     }
 }
 
@@ -421,7 +465,7 @@ mod tests {
     }
 
     /// The stick after `polls` polls 8 ms apart, each moving `dx`, `dy`.
-    fn steady(settings: &Settings, dx: i32, dy: i32, polls: u64) -> (f32, f32) {
+    fn steady(settings: &Settings, dx: f32, dy: f32, polls: u64) -> (f32, f32) {
         let mut stick = MouseStick::new(settings);
         let mut out = (0.0, 0.0);
         for i in 0..polls {
@@ -437,38 +481,109 @@ mod tests {
             ..Settings::default()
         };
         // 4 pixels each 8 ms: 500 pixels a second, a quarter of full speed.
-        let (x, y) = steady(&linear, 4, 0, 50);
+        let (x, y) = steady(&linear, 4.0, 0.0, 50);
         assert!((x - 0.25).abs() < 0.01 && y == 0.0, "{x} {y}");
         let double = Settings {
             sensitivity: 2.0,
             ..linear
         };
-        let (x2, _) = steady(&double, 4, 0, 50);
+        let (x2, _) = steady(&double, 4.0, 0.0, 50);
         assert!((x2 - 0.5).abs() < 0.01, "{x2}");
         // Mouse forward (up the screen) looks up, unless inverted.
-        let (_, up) = steady(&linear, 0, -4, 50);
+        let (_, up) = steady(&linear, 0.0, -4.0, 50);
         assert!(up > 0.2, "{up}");
         let inverted = Settings {
             invert: true,
             ..linear
         };
-        let (_, down) = steady(&inverted, 0, -4, 50);
+        let (_, down) = steady(&inverted, 0.0, -4.0, 50);
         assert!(down < -0.2, "{down}");
         // Fast movement stops at full deflection, in its direction (down
         // the screen is down on the stick).
-        let (x, y) = steady(&linear, 100, 100, 50);
+        let (x, y) = steady(&linear, 100.0, 100.0, 50);
         assert!((x.hypot(y) - 1.0).abs() < 1e-4 && x > 0.0 && (x + y).abs() < 1e-4);
         // The dead zone: the slowest movement already clears it.
-        let (slow, _) = steady(&Settings::default(), 1, 0, 50);
+        let (slow, _) = steady(&Settings::default(), 1.0, 0.0, 50);
         assert!((0.2..=0.26).contains(&slow), "{slow}");
         // At rest it comes back to the middle, exactly.
         let mut stick = MouseStick::new(&Settings::default());
-        stick.update(50, 0, 0);
+        stick.update(50.0, 0.0, 8_000);
         let mut rest = (1.0, 1.0);
-        for i in 1..40 {
-            rest = stick.update(0, 0, i * 8_000);
+        for i in 2..40 {
+            rest = stick.update(0.0, 0.0, i * 8_000);
         }
         assert_eq!(rest, (0.0, 0.0));
+    }
+
+    /// The stick at each of `polls` (microseconds), the mouse moving
+    /// `moved(i)` before poll `i`.
+    fn run(settings: &Settings, polls: &[u64], moved: impl Fn(usize) -> f32) -> Vec<f32> {
+        let mut stick = MouseStick::new(settings);
+        polls
+            .iter()
+            .enumerate()
+            .map(|(i, &now)| stick.update(moved(i), 0.0, now).0)
+            .collect()
+    }
+
+    #[test]
+    fn a_steady_mouse_holds_the_stick_steady() {
+        let linear = Settings {
+            dead_zone: 0.0,
+            ..Settings::default()
+        };
+        let every_8ms: Vec<u64> = (1..=100).map(|i| i * 8_000).collect();
+        // A 125 Hz mouse: 8 counts every other poll, nothing between. The
+        // stick neither drops to zero between reports nor jitters.
+        let half = run(&linear, &every_8ms, |i| if i % 2 == 0 { 8.0 } else { 0.0 });
+        for &x in &half[10..] {
+            assert!((x - 0.25).abs() < 0.03, "{half:?}");
+        }
+        // Polls 7 and 9 ms apart, the mouse moving 500 counts a second.
+        let mut at = 0;
+        let uneven: Vec<u64> = (0..100)
+            .map(|i| {
+                at += if i % 2 == 0 { 7_000 } else { 9_000 };
+                at
+            })
+            .collect();
+        let gaps: Vec<u64> = std::iter::once(uneven[0])
+            .chain(uneven.windows(2).map(|w| w[1] - w[0]))
+            .collect();
+        let x = run(&linear, &uneven, |i| gaps[i] as f32 * 500.0 / 1e6);
+        for &v in &x[10..] {
+            assert!((v - 0.25).abs() < 1e-3, "{x:?}");
+        }
+        // A remote desktop: 16 counts every 32 ms, polls every 8 ms.
+        let remote = run(&linear, &every_8ms, |i| if i % 4 == 0 { 16.0 } else { 0.0 });
+        for &x in &remote[10..] {
+            assert!(x > 0.15, "never back to zero while moving: {remote:?}");
+        }
+    }
+
+    #[test]
+    fn the_stick_comes_back_to_the_middle_without_steps() {
+        let polls: Vec<u64> = (1..=40).map(|i| i * 8_000).collect();
+        let x = run(
+            &Settings::default(),
+            &polls,
+            |i| if i < 20 { 4.0 } else { 0.0 },
+        );
+        // Down in even steps over the span (six polls), then at rest.
+        let stop = &x[19..27];
+        for w in stop.windows(2) {
+            assert!(w[1] <= w[0], "{stop:?}");
+        }
+        let step = (x[19] - x[24]) / 5.0;
+        for w in x[19..25].windows(2) {
+            assert!((w[0] - w[1] - step).abs() < 1e-3, "{stop:?}");
+        }
+        assert_eq!(x[25..], [0.0; 15]);
+        // Starting up as evenly.
+        let rise = &x[..6];
+        for w in rise.windows(2) {
+            assert!(w[1] > w[0], "{rise:?}");
+        }
     }
 
     #[test]
@@ -506,5 +621,19 @@ mod tests {
         );
         let bad = Settings::from_vars(vars(&[("VICTORY_MOUSE_SENS", "beaucoup")]));
         assert_eq!(bad.sensitivity, 1.0);
+        let raw = Settings::from_vars(vars(&[
+            ("VICTORY_RAW_INPUT", "0"),
+            ("VICTORY_MOUSE_SMOOTH", "100"),
+            ("VICTORY_KEY_GRACE", "1000"),
+        ]));
+        assert_eq!(
+            (raw.raw, raw.smoothing_ms, raw.key_grace),
+            (false, 100.0, 500_000)
+        );
+        let default = Settings::default();
+        assert_eq!(
+            (default.raw, default.smoothing_ms, default.key_grace),
+            (true, 48.0, 60_000)
+        );
     }
 }
