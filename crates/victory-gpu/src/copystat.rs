@@ -803,10 +803,76 @@ fn log_memory_map() {
     );
 }
 
+/// The memory's posts on one short line, at most every ten seconds (for a
+/// curve over a long run; the lines below say the same at length): the
+/// process and the PC, the card's two memory groups, the host lists (alive,
+/// idle in the pool, preludes made), their scratch chunks, host copies of
+/// title memory and the windows among them, host textures, our own
+/// allocations, and the shared buffers made so far.
+fn log_posts() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|l| l.elapsed() < std::time::Duration::from_secs(10)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let mb = |v: u64| v >> 20;
+    let (working, private) = process_memory();
+    let (free, left) = system_memory();
+    let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
+    let preludes = crate::host::LISTS[1].load(Relaxed);
+    let (idle, idle_bytes) = crate::list::idle_lists();
+    let (air, landed) = crate::host::lists_in_line();
+    let (backs, backs_free) = crate::list::thin::backs();
+    let (shelved, trimmed) = crate::list::shelved_trimmed();
+    let copies = crate::shadow::memory();
+    let textures = crate::resource::HOST_TEXTURES[1].load(Relaxed);
+    let own: u64 = (0..4).map(owned).sum();
+    let made = crate::host::MADE[3].load(Relaxed);
+    tracing::info!(
+        "posts at {} s: private {} MB, in memory {} MB, the PC {} MB free {} MB to commit; card {}/{} MB, \
+         PC shared with it {} MB; host lists {} ({} idle {} MB, {} in the air, {} landed, {} preludes made; \
+         lists of ours for recordings {}, {} unused; {} put back unrun, {} idle let go); scratch {} MB ({} spare); \
+         copies of title memory {} MB (windows {} MB); host textures {} MB; ours {} MB; shared buffers made {} MB",
+        start.elapsed().as_secs(),
+        mb(private),
+        mb(working),
+        mb(free),
+        mb(left),
+        mb(card[1]),
+        mb(card[0]),
+        mb(card[3]),
+        alive[0],
+        idle,
+        mb(idle_bytes),
+        air,
+        landed,
+        preludes,
+        backs,
+        backs_free,
+        shelved,
+        trimmed,
+        mb(alive[2]),
+        mb(alive[4]),
+        mb(copies[1]),
+        mb(copies[3]),
+        mb(textures),
+        mb(own),
+        mb(made),
+    );
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
+    log_posts();
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
     let (free, left) = system_memory();

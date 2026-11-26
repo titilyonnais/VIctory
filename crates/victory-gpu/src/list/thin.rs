@@ -198,6 +198,14 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Calls translated so far.
+    calls: u64,
+}
+
+/// Whether a recording of `calls` calls has nothing to run: its reset and
+/// its close.
+fn empty(calls: u64) -> bool {
+    calls <= 2
 }
 
 impl Recording {
@@ -248,8 +256,14 @@ impl Recording {
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
+            inner.calls += calls;
             if closed {
                 inner.closed = true;
+                // Nothing will run of it: its host list goes back to the pool
+                // before a submission may look (`super::shelve_host`).
+                if empty(inner.calls) {
+                    super::shelve_host(back);
+                }
                 let kept = std::mem::take(&mut inner.kept);
                 self.done.store(true, Release);
                 self.moved.notify_all();
@@ -272,6 +286,9 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
+            // Its host list, if it was not submitted, waits in the pool, not
+            // with a list nobody uses (`super::shelve_host`).
+            super::shelve_host(inner.back as This);
             held(&BACKS).push(inner.back);
         }
     }
@@ -296,7 +313,18 @@ fn back_list(kind: u32) -> This {
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
+    BACKS_MADE.fetch_add(1, Relaxed);
     list
+}
+
+/// Lists of ours made so far ([`back_list`]).
+static BACKS_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// For the memory's posts: lists of ours made, and of them those nobody
+/// uses ([`BACKS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn backs() -> (u64, usize) {
+    (BACKS_MADE.load(Relaxed), held(&BACKS).len())
 }
 
 fn start() {
@@ -858,6 +886,13 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording of its reset and its close has nothing to run.
+    #[test]
+    fn a_reset_and_a_close_are_empty() {
+        assert!(empty(2));
+        assert!(!empty(3), "one call between");
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.
