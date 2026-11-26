@@ -2399,7 +2399,7 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<(&ID3D12Resource, u64)> {
+    pub(crate) fn budget(&self) -> Option<u64> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2417,7 +2417,7 @@ impl HostList {
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
     /// The list's argument buffer, at least `bytes` long, common between

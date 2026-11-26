@@ -1759,31 +1759,12 @@ impl State {
             why("no host signature");
             return false;
         };
-        // Zero records execute nothing on the GPU: skip refresh, clamp
-        // dispatch, barriers, and pipeline state invalidation.
-        if max == 0 {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| {
-                self.op_text(format!("indirect kind {kind} max 0 at {arguments:#x}"), kind == DISPATCH)
-            });
-            if kind == DISPATCH {
-                DISPATCHED.fetch_add(1, Ordering::Relaxed);
-            } else {
-                DRAWN.fetch_add(1, Ordering::Relaxed);
-            }
-            return true;
-        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(
-            list,
-            (&args.buffer, args.gpu(arguments)),
-            counter.as_ref().map(|(s, _)| &s.buffer),
-            (kind, stride, max),
-        ) else {
+        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
