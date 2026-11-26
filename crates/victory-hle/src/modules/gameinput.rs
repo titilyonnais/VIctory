@@ -111,8 +111,7 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// Scripted keys (`VICTORY_KEYS`), independent of focus.
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
@@ -143,7 +142,6 @@ fn fallback(keys: &[KeyState]) -> PadState {
 }
 
 /// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -158,7 +156,6 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
 
 /// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
 /// works even when an XInput or virtual controller disables `FALLBACK`.
-#[cfg(any(test, feature = "diagnostics"))]
 fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if scripted.is_empty() {
         return;
@@ -167,6 +164,33 @@ fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if let Some(pad) = pads.iter_mut().flatten().next() {
         *pad = merge_pad(*pad, extra);
     }
+}
+
+/// `VICTORY_KEYS`: `<seconds>:<key>,...`, each key with the time after input
+/// starts at which it is pressed. A key is a letter, a digit, or `Enter`,
+/// `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
+/// table maps them to buttons); malformed entries are skipped.
+fn parse_script(list: &str) -> Vec<(Duration, u8)> {
+    list.split(',')
+        .filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, vk))
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -439,10 +463,7 @@ impl Hub {
         let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
             let scripted = source.scripted_keys();
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let scripted: [KeyState; 0] = [];
             (pads, source.keys(), scripted)
         };
         let events = self.state().poll(&self.devices, pads, keys, &scripted);
@@ -506,17 +527,13 @@ impl State {
             }
             self.seen_input[slot].then_some(pad)
         });
-        #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
-        #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
             let base = fallback(&keys);
-            #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
                 return Value::Pad(merge_pad(base, fallback(scripted)));
             }
@@ -1231,10 +1248,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1248,16 +1262,8 @@ mod host {
             down.into_iter().map(key_state).collect()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            scripted().into_iter().map(key_state).collect()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1270,36 +1276,14 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// `VICTORY_KEYS` ([`parse_script`]): each key held for 0.2 s that long
+    /// after input starts, with or without focus. Every build reads it, so
+    /// that unattended runs of a release build pass the title's menus too;
+    /// unset, it holds nothing.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_script(&list))
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
@@ -1758,6 +1742,24 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// `VICTORY_KEYS` is read by every build (release included): named keys,
+    /// letters and digits at their seconds, malformed entries skipped.
+    #[test]
+    fn script_parses_named_keys_letters_and_skips_malformed() {
+        let ms = Duration::from_millis;
+        assert_eq!(
+            parse_script("15:Enter, 20.5 : w ,30:Esc,7,x:Enter,40:F1,-1:Up,50:9,60:Right"),
+            [
+                (ms(15_000), 0x0D),
+                (ms(20_500), b'W'),
+                (ms(30_000), 0x1B),
+                (ms(50_000), b'9'),
+                (ms(60_000), 0x27),
+            ]
+        );
+        assert!(parse_script("").is_empty());
     }
 
     #[test]
