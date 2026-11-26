@@ -9307,6 +9307,8 @@ impl Meter {
             crate::shadow::back_line(frames);
             #[cfg(feature = "diagnostics")]
             split_line(frames);
+            #[cfg(feature = "diagnostics")]
+            crate::texture::fresh::watch::line(frames);
             {
                 let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if passes + compares > 0.0 {

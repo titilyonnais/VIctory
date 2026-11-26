@@ -1625,7 +1625,19 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            // The watched dispatch: what its tables read is looked at.
+            #[cfg(feature = "diagnostics")]
+            let watched = compute && crate::texture::fresh::watch::watched(&stage.shader.hash);
+            #[cfg(feature = "diagnostics")]
+            if watched {
+                crate::texture::fresh::watch::bound();
+                crate::texture::fresh::watch::READER.set(true);
+            }
             let made = self.tables(list, &t.tables, compute);
+            #[cfg(feature = "diagnostics")]
+            if watched {
+                crate::texture::fresh::watch::READER.set(false);
+            }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -4404,6 +4416,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            #[cfg(feature = "diagnostics")]
+            if crate::texture::fresh::watch::READER.get() {
+                crate::texture::fresh::watch::read(*resource as This);
+            }
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).

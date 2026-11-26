@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub(crate) mod fresh;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -549,6 +550,8 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    // Its title memory as it is now is the host's ([`fresh`]).
+    fresh::mark(resource);
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -610,6 +613,25 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     }
 }
 
+/// The title wrote `resource`'s memory after the host wrote the texture
+/// ([`fresh`]): its contents are the title's again. Its staging buffer, if
+/// it has one, holds what the memory held before the host wrote it: read
+/// again in full and uploaded by the next list that samples it.
+fn title_again(resource: This) {
+    let key = resource as usize;
+    if let Some(set) = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        set.remove(&key);
+    }
+    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != key);
+    // (Cloned out of the table: a refresh holds its staging's last state
+    // while it may want the table.)
+    let staging = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
+    if let Some(staging) = staging {
+        staging.forget();
+        staging.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Whether the host GPU wrote `resource` by a copy or resolve
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
@@ -631,6 +653,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
+    drop(set);
+    fresh::forget(resource);
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
@@ -737,17 +761,23 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written {
+    // A texture the host copied into keeps the host's contents, unless the
+    // title wrote its memory since (looked at once a frame, [`fresh`]): then
+    // it is the title's again, and uploaded from title memory now.
+    // (`VICTORY_OCCLUSION_FRESH=0`: kept even then, as before.)
+    let fresh = host_written && fresh::written_since(resource);
+    if host_written && !fresh {
         return;
+    }
+    if fresh {
+        title_again(resource);
     }
     // Once a list for each first level; not again for one that the list's
     // upload of larger ones held too.
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
         return;
     }
-    if !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if !list.first_use(resource as usize) && staged_from(resource) <= first && !fresh {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
