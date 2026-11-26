@@ -236,6 +236,17 @@ pub fn use_host_dir(dir: &Path) -> Result<(), String> {
     HOST.set(host)
         .map_err(|_| String::from("FidelityFX provider already initialized"))?;
     tracing::info!(folder = %dir.display(), version, "FidelityFX: selected PC upscaler");
+    // Frame generation on the upscaled frames (VICTORY_FIDELITYFX_FRAMEGEN=1:
+    // Frame Generation 3; 4: the experimental 4.0.2 with the title's camera;
+    // off without it).
+    if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+        && matches!(mode.as_str(), "1" | "4")
+    {
+        match victory_gpu::external::use_frame_generation(dir, mode == "4") {
+            Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
+            Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+        }
+    }
     Ok(())
 }
 
@@ -630,6 +641,30 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     })
 }
 
+/// What frame generation needs of an upscaling (`settings` in the order of
+/// `ffxDispatchDescUpscale`: sharpening, sharpness, frame time,
+/// pre-exposure, reset, camera near, far, vertical field of view, metres
+/// per view-space unit, flags) and its context's creation `flags`.
+fn frame_inputs(
+    d: &DispatchUpscale,
+    depth: &Resource,
+    motion: &Resource,
+    flags: u32,
+) -> victory_gpu::external::FrameInputs {
+    let f = |i: usize| f32::from_bits(d.settings[i]);
+    victory_gpu::external::FrameInputs {
+        render: d.render_size,
+        jitter: d.jitter,
+        motion_scale: d.motion_scale,
+        frame_time_ms: f(2),
+        reset: d.settings[4] & 0xff != 0,
+        camera: [f(5), f(6), f(7), f(8)],
+        flags,
+        depth_desc: depth.description,
+        motion_desc: motion.description,
+    }
+}
+
 fn record_dispatch(
     list: &victory_gpu::external::Recording<'_>,
     host: &Host,
@@ -639,6 +674,8 @@ fn record_dispatch(
     output_size: [u32; 2],
 ) -> u32 {
     let output = dispatch.resources[6].resource.cast::<Object>();
+    // The title's depth and motion vectors, before they become host textures.
+    let (depth, motion) = (dispatch.resources[1], dispatch.resources[2]);
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     let mut backing_extents = [None; 7];
@@ -699,6 +736,13 @@ fn record_dispatch(
     let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
     if code == OK {
         victory_gpu::external::output_written(output);
+        if !depth.resource.is_null() && !motion.resource.is_null() {
+            list.frame_generation_inputs(
+                depth.resource.cast::<Object>(),
+                motion.resource.cast::<Object>(),
+                frame_inputs(dispatch, &depth, &motion, ctx.creation.description.flags),
+            );
+        }
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
                 jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,

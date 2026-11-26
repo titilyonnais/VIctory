@@ -6874,6 +6874,33 @@ impl HostList {
         }
     }
 
+    /// As [`HostList::settle`], returning the barrier to record instead of
+    /// recording it (frame generation batches its own).
+    pub(crate) fn move_texture(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_for(copy.flags(), wanted);
+        self.changed_something();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
@@ -9152,6 +9179,9 @@ struct Presenter {
     composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    /// AMD frame generation, when on: `swap_chain` is then its proxy
+    /// (`crate::framegen`).
+    framegen: Option<crate::framegen::Presentation>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9630,6 +9660,9 @@ impl Host {
             }
         }
         if (p.width, p.height, p.format) != (width, height, format) {
+            if let Some(fg) = &mut p.framegen {
+                fg.disable(&p.swap_chain);
+            }
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -9682,6 +9715,10 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // Frame generation presents through its proxy from the one list
+            // upstream runs it with, not one sent ahead: in a sent-ahead
+            // list it crashed a run freeing objects (`bury`) after 4 minutes.
+            let read_now = read_now || p.framegen.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9826,6 +9863,12 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            // Frame generation reads the last submitted upscale's depth and
+            // motion in this list, before the present inserts its frames.
+            let generated = match &mut p.framegen {
+                Some(fg) => fg.prepare(&p.swap_chain, &self.device, copy, [width, height], frame),
+                None => false,
+            };
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9851,7 +9894,16 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // The proxy paces generated frames against the display.
+            let status = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            if generated && let Some(fg) = &mut p.framegen {
+                if status.is_ok() {
+                    fg.presented(&p.swap_chain, frame);
+                } else {
+                    tracing::warn!(?status, frame, "FidelityFX frame generation: present failed; off");
+                    fg.disable(&p.swap_chain);
+                }
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -9894,9 +9946,18 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, framegen) = match crate::framegen::enabled()
+                .then(|| crate::framegen::Presentation::create(&factory, &self.device, &self.queue, hwnd, &desc))
+                .flatten()
+            {
+                Some((swap_chain, fg)) => (swap_chain, Some(fg)),
+                None => (
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                        .and_then(|chain| chain.cast::<IDXGISwapChain3>())?,
+                    None,
+                ),
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9913,6 +9974,7 @@ impl Host {
                 composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                framegen,
             })
         }
     }
