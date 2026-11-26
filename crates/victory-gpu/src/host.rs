@@ -1081,10 +1081,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
-            // RDNA 4 (Navi 48: RX 9070, 9070 XT, Radeon AI PRO R9700; Navi 44:
-            // RX 9060 XT) are AMD's device ids 0x7550-0x75ff; RDNA 3 lies below
-            // (0x744c: RX 7900 XTX).
-            let rdna4 = desc.VendorId == 0x1002 && (0x7550..=0x75ff).contains(&desc.DeviceId);
+            let rdna4 = victory_shader::emit::rdna4_adapter(desc.VendorId, desc.DeviceId);
             victory_shader::emit::set_host_rdna4(rdna4);
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(

@@ -253,6 +253,9 @@ pub fn run(
         if let Some(name) = host.adapter_name() {
             println!("pipeline adapter: {name}");
         }
+        // As the game's host does: a raw view's size through a handle of
+        // its own on RDNA 4 (`VICTORY_RAW_SIZE_HANDLE` overrides it).
+        victory_shader::emit::set_host_rdna4(host.rdna4());
         host.translation_caps()
     } else {
         None

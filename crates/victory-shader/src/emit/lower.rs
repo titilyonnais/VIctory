@@ -1526,6 +1526,14 @@ pub fn host_settings() -> [u32; 5] {
 
 static HOST_RDNA4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether an adapter (`vendor`, `device` as DXGI gives them) is an AMD
+/// RDNA 4 card: Navi 48 (RX 9070, 9070 XT, Radeon AI PRO R9700) and Navi 44
+/// (RX 9060 XT) are AMD's device ids 0x7550-0x75ff; RDNA 3 lies below
+/// (0x744c: RX 7900 XTX).
+pub fn rdna4_adapter(vendor: u32, device: u32) -> bool {
+    vendor == 0x1002 && (0x7550..=0x75ff).contains(&device)
+}
+
 /// Tells the translator that the host is an AMD RDNA 4 card
 /// ([`raw_size_own_handle`]).
 pub fn set_host_rdna4(on: bool) {

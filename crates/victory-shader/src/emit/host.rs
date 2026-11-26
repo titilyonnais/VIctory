@@ -235,6 +235,11 @@ impl Host {
         Some((waves.WaveLaneCountMax, rdna))
     }
 
+    /// Whether the adapter is an AMD RDNA 4 card ([`super::rdna4_adapter`]).
+    pub fn rdna4(&self) -> bool {
+        adapter_desc(&self.device).is_ok_and(|desc| super::rdna4_adapter(desc.VendorId, desc.DeviceId))
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
