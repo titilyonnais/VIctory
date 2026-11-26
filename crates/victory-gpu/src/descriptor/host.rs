@@ -5959,6 +5959,38 @@ mod tests {
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 
+    /// A dynamic slot that holds a view of a table made afresh gets its word
+    /// in the table of strides (its stride and kind, which d16 accesses ask:
+    /// the face network's `R16_UINT` views); a title slot, or one past the
+    /// table, is left alone, and no view is 0.
+    #[test]
+    fn a_tables_dynamic_slot_gets_its_views_word() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(&(_, _, data)) = heap.strides.as_ref() else {
+            return;
+        };
+        let word = |index: u32| {
+            // SAFETY: inside the mapping (index under SLOT_STRIDES_COUNT).
+            unsafe { (data as *const u32).add(index as usize).read_volatile() }
+        };
+        let uav = |format| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let at = heap.dynamic(2).expect("two dynamic slots");
+        assert!(at >= heap.count);
+        heap.dynamic_word(at, Some(&uav(57))); // R16_UINT
+        heap.dynamic_word(at + 1, Some(&uav(59))); // R16_SINT
+        assert_eq!(word(at), VIEW_INTEGER | 2);
+        assert_eq!(word(at + 1), VIEW_INTEGER | VIEW_SIGNED | 2);
+        heap.dynamic_word(at, None);
+        assert_eq!(word(at), 0, "no view");
+        // A title slot is the title's, written with its view.
+        heap.dynamic_word(1, Some(&uav(57)));
+        assert_eq!(word(1), 0);
+        heap.release(at, 2);
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {

@@ -215,12 +215,29 @@ fn run_cases(
     run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
 }
 
+/// The root parameter of the host's table of strides, if `shader` reads it:
+/// after the user data, among the root views by slot, then kind (as
+/// `Host::compute_pipeline` lays them out).
+fn strides_param(shader: &HostShader) -> Option<u32> {
+    let mut views: Vec<(u8, u8)> = shader.root_cbvs.iter().map(|&r| (r, 0)).collect();
+    views.extend(shader.root_srvs.iter().map(|&r| (r, 1)));
+    views.extend(shader.root_uavs.iter().map(|&r| (r, 2)));
+    views.sort_unstable();
+    views.dedup();
+    let at = views.iter().position(|&v| v == (super::SLOT_STRIDES, 1))?;
+    Some(1 + at as u32)
+}
+
 fn run_cases_on(
     shader: &HostShader,
     cases: &[[u32; 4]],
     devices: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    // The host's table of strides, all 0 (float views), when the shader
+    // reads it (d16 accesses of typed views): no case reads an unbound
+    // root view.
+    let strides = strides_param(shader).map(|at| (at, vec![0u32; super::SLOT_STRIDES_BYTES as usize / 4]));
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for &(label, warp) in devices {
@@ -248,7 +265,9 @@ fn run_cases_on(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots: std::iter::once((0, Root::Constants(ud)))
+                            .chain(strides.as_ref().map(|(at, data)| (*at, Root::View { srv: true, data: data.clone() })))
+                            .collect(),
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -391,6 +410,34 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
             );
         });
     }
+}
+
+/// MUBUF `op vdata, off, s[srsrc:srsrc+3], 0`: a format access, whose
+/// format is the view's.
+const fn mubuf(op: u8, vdata: u8, srsrc: u8) -> [u32; 2] {
+    [0x38 << 26 | (op as u32) << 18, 0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8]
+}
+
+/// d16 accesses of a typed view in a table ask the host's word for the
+/// view's kind (the face network keeps its halves in `R16_UINT` views of
+/// tables: read as f16, its results were all zero, and faces stood still);
+/// typed accesses of whole dwords do not, nor tbuffer ones (their format is
+/// the instruction's).
+#[test]
+fn d16_accesses_of_a_view_in_a_table_ask_the_host_its_kind() {
+    use super::SLOT_STRIDES;
+    let reads = |shader: &HostShader| shader.root_srvs.contains(&SLOT_STRIDES);
+    // buffer_load_format_d16_xy, buffer_store_format_d16_xyzw and
+    // buffer_load_format_xy, after v1 is stored.
+    let of = |op| {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mubuf(op, 0, 8));
+        build_valu_cs(&body)
+    };
+    assert!(reads(&of(0x81)), "a d16 load");
+    assert!(reads(&build_valu_cs(&mubuf(0x87, 1, 8))), "a d16 store");
+    assert!(!reads(&of(0x01)), "a load of whole dwords");
+    assert!(!reads(&tbuffer_load_of_v1(9, 27)), "a tbuffer load");
 }
 
 #[test]
