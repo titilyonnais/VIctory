@@ -847,9 +847,12 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
+    /// The shapes of views of placed memory, and where each is by its
+    /// hash ([`shape_key`]): keyed by the shape itself the index held a
+    /// second copy of each, 2.4 million of them (some 900 MB with the list)
+    /// 18 minutes into the world (avatarmanz/VIctory-7900XTX#206).
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::BTreeMap<u64, u32>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -949,6 +952,11 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
+fn shape_key(shape: &Shape) -> u64 {
+    use std::hash::BuildHasher;
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
+}
+
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
@@ -959,16 +967,25 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
-            return Some(at);
+        let key = shape_key(&shape);
+        if let Some(&at) = self.shape_index.get(&key) {
+            // Of two shapes with one hash the second is a table entry, as
+            // when the shapes are full.
+            return (self.shapes[at as usize] == shape).then_some(at);
         }
         if self.shapes.len() >= SHAPES {
             return None;
         }
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
+        self.shape_index.insert(key, at);
         Some(at)
+    }
+
+    /// The number of `shape` if it is there already.
+    fn known_shape(&self, shape: &Shape) -> Option<u32> {
+        let &at = self.shape_index.get(&shape_key(shape))?;
+        (self.shapes[at as usize] == *shape).then_some(at)
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1032,7 +1049,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
+                    let known = views_read().known_shape(&shape);
                     let shape = known.or_else(|| views_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -1086,7 +1103,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
         constants,
         placed,
         views.shapes.len() as u64,
@@ -1331,7 +1348,7 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(false, resource, desc));
+        record(handle, placed(false, resource, desc));
     }
 }
 
@@ -1342,8 +1359,33 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(true, resource, desc));
+        record(handle, placed(true, resource, desc));
     }
+}
+
+/// A placed view without the padding words of its descriptions, which hold
+/// whatever the title's stack held: Direct3D reads none of them, but each
+/// new value made a new shape, 4 million (the most there are) in 30 minutes
+/// of run xtx-memcuts, after which every placed view was a table entry kept
+/// for good (avatarmanz/VIctory-7900XTX#206). Zeroed: the resource
+/// description's words 1 (before Alignment) and 13 (its end); a shader
+/// resource view's word 3 (before the union); a buffer view's word 9 (after
+/// the union's buffer member, shader resource and unordered access alike).
+/// `VICTORY_PLACED_PADDING=1`: the words kept as the title gave them.
+fn placed(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> View {
+    const BUFFER: u32 = 1;
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEEP.get_or_init(|| std::env::var_os("VICTORY_PLACED_PADDING").is_some_and(|v| v == "1")) {
+        return View::Placed(unordered, resource, desc);
+    }
+    (resource[1], resource[13]) = (0, 0);
+    if !unordered {
+        desc[3] = 0;
+    }
+    if desc[1] == BUFFER {
+        desc[9] = 0;
+    }
+    View::Placed(unordered, resource, desc)
 }
 
 /// Device method.
@@ -1734,8 +1776,9 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
-        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // (Padding words zero, as `placed` keeps them.)
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
+        let mut desc: [u32; 16] = std::array::from_fn(|k| if k == 3 { 0 } else { 0x7a70_0000 + k as u32 });
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
@@ -1754,6 +1797,12 @@ mod tests {
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // Junk in the padding words: the same view and shape.
+        let (mut junk_resource, mut junk_desc) = (resource, desc);
+        (junk_resource[1], junk_resource[13], junk_desc[3]) = (0xbf80_0000, 0xc0, 0xb717_5a38);
+        create_placed_srv(null, &junk_resource, &junk_desc, at);
+        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(shapes(), 1, "padding makes no shape");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));

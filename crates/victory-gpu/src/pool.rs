@@ -32,6 +32,10 @@ const BLOCK: u64 = 64 << 20;
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
+/// The same on a PC of 32 GB or less (`crate::ram::limited_host_ram`): up
+/// to 3.25 GiB fewer empty blocks, which the card spills to the PC's memory
+/// when it runs short (avatarmanz/VIctory-7900XTX#206).
+const SPARE_LIMITED: usize = 12;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -42,7 +46,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let spare = spares(memory, crate::host::keep_freed());
+    let spare = if crate::ram::limited_host_ram() { spare.min(SPARE_LIMITED) } else { spare };
+    SPARES.store(spare, Ordering::Relaxed);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {

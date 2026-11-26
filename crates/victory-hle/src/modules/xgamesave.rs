@@ -663,12 +663,20 @@ extern "system" fn initialize_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+    let provider = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
     } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
+        Provider::open(&saves, text(config).as_deref()).map(give)
     };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    let hr = xasync::finished_with(block, (&raw const INIT).cast(), provider.map(xasync::bytes));
+    if hr < 0
+        && let Ok(provider) = provider
+    {
+        // Refused before the call existed: the handle was never handed out,
+        // and the call's cleanup frees only the bytes naming it.
+        take(provider);
+    }
+    hr
 }
 extern "system" fn initialize_result(
     _: This,

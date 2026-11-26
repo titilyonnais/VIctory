@@ -122,7 +122,9 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    // Checked first: `put` refuses a null `out` only after the file is open,
+    // and the handle would leak.
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -154,7 +156,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    // Only the walls trace reads these, and nothing removes them: a name for
+    // every file opened, for the whole run, when it is off.
+    if walls_trace() != 0 {
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    }
     put(out, file)
 }
 
@@ -202,6 +208,11 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    // Checked before the lane is made: `put` refuses a null `out` only
+    // after, and the lane would never be closed.
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     let name = text(desc.name);
     tracing::info!(
         source = desc.source_type,
@@ -666,7 +677,8 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        // The newest file at that address: freed objects' addresses come again.
+        files.iter().rev().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,

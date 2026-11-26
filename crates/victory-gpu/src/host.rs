@@ -366,9 +366,11 @@ pub(crate) fn keep_freed() -> bool {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
-/// With plenty of it five minutes ([`keep_freed`]).
+/// With plenty of it five minutes ([`keep_freed`]), unless this process
+/// is already near the PC's commit limit ([`crate::ram::near_commit_limit`],
+/// avatarmanz/VIctory-7900XTX#271): then the shorter times by free RAM.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    ram_idle_for(avail_phys, keep_freed() && !crate::ram::near_commit_limit())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -1291,6 +1293,20 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a prelude made when its list first needs one records into the
+/// list's own allocator, not one of its own (avatarmanz/VIctory-7900XTX#206):
+/// a list made on a fresh allocator costs it its first block, 1.16 MB of
+/// commit on an RX 7900 XTX; 1,107 preludes held 1.3 GB in run xtx-padfix.
+/// The list's allocator is idle then (the list is closed before it is
+/// submitted) and is reset only after every submission of the list ran.
+/// Off by default here (`VICTORY_SHARED_PRELUDE=1`: on): a list submitted
+/// again and again without a reset would grow its allocator by a prelude
+/// each time, and this branch takes host lists back at their reset.
+fn shared_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy_prelude() && std::env::var_os("VICTORY_SHARED_PRELUDE").is_some_and(|v| v == "1"))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4066,11 +4082,19 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
+        self.make_prelude_on(None)
+    }
+
+    /// The same: on `shared`, the list's own allocator ([`shared_prelude`]),
+    /// or on one of its own.
+    fn make_prelude_on(&self, shared: Option<&ID3D12CommandAllocator>) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let allocator: ID3D12CommandAllocator = match shared {
+                    Some(shared) => shared.clone(),
+                    None => self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?,
+                };
                 let list: ID3D12GraphicsCommandList =
                     self.device
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
@@ -6642,17 +6666,19 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
+        let shared = shared_prelude();
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude_on(shared.then_some(&self.allocator))))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures are live. A shared allocator is the list's,
+        // which only the list's reset resets.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
+            (if shared { Ok(()) } else { allocator.Reset() }).and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);

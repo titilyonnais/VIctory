@@ -66,13 +66,27 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
-/// Logs `what` for `destination` the first time (no payload, ever).
+/// Logs `what` for `destination` the first time (no payload, ever), for
+/// the first [`SEEN_MOST`] of them: a title that keeps trying new
+/// destinations or ports would otherwise grow the list, scanned on every
+/// blocked call, for the whole run (avatarmanz/VIctory-7900XTX#229).
 fn once(what: &'static str, destination: String) {
+    const SEEN_MOST: usize = 256;
     static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.iter().any(|(w, d)| *w == what && *d == destination) {
-        tracing::info!(%destination, "{what}");
-        seen.push((what, destination));
+    if seen.iter().any(|(w, d)| *w == what && *d == destination) {
+        return;
+    }
+    match seen.len() {
+        SEEN_MOST => {
+            tracing::info!("network: further blocked destinations are not logged");
+            seen.push(("", String::new()));
+        }
+        n if n > SEEN_MOST => {}
+        _ => {
+            tracing::info!(%destination, "{what}");
+            seen.push((what, destination));
+        }
     }
 }
 
