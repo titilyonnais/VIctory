@@ -1162,8 +1162,44 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let align = start_alignment(u64::from(view_stride(view)), view_raw(view));
+    let (shadow, _) = crate::shadow::for_view(address, len, align)?;
     Some((shadow, address, len))
+}
+
+/// What a host raw buffer view's first byte must be a multiple of in its
+/// buffer: D3D12 refuses one that is not (the debug layer's "the offset of
+/// the first element from the start of the buffer must be a multiple of 16
+/// bytes") and removes the device. A console raw view needs only 4.
+const RAW_VIEW_ALIGNMENT: u64 = 16;
+
+/// What the first byte of a host buffer view of `element`-byte elements
+/// (`raw`: a raw view) must be a multiple of in its host copy
+/// ([`crate::shadow::for_view`]).
+fn start_alignment(element: u64, raw: bool) -> u64 {
+    if raw { element.max(1).next_multiple_of(RAW_VIEW_ALIGNMENT) } else { element }
+}
+
+/// Whether the host reads `view` through a raw buffer view: constant
+/// buffers (`make`) and raw shader resource and unordered access views.
+fn view_raw(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return true,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    // SAFETY (both): a buffer view's union member.
+    words[1] == 1
+        && if unordered {
+            unsafe { uav_desc(words).Anonymous.Buffer }.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+        } else {
+            unsafe { srv_desc(words).Anonymous.Buffer }.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+        }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1208,8 +1244,9 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
+    let align = start_alignment(element, buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0);
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1273,7 +1310,8 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let align = start_alignment(element, buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0);
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
