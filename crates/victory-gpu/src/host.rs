@@ -3333,6 +3333,41 @@ fn crossed_by(written: &[(usize, usize)], runs: &[&HostList], count: bool, first
     parts
 }
 
+/// Whether a refresh that reads title memory a flight writes through
+/// another host copy has those bytes copied on the card, from the host copy
+/// the flight writes, instead of waiting for the flight to land
+/// (`VICTORY_REFRESH_WAIT=2`, with [`card_steps`]; where that is refused,
+/// the wait of `=1`).
+///
+/// Why: with `=0` such a refresh takes last frame's bytes (instance and
+/// bone data a skinning pass writes through the title's whole heap, read by
+/// draws through a buffer of their own): shadows of poles and trees that
+/// come and go, bodies stretched for a frame. With `=1` the submission
+/// stands until the flight has landed, some 40 % of the frame rate.
+fn refresh_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_WAIT").is_ok_and(|v| v.trim() == "2"))
+}
+
+/// [`crossed_by`], with the host copy each part is refreshed through
+/// ([`refresh_on_card`]).
+fn crossed_refreshes(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let mut parts = Vec::new();
+    if written.is_empty() || !refresh_on_card() {
+        return parts;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, at, len) = step {
+                parts.extend(
+                    crossed_parts(written, *at, *at + *len, |a, b| shadow.writes_pending_cover(a, b)).map(|(a, b)| (shadow.clone(), a, b)),
+                );
+            }
+        }
+    }
+    parts
+}
+
 /// Since the last frame-rate line, ns of [`stale_under_flights`] looking
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5932,7 +5967,7 @@ impl Host {
         let blocked = match &own {
             _ if !late => None,
             None => late_blocked(runs),
-            Some(_) if !crossed.is_empty() => {
+            Some(taken) if !crossed.is_empty() && !taken.refreshes_done() => {
                 LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
                 Some(WHY_READ)
             }
