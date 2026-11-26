@@ -4398,6 +4398,20 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                let kind = placed_unordered_texture(resource, desc);
+                if kind == PlacedUnordered::NoMemory {
+                    // The title's placeholder: a view of no memory (address
+                    // 0 in every word; GTA VI's streamed block-compressed
+                    // textures, 2026-11-26). There is nothing to write to on
+                    // the console either: the null view the caller makes is
+                    // what the title asked for.
+                    static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if times.is_power_of_two() {
+                        tracing::debug!(times, format = resource[8], "placed unordered texture view of no memory: a null view");
+                    }
+                    return None;
+                }
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -4407,14 +4421,18 @@ fn make_twinned(
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let (PlacedUnordered::BlockCompressed(at) | PlacedUnordered::Other(at)) = kind else {
+                    return None;
+                };
+                let compressed = matches!(kind, PlacedUnordered::BlockCompressed(_));
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
                 if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
+                        compressed,
                         "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        &desc[..]
                     );
                 }
                 return None;
@@ -4784,6 +4802,40 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
             resource[0] != 1 && resource[0] == other[0] && same(2, 13) && desc[10..12] == other_desc[10..12]
         }
         _ => false,
+    }
+}
+
+/// What a placed unordered view of a texture (device 0x238) names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacedUnordered {
+    /// No memory at all: the title's placeholder, null on the console too.
+    NoMemory,
+    /// A block-compressed texture at this address: the host has no
+    /// unordered view in such a format (a title writes the blocks through
+    /// a 64- or 128-bit integer view and copies them in, which the host
+    /// does see).
+    BlockCompressed(u64),
+    /// Any other texture at this address.
+    Other(u64),
+}
+
+/// Whether DXGI format `format` is block-compressed (BC1 to BC7, typeless
+/// included).
+fn block_compressed(format: u32) -> bool {
+    (70..=84).contains(&format) || (94..=99).contains(&format)
+}
+
+/// See [`PlacedUnordered`]: the address is the view description's words 10
+/// and 11, as for shader views; the title's placeholders have 0 there (and
+/// no address in any other word).
+fn placed_unordered_texture(resource: &[u32; 14], desc: &[u32; 16]) -> PlacedUnordered {
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    if address == 0 {
+        PlacedUnordered::NoMemory
+    } else if block_compressed(resource[8]) || block_compressed(desc[0]) {
+        PlacedUnordered::BlockCompressed(address)
+    } else {
+        PlacedUnordered::Other(address)
     }
 }
 
@@ -5837,6 +5889,49 @@ mod tests {
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    #[test]
+    fn placed_unordered_placeholders_name_no_memory() {
+        // As GTA VI asks (2026-11-26): a 512x512 BC7 texture, 8 levels, its
+        // view shaped as a shader view, no address in any word.
+        let resource = [3, 13, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0x30_0000, 32766];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[2], desc[5], desc[15]) = (98, 4, 0x1688, 15, 3);
+        assert_eq!(placed_unordered_texture(&resource, &desc), PlacedUnordered::NoMemory);
+        // Every block-compressed family, typeless included.
+        for format in [70, 71, 72, 74, 77, 78, 80, 81, 83, 94, 95, 96, 97, 98, 99] {
+            let mut resource = resource;
+            resource[8] = format;
+            assert_eq!(placed_unordered_texture(&resource, &desc), PlacedUnordered::NoMemory);
+            (desc[10], desc[11]) = (0x1000, 0x2);
+            assert_eq!(
+                placed_unordered_texture(&resource, &desc),
+                PlacedUnordered::BlockCompressed(0x2_0000_1000),
+                "format {format}"
+            );
+            (desc[10], desc[11]) = (0, 0);
+        }
+        // An address in the high word alone is an address.
+        desc[11] = 1;
+        assert_eq!(placed_unordered_texture(&resource, &desc), PlacedUnordered::BlockCompressed(1 << 32));
+    }
+
+    #[test]
+    fn placed_unordered_textures_of_other_formats_keep_their_address() {
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0x105, 4, 0];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[10]) = (28, 4, 0x7fed_0000);
+        assert_eq!(placed_unordered_texture(&resource, &desc), PlacedUnordered::Other(0x7fed_0000));
+        // A block-compressed view of a typeless texture is block-compressed.
+        let mut typeless = resource;
+        typeless[8] = 0;
+        desc[0] = 71;
+        assert_eq!(placed_unordered_texture(&typeless, &desc), PlacedUnordered::BlockCompressed(0x7fed_0000));
+        // Formats either side of the block-compressed ranges are not.
+        for format in [69, 85, 93, 100] {
+            assert!(!block_compressed(format), "format {format}");
+        }
     }
 
     #[test]
