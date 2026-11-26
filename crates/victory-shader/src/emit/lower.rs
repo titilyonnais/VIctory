@@ -27,6 +27,11 @@ pub(super) mod intersect;
 
 type Why = &'static str;
 
+/// `DB_SHADER_CONTROL` bits: the program exports depth (`Z_EXPORT_ENABLE`);
+/// depth and stencil are tested before it runs (`DEPTH_BEFORE_SHADER`).
+const Z_EXPORT: u32 = 1;
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -1852,6 +1857,19 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12): the console tests
+        // depth and stencil before the program runs. A host tests after a
+        // program with unordered writes unless told otherwise, and the
+        // program then writes for pixels the test rejects (a glass pre-pass
+        // marked the pane's pixels behind a head as glass).
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & Z_EXPORT == 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
