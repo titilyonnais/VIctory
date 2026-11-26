@@ -2102,6 +2102,17 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Since the start, never reset (`crate::popwatch` takes the difference
+/// between two presented frames): draws of any kind, dispatches, indirect
+/// executions.
+static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// See [`TOTALS`].
+pub(crate) fn totals() -> [u64; 3] {
+    TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -2131,6 +2142,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -2181,6 +2193,7 @@ pub(crate) fn take_indirect() -> u64 {
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {

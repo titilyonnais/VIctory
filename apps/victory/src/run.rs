@@ -180,6 +180,18 @@ pub fn run(
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        // VICTORY_PORT_COPIES=1: the frame allocator's table copies the six
+        // stores miss (its own memcpy, a 128-byte copy) mark their slots too.
+        // A third fewer records left to the fallback (runs pop-4/pop-5), no
+        // change seen in the picture (POPIN.md): off by default.
+        if std::env::var("VICTORY_PORT_COPIES").is_ok_and(|v| v.trim() == "1") {
+            use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
+            let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
+            // SAFETY: as above; the hook is a function of ours.
+            let done = unsafe { apply_copies(image.base(), size, victory_hle::port_descriptors::marks_address(), hook) };
+            let copies = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
+        }
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
@@ -203,6 +215,14 @@ pub fn run(
             }
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
+    }
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
+    // VICTORY_UPSCALER; each off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
