@@ -3326,6 +3326,9 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        // Over the same frames (`VICTORY_ASYNC_SUBMIT`).
+        let waited = ASYNC_US[0].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
+        let finished = ASYNC_US[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
@@ -3343,8 +3346,6 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             if async_submit() {
-                let waited = ASYNC_US[0].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
-                let finished = ASYNC_US[1].swap(0, Ordering::Relaxed) as f64 / frames;
                 tracing::info!(
                     "submissions in flight: {waited:.1} ms/frame waited for the one before, \
                      {finished:.1}/frame finished by the finisher thread"
