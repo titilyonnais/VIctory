@@ -490,11 +490,27 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// instead of 36; filling them costs the CPU what it did.
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
-/// [`window_room_for`], which this comes before.
+/// [`window_room_for`], which this comes before (`VICTORY_WINDOWS_BAR_PCT`
+/// moves that line, [`window_mapped_percent`]).
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// How full the card's budget may be, in percent, for another window to go
+/// into card memory the CPU maps (`VICTORY_WINDOWS_BAR_PCT`, 80 if not
+/// given, 10 to 99). On a 16 GB card running the Series X profile with PC
+/// FSR the budget is about 80 % used before the world loads, so at 80 no
+/// window ever went there; at 97 (`VICTORY_WINDOWS_BAR_MB=4096`) the
+/// windows' copies in the PC's memory went from 5.5 GB to 0.2 GB in the
+/// world on an RX 9070 with 32 GB of RAM, the paging stopped, and frames
+/// took 75 ms instead of 85 (the card reads them from its own memory).
+fn window_mapped_percent() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_PCT").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(80).clamp(10, 99)
     })
 }
 
@@ -510,7 +526,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_mapped_percent()
     {
         return None;
     }
