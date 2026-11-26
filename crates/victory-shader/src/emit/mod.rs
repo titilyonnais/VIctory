@@ -196,6 +196,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(test)]
+mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;

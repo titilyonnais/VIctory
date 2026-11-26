@@ -345,13 +345,16 @@ fn account_frame(frame: u64) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (0x48-byte stride): frame token,
+/// resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -477,10 +480,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the first resource of each presented plane in our window.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -533,46 +533,74 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        use windows::core::Interface;
+
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        // Diagnostics, `VICTORY_PRESENT_1440P`: a 4K primary that came out
-        // black is replaced by the frame's last finished 2560x1440 color
-        // target (issue #841: the world renders there, the 4K output stays
-        // zero). A primary that is not black is shown as usual (menus,
-        // subtitles).
-        #[cfg(feature = "diagnostics")]
-        let fallback = crate::capture::take_1440p_target()
-            .filter(|c| is_4k(&texture) && c.copy.texture != texture)
-            .filter(|_| crate::capture::probe_now(host, &texture, state) == Some(true));
-        #[cfg(feature = "diagnostics")]
-        let shown = match &fallback {
-            Some(c) => {
-                // The candidate's tracked host state, moved for the copy and back.
-                let before = c.copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
-                let shown = host.present(&c.copy.texture, before, frame);
-                c.copy.state.store(before, Ordering::Relaxed);
-                note_fallback(frame);
-                shown
+        // SAFETY: the title passes the plane descriptions.
+        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
+            Vec::with_capacity(slice.len());
+        for plane in slice {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
             }
-            None => host.present(&texture, state, frame),
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let shown = host.present(&texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                // Distinct title resources may refer to one host texture.
+                // Keep its original state for every plane and restore it once.
+                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
+                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
+                });
+                let state = prior.unwrap_or_else(|| {
+                    crate::resource::host_transition(resource, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, before)| before)
+                });
+                resources.push((resource, texture, state, prior.is_none()));
+            }
+        }
+        if !resources.is_empty() {
+            let sources: Vec<(&_, u32)> = resources
+                .iter()
+                .map(|(_, tex, state, _)| (tex, *state))
+                .collect();
+            // Diagnostics, `VICTORY_PRESENT_1440P`: a 4K primary that came out
+            // black is replaced by the frame's last finished 2560x1440 color
+            // target (issue #841: the world renders there, the 4K output stays
+            // zero), shown alone. A primary that is not black is shown as
+            // usual, with its planes (menus, subtitles).
+            #[cfg(feature = "diagnostics")]
+            let fallback = crate::capture::take_1440p_target()
+                .filter(|c| is_4k(&resources[0].1) && c.copy.texture != resources[0].1)
+                .filter(|_| crate::capture::probe_now(host, &resources[0].1, resources[0].2) == Some(true));
+            #[cfg(feature = "diagnostics")]
+            let shown = match &fallback {
+                Some(c) => {
+                    // The candidate's tracked host state, moved for the copy and back.
+                    let before = c.copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
+                    let shown = host.present(&[(&c.copy.texture, before)], frame);
+                    c.copy.state.store(before, Ordering::Relaxed);
+                    note_fallback(frame);
+                    shown
+                }
+                None => host.present(&sources, frame),
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let shown = host.present(&sources, frame);
+            for &(resource, _, state, first) in &resources {
+                if first {
+                    crate::resource::host_transition(resource, state);
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resources[0].0, resources[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -770,6 +798,81 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Distinct title resources can name the same host texture. Presenting
+    /// both planes must preserve that texture's original rendering state.
+    #[cfg(windows)]
+    #[test]
+    fn aliased_present_planes_preserve_the_host_texture_state() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let address = crate::watch::tests::pool(1);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 87, 1, 0, 1, 1, 0]);
+        let resources = std::array::from_fn::<_, 2, _>(|_| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    address as u64,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        });
+        assert_ne!(resources[0], resources[1]);
+        let primary = crate::resource::host_copy(resources[0]).unwrap();
+        let alias = crate::resource::host_copy(resources[1]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&primary, &alias));
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resources[0], TARGET);
+        // SAFETY: the texture is a live render target, on an open list.
+        unsafe {
+            list.list.ClearRenderTargetView(
+                host.rtv(&primary.texture, None),
+                &[0.25, 0.5, 0.75, 1.0],
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
+
+        let planes = resources.each_ref().map(|resource| Plane {
+            token: 0,
+            count: 1,
+            resources: std::ptr::from_ref(resource),
+            _rest: [0; 6],
+        });
+        assert_eq!(present(null, 2, planes.as_ptr(), null.cast()), S_OK);
+        let restored = primary.state.load(Ordering::Relaxed);
+        let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        for resource in resources {
+            assert_eq!(release(resource), 0);
+        }
+        drop((list, primary, alias));
+        crate::watch::tests::free(address);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(restored, TARGET, "the two planes share one rendering state");
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

@@ -24,6 +24,45 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = 0;
+    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
+        let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
+        let delta = (*title_byte ^ *host_byte) & mask;
+        *title_byte ^= delta;
+        *host_byte = *title_byte;
+        changed |= delta;
+    }
+    changed != 0
+}
+
+#[test]
+fn writeback_merge_matches_bytewise_oracle() {
+    for len in [0, 1, 63, 64, 65, 193, 65_536] {
+        let old = vec![0x11; len];
+        for stride in [1, 5, 67, len + 1] {
+            let mut title = old.clone();
+            let mut host = old.clone();
+            for index in (0..len).step_by(3) {
+                title[index] = 0x22;
+            }
+            for index in (0..len).step_by(stride) {
+                host[index] = if index % 2 == 0 { 0x22 } else { 0x33 };
+            }
+            let expected: Vec<_> = host
+                .iter()
+                .zip(&old)
+                .zip(&title)
+                .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
+                .collect();
+            let changed = expected != title;
+            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
+            assert_eq!(title, expected);
+            assert_eq!(host, expected);
+        }
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -456,14 +495,7 @@ impl Shadow {
                     if host != old && crate::host::read_into((start + at) as *const u8, title) {
                         // Title memory with the GPU's bytes put in; the copy
                         // takes the title's bytes in turn.
-                        let mut changed = false;
-                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                            if *h != *o && *t != *h {
-                                *t = *h;
-                                changed = true;
-                            }
-                            *h = *t;
-                        }
+                        let changed = merge_writeback(title, host, old);
                         #[cfg(test)]
                         tests::before_copy_back_write();
                         // Under the remap lock: a page remapped meanwhile
@@ -644,7 +676,9 @@ impl Shadow {
         // snapshot over it. A copy with no snapshot over it (none is kept
         // where nothing is busy, nor for marked ranges) may be queued
         // (`crate::copy_pool`): nothing reads those bytes before the flush
-        // makes it.
+        // makes it. Not over a page with saved bytes: those take the copied
+        // bytes at once (`Tracked::refreshed`), so marked copy-back neither
+        // takes a partial refresh for the GPU's nor drops a shader write.
         let mut sync_before = |a: usize, b: usize, copy: bool| -> usize {
             let (ra, rb) = (a - start, b - start);
             let covered = before.as_ref().is_some_and(|before| {
@@ -653,7 +687,7 @@ impl Shadow {
                     .iter()
                     .any(|(at, bytes)| *at < rb && ra < *at + bytes.len())
             });
-            if copy && !covered {
+            if copy && !covered && !t.saves_any(a, b) {
                 return self.copy_queued(a, b);
             }
             let copied = if copy { self.copy(a, b) } else { 0 };
@@ -735,6 +769,10 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if let Some(t) = &self.tracked {
+            // SAFETY: `to - from` bytes inside the mapping, just copied.
+            t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
+        }
         to - from
     }
 }
@@ -1663,6 +1701,20 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    impl Shadow {
+        /// The marked copy-back of the page at `page` alone (no withheld
+        /// ranges), as [`copy_back_marks`] makes it for each marked page.
+        fn copy_back_marked(&self, page: usize) {
+            if let Some(slice) = self.prepare_marked(page, Vec::new())
+                && let Some((_, wrote, saved)) = slice.commit(&mut Vec::new())
+                && (wrote || saved)
+                && let Some(t) = &self.tracked
+            {
+                t.taken(&[page / PAGE]);
+            }
+        }
+    }
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -2442,6 +2494,48 @@ pub(crate) mod tests {
         bits[w] = (1 << 31) | (1 << 30) | 1;
         assert_eq!(drain_marks(&mut bits, last), [last - 31, last - 1]);
         assert_eq!(bits[w], 0, "the sink bit is cleared too");
+    }
+
+    /// A partial refresh of an armed page updates its saved bytes too (both
+    /// under and beside a pending marked range): copy-back neither puts the
+    /// refreshed byte back over a later title write nor drops a shader write
+    /// back to the pre-fault value.
+    #[test]
+    fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let write = |at: usize, v: u8| {
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        };
+        copy.update(p, len);
+        // Arms both pages: page 0 is wholly busy; page 1 past +16 is free.
+        copy.writing(p, PAGE + 16, true);
+        for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
+            write(at, v);
+        }
+        assert!(copy.update(p + 16, 16) > 0 && copy.update(p + PAGE + 16, 16) > 0);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + 24) as u64, &[0x00]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        write(20, 0x66);
+        write(PAGE + 20, 0x77);
+        copy.copy_back_marked(p);
+        copy.copy_back_marked(p + PAGE);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            [read(10), read(20), read(24), read(40)],
+            [0xaa, 0x66, 0x00, 0x11]
+        );
+        assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
+        copy.copy_back(p, PAGE + 16, &[]);
+        unregister(p, p as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.

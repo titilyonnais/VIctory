@@ -752,3 +752,175 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// Multi-byte writes into title memory that cross a 256 MiB region boundary
+/// or a 4 GiB boundary look up their last byte's region and page in the
+/// page table rather than offsetting the first page's entry or adding the
+/// low dword alone (`Lower::memory`).
+#[test]
+fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
+    let mut w = vec![v_mov_b32(0, ZERO)];
+    for k in 0..4u8 {
+        // Inline constants 129..=132 are 1..=4.
+        w.push(v_mov_b32(1 + k, 129 + u16::from(k)));
+    }
+    w.extend(global(30, 0, 0, 1, 0, 0)); // global_store_dwordx4 v0, v[1:4], s[0:1]
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 5,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    // 513 blocks (block 0 null + 512 capacity blocks), 4096 entries each,
+    // View::Memory at heap slot 0 (UAV at 1) and View::NullPair at slot 2.
+    const BLOCKS: usize = 513;
+    const ENTRIES: usize = 4096;
+    let mut table = vec![0u32; ENTRIES];
+    for _ in 0..BLOCKS * ENTRIES {
+        table.extend([2, 0]);
+    }
+    let set_entry = |table: &mut Vec<u32>, block: usize, page: usize, start_lo: u32| {
+        let at = ENTRIES + 2 * (block * ENTRIES + page);
+        table[at..at + 2].copy_from_slice(&[0, start_lo]);
+    };
+    // 4 GiB boundary: 0x1_FFFF_0000 (l1 0x1F -> block 2) -> 0x2_0000_0000 (l1 0x20 -> block 1).
+    table[0x1F] = 2;
+    table[0x20] = 1;
+    set_entry(&mut table, 2, 0xFFF, 0xFFFF_0000);
+    set_entry(&mut table, 1, 0x000, 0xFFFF_0000);
+    // 256 MiB / capacity edge: 0x1_0FFF_0000 (l1 0x10 -> block 512) -> 0x1_1000_0000 (l1 0x11 -> block 0, unmapped).
+    table[0x10] = 512;
+    set_entry(&mut table, 512, 0xFFF, 0x0FFF_0000);
+
+    // 128 KiB copy spanning two 64 KiB pages; the store writes at +0xFFF8..+0x10008.
+    let memory = vec![0u32; 32 * 1024];
+    let bitmap_dwords = BLOCKS * ENTRIES / 32;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let cases: [(&str, u64, Vec<usize>); 3] = [
+            (
+                "4 GiB boundary",
+                0x1_FFFF_FFF8,
+                vec![4096, 2 * ENTRIES + 0xFFF],
+            ),
+            (
+                "256 MiB boundary into unmapped region at block capacity",
+                0x1_0FFF_FFF8,
+                vec![0x11, 512 * ENTRIES + 0xFFF],
+            ),
+            (
+                "same-page write inside 0x1_FFFF_0000",
+                0x1_FFFF_FF00,
+                vec![2 * ENTRIES + 0xFFF],
+            ),
+        ];
+        for (case, addr, want_bits) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] = (addr >> (32 * u.dword)) as u32;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                            (2, Root::Uav(bitmap_dwords as u32)),
+                        ],
+                        views: &[
+                            View::Memory(&memory),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} ({case}): {e}"));
+            let off = ((addr as u32) & 0xFFFF) as usize / 4;
+            assert_eq!(
+                &out[0][off..off + 4],
+                &[1, 2, 3, 4],
+                "{label} ({case}): store data"
+            );
+            let marked: Vec<usize> = (0..out[1].len() * 32)
+                .filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert_eq!(marked, want_bits, "{label} ({case}): dirty bits");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

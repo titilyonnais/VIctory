@@ -57,8 +57,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the console descriptor's dwords 0-3 as far as the
-    /// host knows them (shaders reading a descriptor as data, `crate::memory`;
+    /// Per title slot and per dynamic slot (tables made afresh lie there,
+    /// and shaders index the view addresses at the slots their tables are
+    /// in), the console descriptor's dwords 0-3 as far as the host knows
+    /// them (shaders reading a descriptor as data, `crate::memory`;
     /// [`write_address`]): the buffer, its mapping and host address, made on
     /// first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
@@ -299,6 +301,22 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for the lists that set a root signature whose
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`) while
+/// the title binds no sampler heap: D3D12 requires one to be bound first
+/// (the debug layer's id 1419), and breaking that rule removes the device on
+/// NVIDIA. Slot 0 holds a point sampler, so an indexed read of it returns
+/// something defined rather than whatever the memory held.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let heap = HostHeap::new(true, 1)?;
+        null_sampler(heap.cpu(0));
+        Some(heap)
+    })
+    .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -401,6 +419,9 @@ impl HostHeap {
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
+        // A table made afresh: shaders reading a view's address there (e.g.
+        // the BVH builder's base) index the view addresses at this slot.
+        self.note_address(index, Some(view));
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -458,6 +479,8 @@ impl HostHeap {
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.set_mark(index, None);
+        // Not a title view: no entry an earlier table left there stays.
+        self.note_address(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -470,6 +493,7 @@ impl HostHeap {
         self.keep(index, None);
         self.set_stride(index, None);
         self.set_mark(index, None);
+        self.note_address(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
@@ -550,13 +574,23 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
+            // The view is a root view, which has no bounds: an entry for
+            // every slot a table can lie in, the dynamic ones too (a table
+            // made afresh on a host whose heap is smaller than the title's
+            // read past the title slots' entries: whatever followed the
+            // buffer, or a GPU fault).
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
+            }
+            // Dynamic slots are entered as they are made ([`Self::make_at`],
+            // [`Self::make_null`], raw views).
+            for i in self.count..self.address_slots() {
+                write_address(data, i as usize, None);
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -565,11 +599,33 @@ impl HostHeap {
         made.as_ref().map(|m| m.2)
     }
 
+    /// The slots the view addresses have an entry for: the title's and the
+    /// dynamic ones.
+    fn address_slots(&self) -> u32 {
+        self.count + self.dynamic
+    }
+
     /// Slot `index` now holds `view` (or no view): its view address.
     fn note_address(&self, index: u32, view: Option<&View>) {
-        if let Some(Some((_, data, _))) = self.addresses.get() {
+        if index < self.address_slots()
+            && let Some(Some((_, data, _))) = self.addresses.get()
+        {
             write_address(*data, index as usize, view);
         }
+    }
+
+    /// The view address entered for slot `index`; none for a slot past the
+    /// view addresses' buffer (tests).
+    #[cfg(test)]
+    fn address_at(&self, index: u32) -> Option<u64> {
+        let (buffer, data, _) = self.addresses.get()?.as_ref()?;
+        // SAFETY: a live buffer.
+        if 16 * u64::from(index) + 16 > unsafe { buffer.GetDesc() }.Width {
+            return None;
+        }
+        // SAFETY: an entry of the mapped view addresses (checked).
+        let [lo, hi] = unsafe { ((data + 16 * index as usize) as *const [u32; 2]).read_unaligned() };
+        Some(u64::from(hi) << 32 | u64::from(lo))
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
@@ -619,6 +675,9 @@ impl HostHeap {
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
+        // Not a title view: no entry an earlier table left there stays.
+        self.note_address(index, None);
+        self.note_address(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -1047,8 +1106,9 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
-/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+/// Writes slot `index`'s words into the view addresses at `data` (the
+/// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
+/// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
 /// high), a texture view's size fields ([`texture_words`]), zeros for
 /// anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
@@ -1057,7 +1117,8 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         Some(words) => words,
         None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
     };
-    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
+    // slot (below `address_slots`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
 }
 
@@ -1390,6 +1451,16 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to
+    // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
+    // texture's own format too: the slot stays null, its writes dropped.
+    // The format checked is the one the view is made in: a typed
+    // texture's own unless the requested one is castable (below).
+    let typed = if view == 0 || (!typeless && !castable.contains(&view)) { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
     }
@@ -1588,7 +1659,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -2223,6 +2294,87 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A table made afresh lies in dynamic slots, and a shader reading a
+    /// view's address (e.g. the BVH builder's base) indexes the view
+    /// addresses there: they have an entry for each dynamic slot, entered
+    /// whenever the slot is made (a view, null, or a raw view of ours).
+    /// Giving a slot back leaves its entry: every table made afresh makes
+    /// all its slots. (Hosts whose view heaps are smaller than the title's,
+    /// NVIDIA, make such tables; the shader read past the buffer.)
+    ///
+    /// Any heap size the host takes will do: a title heap of 4 slots leaves
+    /// dynamic slots past it either way ([`DYNAMIC`] or [`MIN_DYNAMIC`]).
+    #[test]
+    fn view_addresses_cover_tables_made_afresh() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let end = heap.count() + heap.dynamic;
+        assert!(heap.view_addresses().is_some());
+        let first = heap.dynamic(2).unwrap();
+        assert!(first >= heap.count() && first + 1 < end);
+        // A buffer the title placed at 0xd_6013_e000: 16 elements of 4 bytes.
+        let address = 0xd_6013_e000u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        assert_eq!(buffer_range(&view), Some((address, 64)));
+        assert_eq!(heap.address_at(first), Some(0), "not made yet");
+        heap.make_at(first, &view);
+        assert_eq!(heap.address_at(first), Some(address));
+        assert_eq!(heap.address_at(first + 1), Some(0), "not made yet");
+        // The last dynamic slot has its entry too.
+        heap.make_at(end - 1, &view);
+        assert_eq!(heap.address_at(end - 1), Some(address));
+        // A slot given back keeps its entry until it is made again; made
+        // null, it has its entry cleared.
+        heap.release(first, 2);
+        assert_eq!(
+            heap.address_at(first),
+            Some(address),
+            "given back, not made"
+        );
+        heap.make_null(first);
+        assert_eq!(heap.address_at(first), Some(0));
+        assert_eq!(heap.address_at(end - 1), Some(address), "still made");
+        // Raw views of ours (root views, host copies' view pairs) in dynamic
+        // slots clear what an earlier table entered there.
+        heap.make_at(first, &view);
+        heap.raw_view_at(first, None, 0, 0, false);
+        assert_eq!(heap.address_at(first), Some(0), "a root view");
+        heap.make_at(first, &view);
+        heap.make_at(first + 1, &view);
+        heap.raw_pair_at(first, None, 0);
+        assert_eq!(heap.address_at(first), Some(0), "a view pair");
+        assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
+        // Slots past the dynamic ones (host copies' view pairs) have no
+        // entry, and nothing is written past the last: a mark there (the
+        // buffer's allocation reaches past it) stays.
+        assert_eq!(heap.address_at(end), None);
+        let host = host().unwrap();
+        let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
+        // SAFETY: plain queries of a live buffer.
+        let (desc, size) = unsafe {
+            let desc = buffer.GetDesc();
+            let info = host.device.GetResourceAllocationInfo(0, &[desc]);
+            (desc, info.SizeInBytes)
+        };
+        assert_eq!(desc.Width, 16 * u64::from(end));
+        assert!(size >= desc.Width + 8, "room for the mark");
+        let past = (data + 16 * end as usize) as *mut u64;
+        let mark = 0x5a5a_5a5a_5a5a_5a5a;
+        // SAFETY: mapped memory of the buffer's allocation (checked).
+        unsafe { past.write_unaligned(mark) };
+        heap.note_address(end, Some(&view));
+        // SAFETY: as above.
+        assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

@@ -97,6 +97,13 @@ impl Shader {
             translated: OnceLock::new(),
         }
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Shader> {
+        let shader = Shader::new(stage, b"");
+        let _ = shader.translated.set(Some(translated));
+        Arc::new(shader)
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -542,9 +549,10 @@ fn read_stream(
             break;
         }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
-            shaders.extend(shader(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // slice does not promise to be aligned.
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -712,6 +720,25 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
+        stream[16..24].copy_from_slice(&7usize.to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let seen = std::cell::RefCell::new(Vec::new());
+        read_stream(stream, |stage, code| {
+            seen.borrow_mut().push((stage, code.code as usize, code.size));
+            None
+        });
+        assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders
@@ -871,3 +898,6 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
