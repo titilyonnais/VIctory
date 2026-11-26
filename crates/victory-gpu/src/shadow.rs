@@ -332,14 +332,25 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
         if marked && let Some(t) = &self.tracked {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::GpuWritePages,
+                ((address + len).div_ceil(PAGE) - address / PAGE) as u64,
+            );
             t.arm(address, address + len);
             // A page left changed by an earlier partial copy-back gets no new
             // title-side snapshot: its first write was already recorded. Keep
             // this submission's host bytes instead, so its later GPU writes
             // remain distinguishable from the title's.
+            //
+            // Only the changed pages of the range, asked under one lock (a
+            // root view declares the heap from its address to its end, ~2,800
+            // pages, for each draw); and a page whose bytes are kept already
+            // (an earlier declaration of the submission, or the title's first
+            // write) keeps them: `save_host` would drop a new copy anyway.
             let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-            for page in address / PAGE..(address + len).div_ceil(PAGE) {
-                if !t.changed(page) {
+            for page in t.changed_pages(address / PAGE, (address + len).div_ceil(PAGE)) {
+                if t.has_saved(page) {
                     continue;
                 }
                 let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
@@ -2149,6 +2160,36 @@ pub(crate) mod tests {
             .count();
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len, &[]), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// A marked range declared again in the submission leaves the host
+    /// bytes the first declaration kept for a page the title had changed,
+    /// and pages the title had not changed keep none.
+    #[test]
+    fn a_marked_range_declared_twice_keeps_the_first_host_bytes() {
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let t = copy.tracked.as_ref().expect("pool memory is tracked");
+        copy.update(p, len);
+        // The title changes page 1 before the submission (nothing armed:
+        // nothing kept), and the copy's bytes there differ from it.
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + PAGE + 4) as *mut u8).write_volatile(0x33) };
+        copy.write_host((p + PAGE + 4) as u64, &[0x44]);
+        copy.writing(p, len, true);
+        copy.write_host((p + PAGE + 4) as u64, &[0x55]);
+        copy.writing(p + PAGE, PAGE, true);
+        copy.writing(p, len, true);
+        let first = p / PAGE;
+        assert!(!t.has_saved(first) && !t.has_saved(first + 2), "unchanged pages keep nothing");
+        assert_eq!(t.saved(first + 1).map(|bytes| bytes[4]), Some(0x44), "the first declaration's bytes");
+        t.disarm();
         unregister(p, p as u64);
     }
 

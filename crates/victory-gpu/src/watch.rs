@@ -557,6 +557,21 @@ impl Tracked {
             .contains(&page)
     }
 
+    /// The pages of `[first, last)` (page numbers) that changed since they
+    /// were taken, in order: [`Tracked::changed`] of each, under one lock.
+    pub(crate) fn changed_pages(&self, first: usize, last: usize) -> Vec<usize> {
+        if first >= last {
+            return Vec::new();
+        }
+        self.changed
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(first..last)
+            .copied()
+            .collect()
+    }
+
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
@@ -1612,6 +1627,59 @@ pub(crate) mod tests {
         t.disarm();
         assert!(!t.was_remapped(page));
         assert!(t.changed(page), "disarm does not clear changed");
+        drop(t);
+        free(p);
+    }
+
+    /// A remapped page leaves the armed run it was in (its next write keeps
+    /// no bytes) while its neighbours stay armed; arming a range holding it
+    /// arms it again.
+    #[test]
+    fn a_remapped_page_leaves_its_armed_run_until_armed_again() {
+        let p = pool(3);
+        let t = track_copy(p, 3 * PAGE, true).expect("pool memory is tracked");
+        let first = p / PAGE;
+        let all = || t.take(p, p + 3 * PAGE);
+        // SAFETY: (every write below) a byte of our pool; a guarded page
+        // faults into the handler, which saves it first where it is armed.
+        let write = |page: usize, value: u8| unsafe { ((p + page * PAGE + 8) as *mut u8).write_volatile(value) };
+        let saved = |page: usize| t.saved(first + page).map(|bytes| bytes[8]);
+        all();
+        t.arm(p, p + 3 * PAGE);
+        title_memory_remapped(p + PAGE, PAGE);
+        // Taken again (guarded), page 1 is still not armed.
+        all();
+        for page in 0..3 {
+            write(page, 1);
+        }
+        assert_eq!([saved(0), saved(1), saved(2)], [Some(0), None, Some(0)]);
+        all();
+        t.arm(p + PAGE, p + 2 * PAGE);
+        write(1, 2);
+        assert_eq!(saved(1), Some(1), "armed again");
+        drop(t);
+        free(p);
+    }
+
+    /// The changed pages of a range, in order, are the ones
+    /// [`Tracked::changed`] tells one by one.
+    #[test]
+    fn changed_pages_of_a_range_are_the_ones_changed() {
+        let p = pool(4);
+        let t = track_copy(p, 4 * PAGE, true).expect("pool memory is tracked");
+        let first = p / PAGE;
+        t.take(p, p + 4 * PAGE);
+        assert!(t.changed_pages(first, first + 4).is_empty(), "all taken");
+        // SAFETY: bytes of our pool (guarded: the handler marks them).
+        unsafe {
+            ((p + PAGE + 3) as *mut u8).write_volatile(7);
+            ((p + 3 * PAGE) as *mut u8).write_volatile(7);
+        }
+        let one_by_one: Vec<usize> = (first..first + 4).filter(|&page| t.changed(page)).collect();
+        assert_eq!(t.changed_pages(first, first + 4), one_by_one);
+        assert_eq!(one_by_one, [first + 1, first + 3]);
+        assert_eq!(t.changed_pages(first + 2, first + 4), [first + 3], "cut to the range");
+        assert!(t.changed_pages(first + 3, first + 3).is_empty(), "an empty range");
         drop(t);
         free(p);
     }
