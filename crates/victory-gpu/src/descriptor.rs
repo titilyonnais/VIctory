@@ -290,6 +290,7 @@ pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
     drop(rounds);
     if asked {
         SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
         crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

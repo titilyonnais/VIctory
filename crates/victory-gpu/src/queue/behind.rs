@@ -90,10 +90,18 @@ pub(super) trait Work: Send {
     fn mark_now() -> u64 {
         0
     }
-    /// A mark taken when a wait goes or is taken along (on our thread): the
-    /// first round that begins after, not asked for yet.
+    /// A mark taken when a wait goes or is taken along (on our thread): a
+    /// round that begins after.
     fn mark_later() -> u64 {
         0
+    }
+    /// Whether what its queue has behind this wait may have been written
+    /// only just before the wait was met (by the CPU, which writes, then
+    /// meets the wait): it was met in memory. A wait met by a bottom-of-pipe
+    /// write of a flight or of the submission it is taken along with is the
+    /// card's order, not the CPU's.
+    fn raises(&self) -> bool {
+        true
     }
     /// Told just before [`Work::go`] of a submission: the highest mark of
     /// what it is made of and of the waits its queue went past.
@@ -355,7 +363,7 @@ impl<W: Work> Lane<W> {
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
         // The highest mark of what it is made of (renderer port #7).
         let mut mark = entry.mark;
-        if entry.what.ask().is_some() && !entry.what.folded() {
+        if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
             // A wait that goes: what its queue has behind it was written
             // before it was met, which is now at the latest.
             let later = W::mark_later();
@@ -396,7 +404,7 @@ impl<W: Work> Lane<W> {
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
-            let waits = what.ask().is_some();
+            let waits = what.ask().is_some() && what.raises();
             match entry.what.take_along(what) {
                 Ok(run) => {
                     runs += usize::from(run);
@@ -507,7 +515,20 @@ impl Work for Job {
     }
 
     fn mark_later() -> u64 {
-        if crate::port_journal::on() { crate::descriptor::round_mark() } else { 0 }
+        // (Asked for now: the round runs while the lane does what is before
+        // the part behind the wait.)
+        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+    }
+
+    fn raises(&self) -> bool {
+        // (Without the switch no mark is taken: the memory is not read.)
+        if !crate::port_journal::on() {
+            return true;
+        }
+        match self {
+            Job::Value(wait) => wait.met(),
+            _ => true,
+        }
     }
 
     fn marked(&mut self, mark: u64) {

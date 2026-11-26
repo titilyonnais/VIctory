@@ -89,7 +89,10 @@ pub(crate) fn needed() -> u64 {
         return 0;
     }
     match mark() {
-        0 => 0,
+        0 => {
+            STATS[NO_MARK].fetch_add(1, Relaxed);
+            0
+        }
         m => m.max(PREP_FLOOR.load(Relaxed)),
     }
 }
@@ -101,7 +104,10 @@ pub(crate) fn needed() -> u64 {
 /// submit; submissions that waited for a round asked earlier; preparings
 /// that wrote a heap's memory (or may have); nanoseconds the lane waited for
 /// the heaps' records, and how many times, with the switch and without.
-pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Also preparings with no mark (a round asked then, as before) and those
+/// whose round had to be asked for at the preparing (a wait's floor or our
+/// own writes asked for a later one).
+pub(crate) static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 pub(crate) const ROUNDS_ASKED: usize = 0;
 pub(crate) const EARLY_ROUNDS: usize = 1;
 const PREP_WRITES: usize = 2;
@@ -109,6 +115,8 @@ const HEAPS_NS_ON: usize = 3;
 const HEAPS_NS_OFF: usize = 4;
 const HEAPS_ON: usize = 5;
 const HEAPS_OFF: usize = 6;
+const NO_MARK: usize = 7;
+pub(crate) const LATE_ROUNDS: usize = 8;
 
 /// The lane waited `ns` for the heaps' records; `on`: with the switch.
 pub(crate) fn heaps_waited(ns: u64, on: bool) {
@@ -140,11 +148,13 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "renderer port 7 (VICTORY_PORT_JOURNAL=1) per frame: heaps' records: the lane waited {on_ms:.2} ms ({:.1} preparings) with \
          the switch, {off_ms:.2} ms ({:.1}) without; {:.1} rounds asked for at the title's submit, {:.1} preparings found theirs \
-         asked earlier, {:.1} preparings wrote a heap's memory; journal: {}",
+         asked earlier, {:.1} asked it at the preparing, {:.1} had no mark; {:.1} preparings wrote a heap's memory; journal: {}",
         s[HEAPS_ON] / f,
         s[HEAPS_OFF] / f,
         s[ROUNDS_ASKED] / f,
         s[EARLY_ROUNDS] / f,
+        s[LATE_ROUNDS] / f,
+        s[NO_MARK] / f,
         s[PREP_WRITES] / f,
         journal.per_frame(f),
     );
