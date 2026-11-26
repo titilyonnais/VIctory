@@ -119,12 +119,54 @@ pub(crate) enum C {
     MarkedTakenUs,
     BackWrites,
     BackWriteBytes,
+    /// Of a submission (`Host::execute`), before its lists run: evicting
+    /// unused textures, gathering the lists' texture steps, the lists'
+    /// submission-time steps in all, and the last refresh batch.
+    EvictUs,
+    GatherUs,
+    StepsUs,
+    LastFlushUs,
+    /// Of those steps, the ranges shaders write (`Step::GpuWrite`): how
+    /// many, the refresh batch each flushes first, keeping the range's
+    /// bytes or arming its pages (`Shadow::writing`), and pages armed.
+    GpuWriteSteps,
+    GpuWriteFlushUs,
+    GpuWriteKeepUs,
+    GpuWritePages,
+    /// Running the lists: in `ExecuteCommandLists`, waiting for the fence,
+    /// the GPU busy between timestamps written first and last in each
+    /// submission, the submissions so timed, and the longest busy (a
+    /// maximum, not a sum).
+    ExecCallUs,
+    FenceWaitUs,
+    GpuBusyUs,
+    GpuTimed,
+    GpuBusyMaxUs,
+    /// Of the heap syncs: slots whose record changed (made again), and the
+    /// time making them.
+    SyncStale,
+    SyncMirrorUs,
+    /// Of making them: what their views need (`descriptor::host::prepare`),
+    /// and the host views themselves.
+    SyncPrepareUs,
+    SyncMakeUs,
 }
-const COUNTERS: usize = 71;
+const COUNTERS: usize = 88;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// The counter's value now (tests).
+#[cfg(test)]
+pub(crate) fn count(c: C) -> u64 {
+    COUNT[c as usize].load(Relaxed)
+}
+
+/// Keeps the larger of `n` and the counter (a maximum since the last line).
+pub(crate) fn max(c: C, n: u64) {
+    COUNT[c as usize].fetch_max(n, Relaxed);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -332,6 +374,38 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackOpenUs as usize]),
         ms(c[C::BackCopyUs as usize]),
         ms(c[C::BackCloseUs as usize]),
+    );
+    tracing::info!(
+        concat!(
+            "submission parts per frame: evicting {:.1} ms, heap syncs {:.1} ms ({:.0} slots made again in {:.1} ms: ",
+            "preparing {:.1} ms, views {:.1} ms), ",
+            "gathering {:.1} ms, ",
+            "texture uploads {:.1} ms, steps {:.1} ms (shader-written ranges {:.0}: their flushes {:.1} ms, ",
+            "keeping bytes or arming {:.1} ms over {:.0} pages), last flush {:.1} ms, preludes {:.1} ms; ",
+            "running: ExecuteCommandLists {:.1} ms, fence waits {:.1} ms, GPU busy {:.1} ms in {:.1} ",
+            "timed submissions (longest {:.1} ms)"
+        ),
+        ms(c[C::EvictUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncStale as usize],
+        ms(c[C::SyncMirrorUs as usize]),
+        ms(c[C::SyncPrepareUs as usize]),
+        ms(c[C::SyncMakeUs as usize]),
+        ms(c[C::GatherUs as usize]),
+        ms(c[C::UploadsUs as usize]),
+        ms(c[C::StepsUs as usize]),
+        c[C::GpuWriteSteps as usize],
+        ms(c[C::GpuWriteFlushUs as usize]),
+        ms(c[C::GpuWriteKeepUs as usize]),
+        c[C::GpuWritePages as usize],
+        ms(c[C::LastFlushUs as usize]),
+        ms(c[C::PreludeUs as usize]),
+        ms(c[C::ExecCallUs as usize]),
+        ms(c[C::FenceWaitUs as usize]),
+        ms(c[C::GpuBusyUs as usize]),
+        c[C::GpuTimed as usize],
+        // A maximum, not a per-frame sum.
+        ms(c[C::GpuBusyMaxUs as usize] * frames),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

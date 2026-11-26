@@ -859,7 +859,7 @@ pub(crate) fn warn_depth_bounds() {
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -879,7 +879,7 @@ pub(crate) fn dred_on() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds; their commands are noted for it, with or without `VICTORY_D3D12_DRED`).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1178,6 +1178,14 @@ impl Host {
         self.submitted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Ticks per second of the queue's timestamps (asked once).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        static FREQUENCY: OnceLock<u64> = OnceLock::new();
+        // SAFETY: a plain query.
+        *FREQUENCY.get_or_init(|| unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0))
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1190,7 +1198,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        #[cfg(feature = "diagnostics")]
+        let evicting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::EvictUs);
         crate::resource::evict_unused();
+        #[cfg(feature = "diagnostics")]
+        drop(evicting);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -1200,6 +1212,8 @@ impl Host {
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
+        #[cfg(feature = "diagnostics")]
+        let gathering = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::GatherUs);
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
             .iter()
             .flat_map(|l| {
@@ -1227,6 +1241,8 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(gathering);
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -1265,7 +1281,11 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            {
+                #[cfg(feature = "diagnostics")]
+                let _steps = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::StepsUs);
+                list.run_deferred(&mut batch);
+            }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1274,7 +1294,11 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _last = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::LastFlushUs);
+            batch.flush();
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1297,9 +1321,31 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // Diagnostics: the group between a timestamp before and one
+            // after it (`crate::gpustamp`), to tell the GPU's busy time from
+            // the wait around it.
+            #[cfg(feature = "diagnostics")]
+            let stamper = crate::gpustamp::stamper(&self.device);
+            #[cfg(feature = "diagnostics")]
+            let stamped: Vec<Option<ID3D12CommandList>>;
+            #[cfg(feature = "diagnostics")]
+            let group: &[Option<ID3D12CommandList>] = match stamper {
+                Some(s) => {
+                    stamped = s.around(group);
+                    &stamped
+                }
+                None => group,
+            };
+            #[cfg(feature = "diagnostics")]
+            let calling = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::ExecCallUs);
             // SAFETY: closed lists; the fence and event are ours.
+            unsafe { self.queue.ExecuteCommandLists(group) };
+            #[cfg(feature = "diagnostics")]
+            drop(calling);
+            #[cfg(feature = "diagnostics")]
+            let waiting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FenceWaitUs);
+            // SAFETY: the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1310,6 +1356,17 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            drop(waiting);
+            #[cfg(feature = "diagnostics")]
+            if let Some(s) = stamper
+                && let Some(us) = s.busy_us(self.timestamp_frequency())
+            {
+                use crate::copystat::{C, add, max};
+                add(C::GpuBusyUs, us);
+                add(C::GpuTimed, 1);
+                max(C::GpuBusyMaxUs, us);
             }
             #[cfg(feature = "diagnostics")]
             if crate::capture::present_1440p_on()
@@ -2059,7 +2116,9 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        // Timing needs the notes too, not the device-removed data (whose
+        // breadcrumbs slow the GPU).
+        if dred_on() || timing() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
@@ -2520,10 +2579,16 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len, marked, _) => {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
+                    #[cfg(feature = "diagnostics")]
+                    add(C::GpuWriteSteps, 1);
                     if !marked {
+                        #[cfg(feature = "diagnostics")]
+                        let _flushing = crate::watch::Timed(std::time::Instant::now(), C::GpuWriteFlushUs);
                         batch.flush();
                     }
                     batch.gpu_write(*address, *len);
+                    #[cfg(feature = "diagnostics")]
+                    let _keeping = crate::watch::Timed(std::time::Instant::now(), C::GpuWriteKeepUs);
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }

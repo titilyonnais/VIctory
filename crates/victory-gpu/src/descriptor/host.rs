@@ -718,9 +718,17 @@ impl HostHeap {
                 .map(|(i, _)| i)
                 .collect()
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncStale, stale.len() as u64);
+        #[cfg(feature = "diagnostics")]
+        let _mirroring = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncMirrorUs);
+        #[cfg(feature = "diagnostics")]
+        SYNCING.with(|s| s.set(true));
         for i in stale {
             self.mirror(i, at(i), false);
         }
+        #[cfg(feature = "diagnostics")]
+        SYNCING.with(|s| s.set(false));
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -814,7 +822,11 @@ impl HostHeap {
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
+            #[cfg(feature = "diagnostics")]
+            let preparing = syncing(crate::copystat::C::SyncPrepareUs);
             prepare(&view);
+            #[cfg(feature = "diagnostics")]
+            drop(preparing);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
@@ -836,11 +848,15 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            #[cfg(feature = "diagnostics")]
+            let making = syncing(crate::copystat::C::SyncMakeUs);
             let (kept, mark) = if later {
                 (None, None)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            #[cfg(feature = "diagnostics")]
+            drop(making);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1400,6 +1416,17 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+// Diagnostics: whether this thread is making the slots of a heap sync
+// (`HostHeap::sync_slots`), whose parts are then timed.
+#[cfg(feature = "diagnostics")]
+std::thread_local!(static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// A timer of `counter` while this thread syncs heap slots.
+#[cfg(feature = "diagnostics")]
+fn syncing(counter: crate::copystat::C) -> Option<crate::watch::Timed> {
+    SYNCING.with(std::cell::Cell::get).then(|| crate::watch::Timed(std::time::Instant::now(), counter))
 }
 
 /// [`make`], and the view-mark entry of the view if it is an unordered
