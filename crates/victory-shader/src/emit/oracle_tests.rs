@@ -1844,3 +1844,108 @@ fn oracle_fuzz() {
     }
     assert_eq!(exact_failures, 0, "exact translations that differ from the oracle (see above)");
 }
+
+/// A lane-divergent branch: the lanes whose v5 (the thread id) is above s0 (signed) take
+/// `then`. [`by_hash`] turns it into one on v3 (a hash of the thread id, unsigned), as the
+/// fuzzer's branches are.
+fn lane_split(then: Vec<Item>, els: Option<Vec<Item>>) -> Item {
+    Item::If { cmp: Cmp::Lt, signed: true, a: Src::S(0), b: 5, then, els }
+}
+
+/// `items` with every branch of [`lane_split`] on v3, unsigned.
+fn by_hash(items: &[Item]) -> Vec<Item> {
+    items
+        .iter()
+        .map(|i| match i {
+            Item::If { cmp: Cmp::Lt, signed: true, a: Src::S(0), b: 5, then, els } => Item::If {
+                cmp: Cmp::Lt,
+                signed: false,
+                a: Src::S(0),
+                b: 3,
+                then: by_hash(then),
+                els: els.as_ref().map(|e| by_hash(e)),
+            },
+            Item::Loop { n, body } => Item::Loop { n: *n, body: by_hash(body) },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn mov_s(dst: u8, x: i8) -> Item {
+    Item::I(Inst::S1 { op: S1::Mov, dst, a: Src::Int(x) })
+}
+
+/// Class 1 of the oracle's findings: a scalar a lane-divergent branch writes is the wave's
+/// after the join, as on the console (`lower::scalar_splits`). Every shape for all, some and
+/// no lanes in the branch, waves of 32 and of 64 (two host waves of 32 with
+/// `VICTORY_WAVE_WIDE=1`).
+#[test]
+fn oracle_scalars_written_in_lane_branches_reach_every_lane() {
+    use Src::*;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let shapes: Vec<(&str, Vec<Item>)> = vec![
+        ("else writes", vec![lane_split(vec![], Some(vec![mov_s(21, -3)]))]),
+        ("then writes", vec![lane_split(vec![Item::I(Inst::S2 { op: S2::SubU, dst: 20, a: S(17), b: S(16) })], None)]),
+        ("both write", vec![lane_split(vec![mov_s(22, 7)], Some(vec![mov_s(22, 9)]))]),
+        // (a copy of a value from before the branch: still a different value at the join)
+        ("then copies an older scalar", vec![lane_split(vec![Item::I(Inst::S1 { op: S1::Mov, dst: 27, a: S(19) })], None)]),
+        (
+            "nested, read after the outer join",
+            vec![lane_split(
+                vec![],
+                Some(vec![Item::If { cmp: Cmp::Gt, signed: false, a: S(1), b: 5, then: vec![mov_s(23, 5)], els: None }]),
+            )],
+        ),
+        (
+            "SCC set in the branch, read after it",
+            vec![
+                lane_split(vec![Item::I(Inst::SCmp { cmp: Cmp::Eq, signed: false, a: S(16), b: S(16) })], None),
+                Item::I(Inst::S2 { op: S2::Cselect, dst: 24, a: Int(1), b: Int(2) }),
+            ],
+        ),
+        ("first lane read in the branch", vec![lane_split(vec![Item::I(Inst::FirstLane { dst: 25, v: 5 })], None)]),
+        ("lane read in the branch", vec![lane_split(vec![Item::I(Inst::ReadLane { dst: 25, v: 5, lane: Int(0) })], None)]),
+        (
+            "branch in a uniform loop",
+            vec![Item::Loop {
+                n: 2,
+                body: vec![lane_split(vec![Item::I(Inst::S2 { op: S2::AddU, dst: 27, a: S(27), b: Int(1) })], None)],
+            }],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        // (on this thread only: other tests translate meanwhile)
+        lower::THREAD_WAVE_WIDE.set(true);
+        for (name, body) in &shapes {
+            // On the thread id, s0: -1 every lane, 9 some lanes, 40 some (wave64) or none
+            // (wave32), 70 none. On the hash, s0: 0 nearly all, 2^31 about half, 2^32-1 none.
+            let cases = [(false, u32::MAX), (false, 9), (false, 40), (false, 70), (true, 0), (true, 0x8000_0000), (true, u32::MAX)];
+            // (VCC also stored as numbers: a mask read as data, which lowers branches as the
+            // console's lanes take them instead of as guarded code)
+            for ((hash, s0), raw_masks) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
+                let body = if hash { by_hash(body) } else { body.clone() };
+                let name = format!("{name}{}{}", if hash { " (on a hash)" } else { "" }, if raw_masks { " (masks as data)" } else { "" });
+                let p = Prog { wave64, seeds: [s0, 3, 0x1234, 0x5678], body, raw_masks };
+                match check(&gpu, &p) {
+                    Outcome::Same => {}
+                    other => failures.push(format!(
+                        "wave{} {name}, s0 = {s0:#x}: {}",
+                        if wave64 { 64 } else { 32 },
+                        match other {
+                            Outcome::Differs(d) => describe(&d),
+                            o => format!("{o:?}"),
+                        }
+                    )),
+                }
+            }
+        }
+        lower::THREAD_WAVE_WIDE.set(false);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
