@@ -311,6 +311,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
         }
+        IDLE_LOW.fetch_min(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
         taken
     };
     match idle {
@@ -332,19 +333,139 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
-            continue;
-        }
-        // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        if ran.contains(&i) {
+            park(host);
         }
     }
+    trim_idle();
+}
+
+/// Puts `host`, closed and not running, among the idle ones, reset as the
+/// title's reset does (what it kept for its commands goes, its allocators
+/// stay); let go if the pool is full ([`IDLE_MOST`]).
+#[cfg(windows)]
+fn park(host: crate::host::HostList) {
+    if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        return;
+    }
+    host.reset();
+    let bytes = host.scratch_kept();
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        idle.0.push(Idle(host, bytes));
+        idle.1 += bytes;
+    }
+}
+
+/// Whether the host list of a list of ours for a thin recording goes back
+/// to the pool when nothing will run it: the recording was let go unsubmitted,
+/// or it was closed with nothing in it (on by default; `VICTORY_SHELVE_BACKS=0`:
+/// it stays with the list of ours, as before). Such a list kept its host list
+/// until the title reset its own list again, and the title keeps hundreds of
+/// lists made and closed and not used for a long time (run mem-paresse: 793
+/// host lists at 35 s, 6.2 GB of private memory, some 7.9 MB each on the
+/// RX 9070 XT).
+#[cfg(windows)]
+pub(crate) fn shelving() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lazy_hosts() && std::env::var_os("VICTORY_SHELVE_BACKS").is_none_or(|v| v != "0"))
+}
+
+/// The host list of `this` (one of ours, closed, its recording not
+/// submitted since its reset) goes to the pool ([`shelving`]); its next
+/// reset takes one from there ([`lazy_hosts`]). Whether it had one.
+#[cfg(windows)]
+pub(crate) fn shelve_host(this: This) -> bool {
+    if this.is_null() || !shelving() {
+        return false;
+    }
+    // SAFETY: one of our lists, which nobody records into or submits now.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(host) = list.host.take() else {
+        return false;
+    };
+    list.earlier.clear();
+    list.gate.clear();
+    list.uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SHELVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    park(host);
+    true
+}
+
+/// Host lists put back by [`shelve_host`] so far.
+#[cfg(windows)]
+static SHELVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the memory's posts: host lists put back by [`shelve_host`], and idle
+/// ones let go by [`trim_idle`], so far.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shelved_trimmed() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SHELVED.load(Relaxed), TRIMMED.load(Relaxed))
+}
+
+/// The fewest host lists idle since the last trim ([`trim_idle`]), and the
+/// coarse milliseconds of that trim.
+#[cfg(windows)]
+static IDLE_LOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(windows)]
+static TRIM_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How often the idle pool is trimmed, in milliseconds, the lists kept above
+/// what was needed, and the most let go at once (the graphics kernel takes
+/// its time to free them).
+#[cfg(windows)]
+const TRIM_EVERY_MS: u64 = 10_000;
+#[cfg(windows)]
+const TRIM_KEEP: usize = 32;
+#[cfg(windows)]
+const TRIM_MOST: usize = 64;
+
+/// How many idle host lists a trim lets go: of those that stayed idle the
+/// whole time since the last one (`low`, the fewest there were), all but
+/// [`TRIM_KEEP`], at most [`TRIM_MOST`] and what there is (`now`).
+#[cfg(windows)]
+fn to_trim(low: usize, now: usize) -> usize {
+    low.saturating_sub(TRIM_KEEP).min(TRIM_MOST).min(now)
+}
+
+/// Whether the idle pool is trimmed (on by default; `VICTORY_IDLE_TRIM=0`: it
+/// keeps up to [`IDLE_MOST`], as before). A pool filled in a burst (the
+/// opening, a flight of many lists) stayed full: hundreds of host lists of
+/// some 7.9 MB each nobody took again.
+#[cfg(windows)]
+fn trimming() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_TRIM").is_none_or(|v| v != "0"))
+}
+
+/// Every [`TRIM_EVERY_MS`], lets go of the idle host lists nobody took since
+/// the last time ([`to_trim`]), the longest idle first.
+#[cfg(windows)]
+fn trim_idle() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !trimming() {
+        return;
+    }
+    // (0: the first time, which only marks the beginning.)
+    let now = crate::host::coarse_ms().max(1);
+    let at = TRIM_AT.load(Relaxed);
+    if (at != 0 && now < at + TRIM_EVERY_MS) || TRIM_AT.compare_exchange(at, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let n = if at == 0 { 0 } else { to_trim(IDLE_LOW.load(Relaxed), idle.0.len()) };
+        let gone: Vec<Idle> = idle.0.drain(..n).collect();
+        idle.1 -= gone.iter().map(|g| g.1).sum::<u64>();
+        IDLE_LOW.store(idle.0.len(), Relaxed);
+        gone
+    };
+    TRIMMED.fetch_add(gone.len() as u64, Relaxed);
+    // Freed outside the lock.
+    drop(gone);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2432,6 +2553,46 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A trim lets go of what stayed idle all the time, but a margin, a
+    /// few at a time.
+    #[cfg(windows)]
+    #[test]
+    fn a_trim_lets_go_of_what_nobody_took() {
+        assert_eq!(to_trim(usize::MAX, 500), TRIM_MOST, "nothing taken: the most at once");
+        assert_eq!(to_trim(TRIM_KEEP + 8, 200), 8);
+        assert_eq!(to_trim(TRIM_KEEP, 200), 0, "the margin stays");
+        assert_eq!(to_trim(0, 0), 0);
+        assert_eq!(to_trim(usize::MAX, 5), 5, "no more than there is");
+    }
+
+    /// A list closed with nothing to run gives its host list back, and its
+    /// next reset takes one again.
+    #[cfg(windows)]
+    #[test]
+    fn a_shelved_list_takes_a_host_list_at_its_reset() {
+        if crate::host::host().is_none() || !shelving() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        if host_list(list).is_none() {
+            // (The thin path: the title's lists have none.)
+            return;
+        }
+        assert_eq!(close(list), S_OK);
+        assert!(shelve_host(list), "it had one");
+        assert!(host_list(list).is_none());
+        assert!(!shelve_host(list), "nothing left to put back");
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(host_list(list).is_some(), "taken again at the reset");
+        assert_eq!(close(list), S_OK);
+        list_release(list);
+        allocator_release(allocator);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

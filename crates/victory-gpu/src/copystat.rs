@@ -744,6 +744,7 @@ fn log_posts() {
     let (idle, idle_bytes) = crate::list::idle_lists();
     let (air, landed) = crate::host::lists_in_line();
     let (backs, backs_free) = crate::list::thin::backs();
+    let (shelved, trimmed) = crate::list::shelved_trimmed();
     let copies = crate::shadow::memory();
     let textures = crate::resource::HOST_TEXTURES[1].load(Relaxed);
     let own: u64 = (0..4).map(owned).sum();
@@ -751,7 +752,7 @@ fn log_posts() {
     tracing::info!(
         "posts at {} s: private {} MB, in memory {} MB, the PC {} MB free {} MB to commit; card {}/{} MB, \
          PC shared with it {} MB; host lists {} ({} idle {} MB, {} in the air, {} landed, {} preludes made; \
-         lists of ours for recordings {}, {} unused); scratch {} MB ({} spare); \
+         lists of ours for recordings {}, {} unused; {} put back unrun, {} idle let go); scratch {} MB ({} spare); \
          copies of title memory {} MB (windows {} MB); host textures {} MB; ours {} MB; shared buffers made {} MB",
         start.elapsed().as_secs(),
         mb(private),
@@ -769,6 +770,8 @@ fn log_posts() {
         preludes,
         backs,
         backs_free,
+        shelved,
+        trimmed,
         mb(alive[2]),
         mb(alive[4]),
         mb(copies[1]),
