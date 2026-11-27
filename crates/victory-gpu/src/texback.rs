@@ -201,8 +201,12 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
+    use crate::land::part;
+    let began = std::time::Instant::now();
     let _mapping = crate::watch::title_memory_reading();
+    let at_part = crate::land::part(part::TEX_HELD, began);
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let at_part = crate::land::part(part::TEX_TICKETS, at_part);
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -217,6 +221,7 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    let at_part = crate::land::part(part::TEX_READ, at_part);
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -241,7 +246,12 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
+    let at_part = crate::land::part(part::TEX_TILE, at_part);
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    crate::land::part(part::TEX_WRITE, at_part);
+    crate::land::part_count(part::TEX, 1);
+    crate::land::part_count(part::TEX_BYTES, size as u64);
+    crate::land::texture_back_took(began);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
