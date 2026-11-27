@@ -124,6 +124,9 @@ impl Made {
     }
 }
 
+/// The next host heap's identity ([`HostHeap::id`]); 0 is none's.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
@@ -188,6 +191,10 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// This heap's identity ([`NEXT_ID`]), recorded with each range of
+    /// dynamic slots it gives: a range goes back only to the heap that gave
+    /// it ([`HostHeap::release_from`]), not to a later one at its address.
+    id: u64,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1776,6 +1783,7 @@ impl HostHeap {
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
@@ -2833,6 +2841,27 @@ impl HostHeap {
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
         }
+    }
+
+    /// This heap's identity: no other host heap has it, whatever its
+    /// address (a later heap may be made where this one was).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// [`HostHeap::release`] if `id` is this heap's ([`HostHeap::id`]):
+    /// whether the slots went back. A list may outlive the title heap it
+    /// took slots from (D3D12 keeps a heap alive while a list names it, so
+    /// the title may release it before the list is reset); a heap made
+    /// later at the same address must not be given that list's range, or
+    /// two live lists hold the same slots and one rewrites the other's
+    /// descriptors. A range of a heap gone went with it.
+    pub(crate) fn release_from(&self, id: u64, first: u32, n: u32) -> bool {
+        if id != self.id {
+            return false;
+        }
+        self.release(first, n);
+        true
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -6004,6 +6033,25 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_go_back_only_to_the_heap_that_gave_them() {
+        // Two host heaps, as an old title heap and a later one at its address.
+        let (Some(old), Some(new)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        assert_ne!(old.id(), new.id());
+        let free = |heap: &HostHeap| heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        let mine = new.dynamic(2).unwrap();
+        assert_eq!(free(&new), new.dynamic - 2);
+        // The old heap's range, at the same slots: the new heap keeps its own.
+        assert!(!new.release_from(old.id(), mine, 2));
+        assert_eq!(free(&new), new.dynamic - 2);
+        // Its own identity gives them back.
+        assert!(new.release_from(new.id(), mine, 2));
+        assert_eq!(free(&new), new.dynamic);
     }
 
     #[test]
