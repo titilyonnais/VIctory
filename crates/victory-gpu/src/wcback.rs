@@ -75,6 +75,11 @@ pub(crate) fn lazy() -> bool {
 
 /// `VICTORY_WC_LAZY`: 0 (unset), 1 (the title's own read-write memory), 2
 /// (views of sections too, with every other view of their pages).
+///
+/// Level 2 is held back: in GTA 6 a host copy asking for other copies'
+/// pieces ([`take_back_for`]) fetched them from the card holding the
+/// table's lock, and the frame stalled behind it (13 threads waiting, black
+/// screen). `2` runs as `1` until that fetch is done outside the lock.
 fn level() -> u8 {
     if cfg!(test) {
         return 2;
@@ -82,7 +87,10 @@ fn level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("VICTORY_WC_LAZY").as_deref() {
         Ok("1") => 1,
-        Ok("2") => 2,
+        Ok("2") => {
+            tracing::warn!("VICTORY_WC_LAZY=2 stalls (a fetch under the table's lock): running as 1");
+            1
+        }
         _ => 0,
     })
 }
