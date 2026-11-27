@@ -29,7 +29,7 @@ pub mod structure;
 /// 7: d16 accesses of a typed view in a table ask the host's word for its
 /// kind too (an integer view's halves are integers, not f16); 4 to 6 are
 /// other branches'.
-pub const TRANSLATOR_VERSION: u32 = 7;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
