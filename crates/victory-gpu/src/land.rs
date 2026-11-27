@@ -131,6 +131,52 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
     now
 }
 
+/// Where "read-backs and lists" of the landing goes: microseconds, and the
+/// counts beside them.
+pub(crate) mod part {
+    /// A texture read-back ([`crate::texback::land`]): waiting for title
+    /// memory to hold still, for the tickets, reading the title's bytes,
+    /// tiling the card's into them, writing them back.
+    pub(crate) const TEX_HELD: usize = 0;
+    pub(crate) const TEX_TICKETS: usize = 1;
+    pub(crate) const TEX_READ: usize = 2;
+    pub(crate) const TEX_TILE: usize = 3;
+    pub(crate) const TEX_WRITE: usize = 4;
+    /// How many, and their bytes.
+    pub(crate) const TEX: usize = 5;
+    pub(crate) const TEX_BYTES: usize = 6;
+    /// The small read-backs of buffers.
+    pub(crate) const BACKS: usize = 7;
+    /// The card's plan done with, and of that reading its looks.
+    pub(crate) const CARD: usize = 8;
+    pub(crate) const LOOKS: usize = 9;
+    /// The flight's own list landed.
+    pub(crate) const OWN: usize = 10;
+    /// The lists' tables given back.
+    pub(crate) const TABLES: usize = 11;
+    pub(crate) const COUNT: usize = 12;
+}
+
+static PARTS: [AtomicU64; part::COUNT] = [const { AtomicU64::new(0) }; part::COUNT];
+/// The longest texture read-back since the last line, microseconds.
+static LONGEST: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn part_count(which: usize, n: u64) {
+    PARTS[which].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Adds the microseconds since `from` to the part `which`; now.
+pub(crate) fn part(which: usize, from: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    part_count(which, (now - from).as_micros() as u64);
+    now
+}
+
+/// A texture read-back took the time since `from`.
+pub(crate) fn texture_back_took(from: std::time::Instant) {
+    LONGEST.fetch_max(from.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -171,6 +217,27 @@ pub(crate) fn log(frames: f64) {
         ms(stat::READ_BACKS),
         ms(stat::TOLD),
         ms(stat::REST),
+    );
+    let p: Vec<f64> = PARTS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let pms = |i: usize| p[i] / 1000.0;
+    tracing::info!(
+        "read-backs and lists of the landing, per frame: {:.1} texture read-backs of {:.0} KB: {:.2} ms waiting for title memory \
+         to hold still, {:.2} waiting for the tickets, {:.2} reading the title's bytes, {:.2} tiling, {:.2} writing them back \
+         (the longest one {:.1} ms); small read-backs {:.2} ms; the card's plan done {:.2} ms ({:.2} reading its looks); the \
+         flight's own list {:.2} ms; the lists' tables {:.2} ms",
+        p[part::TEX],
+        p[part::TEX_BYTES] / 1024.0,
+        pms(part::TEX_HELD),
+        pms(part::TEX_TICKETS),
+        pms(part::TEX_READ),
+        pms(part::TEX_TILE),
+        pms(part::TEX_WRITE),
+        LONGEST.swap(0, Ordering::Relaxed) as f64 / 1000.0,
+        pms(part::BACKS),
+        pms(part::CARD),
+        pms(part::LOOKS),
+        pms(part::OWN),
+        pms(part::TABLES),
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \

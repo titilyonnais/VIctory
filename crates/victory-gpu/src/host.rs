@@ -4292,6 +4292,7 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
+    let small = std::time::Instant::now();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4320,6 +4321,7 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+    crate::land::part(crate::land::part::BACKS, small);
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
@@ -4992,7 +4994,9 @@ impl Host {
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
         if let Some(looks) = plan.looks {
+            let from = std::time::Instant::now();
             looks.read();
+            crate::land::part(crate::land::part::LOOKS, from);
         }
         if let Some(memory) = plan.sends {
             send::give_back(memory);
@@ -5393,15 +5397,19 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
+                    let mut from = std::time::Instant::now();
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                        from = crate::land::part(crate::land::part::CARD, from);
                     }
                     if let Some(own) = flight.own {
                         own.landed();
+                        from = crate::land::part(crate::land::part::OWN, from);
                     }
                     // Its tables' slots now, not after the bury lag.
                     let mut lists = flight.lists;
                     crate::list::tables_early(&mut lists);
+                    crate::land::part(crate::land::part::TABLES, from);
                     landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
