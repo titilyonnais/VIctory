@@ -348,6 +348,9 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
             v.pages_twice += usize::from(twice);
         }
     }
+    // Pieces of copies left on the card whose bytes this view shows were
+    // kept from the others only (`crate::wcback`).
+    crate::wcback::view_mapped(section, offset, len);
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).

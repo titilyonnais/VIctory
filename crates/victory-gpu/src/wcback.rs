@@ -23,9 +23,11 @@
 //! from `crate::watch::kernel_writing`), memory let go, and other host copies
 //! of the same memory, which would not see it written ([`take_back_for`],
 //! when they ask what was written). A piece taken back is fetched by the
-//! copy-back from then on ("hot"). Only whole kernel pages of the title's
-//! own read-write memory are left: not views of sections, which the title
-//! also sees elsewhere.
+//! copy-back from then on ("hot"). `VICTORY_WC_LAZY=1` leaves whole kernel
+//! pages of the title's own read-write memory only. `VICTORY_WC_LAZY=2` also
+//! leaves whole 64 KiB pages of views of sections (most of it), made
+//! inaccessible at every view of them, and taken back when another view of
+//! them is mapped.
 //!
 //! What counts is what the title asked for (`XMemVirtualAlloc`'s protection,
 //! bit 0x400): the runtime drops that bit for the host.
@@ -52,7 +54,7 @@ pub(crate) fn on() -> bool {
         let skip = std::env::var_os("VICTORY_SKIP_WC_BACK").is_some_and(|v| v == "1");
         if lazy() {
             tracing::warn!(
-                "VICTORY_WC_LAZY=1: what shaders wrote to copies in the card's memory of write-combining title \
+                "VICTORY_WC_LAZY: what shaders wrote to copies in the card's memory of write-combining title \
                  memory stays there, and is fetched when something touches that memory"
             );
         } else if skip {
@@ -66,10 +68,23 @@ pub(crate) fn on() -> bool {
 }
 
 /// Whether what stays on the card is fetched when something touches it
-/// (`VICTORY_WC_LAZY=1`; it wins over `VICTORY_SKIP_WC_BACK`).
+/// (`VICTORY_WC_LAZY=1` or `2`; it wins over `VICTORY_SKIP_WC_BACK`).
 pub(crate) fn lazy() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_LAZY").is_some_and(|v| v == "1"))
+    level() != 0
+}
+
+/// `VICTORY_WC_LAZY`: 0 (unset), 1 (the title's own read-write memory), 2
+/// (views of sections too, with every other view of their pages).
+fn level() -> u8 {
+    if cfg!(test) {
+        return 2;
+    }
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_WC_LAZY").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Title memory known to be write-combining, by start: the end of each run.
@@ -205,14 +220,22 @@ struct Piece {
     shadow: Arc<Shadow>,
     lo: usize,
     len: usize,
+    /// The title memory made inaccessible for it: its own, and with
+    /// `VICTORY_WC_LAZY=2` the other views of its pages.
+    spans: Vec<(usize, usize)>,
+    /// Whether it is view memory (its protection is the guards' to say
+    /// when it is let in again).
+    view: bool,
 }
 
 #[derive(Default)]
 struct Table {
     /// The pieces left, by title address and copy.
     left: BTreeMap<(usize, u64), Piece>,
-    /// The longest piece ever left.
-    longest: usize,
+    /// Their spans, by address, then the piece's key: the bytes.
+    index: BTreeMap<(usize, usize, u64), usize>,
+    /// The widest span ever.
+    widest: usize,
     /// Pieces taken back (copy, offset): fetched as before from then on.
     hot: HashSet<(u64, usize)>,
     /// The 64 KiB blocks that ever held a piece left.
@@ -263,33 +286,95 @@ impl Drop for Inside {
     }
 }
 
-/// The keys of the pieces of `left` that hold some of `seeds`, and of
-/// those that share a kernel page with them, and so on: what must be taken
-/// back together (letting one in lets in the pages it shares with
-/// another). `len` gives a piece's bytes; `longest` is the most.
-fn together<V>(
-    left: &BTreeMap<(usize, u64), V>,
-    len: impl Fn(&V) -> usize,
-    longest: usize,
+/// The keys of the pieces whose spans (`index`: by address, then the
+/// piece's key, the bytes; `widest` the most) hold some of `seeds` (from,
+/// to), and of those whose spans (`spans_of`: address, bytes) share a
+/// kernel page with theirs, and so
+/// on: what must be taken back together (letting one in lets in the pages
+/// it shares with another).
+fn together(
+    index: &BTreeMap<(usize, usize, u64), usize>,
+    widest: usize,
+    spans_of: impl Fn(&(usize, u64)) -> Vec<(usize, usize)>,
     seeds: &[(usize, usize)],
 ) -> Vec<(usize, u64)> {
+    let pages = |(a, b): (usize, usize)| (a / KERNEL_PAGE * KERNEL_PAGE, b.div_ceil(KERNEL_PAGE) * KERNEL_PAGE);
     let mut keys: Vec<(usize, u64)> = Vec::new();
-    let mut todo: Vec<(usize, usize)> = seeds
-        .iter()
-        .filter(|&&(a, b)| a < b)
-        .map(|&(a, b)| (a / KERNEL_PAGE * KERNEL_PAGE, b.div_ceil(KERNEL_PAGE) * KERNEL_PAGE))
-        .collect();
+    let mut todo: Vec<(usize, usize)> = seeds.iter().copied().filter(|&(a, b)| a < b).map(pages).collect();
     while let Some((from, to)) = todo.pop() {
-        for (k, v) in left.range((from.saturating_sub(longest), 0)..(to, 0)) {
-            let end = k.0 + len(v);
-            if end > from && !keys.contains(k) {
-                keys.push(*k);
-                todo.push((k.0, end.div_ceil(KERNEL_PAGE) * KERNEL_PAGE));
+        for (&(at, piece, id), &n) in index.range((from.saturating_sub(widest), 0, 0)..(to, 0, 0)) {
+            if at + n > from && !keys.contains(&(piece, id)) {
+                keys.push((piece, id));
+                todo.extend(spans_of(&(piece, id)).into_iter().map(|(a, n)| pages((a, a + n))));
             }
         }
     }
     keys.sort_unstable();
     keys
+}
+
+/// [`together`] over the table.
+fn together_in(t: &Table, seeds: &[(usize, usize)]) -> Vec<(usize, u64)> {
+    together(&t.index, t.widest, |k| t.left.get(k).map(|p| p.spans.clone()).unwrap_or_default(), seeds)
+}
+
+/// With `VICTORY_WC_LAZY=2`, for a piece `[from, from + len)` of view
+/// memory: every title address of its bytes, if it is whole 64 KiB pages of
+/// one run of one section, each shown in few places, all of them committed
+/// and read-write or guarded.
+fn view_spans(from: usize, len: usize) -> Option<Vec<(usize, usize)>> {
+    if !from.is_multiple_of(BLOCK) || !len.is_multiple_of(BLOCK) || len == 0 {
+        return None;
+    }
+    let crate::inplace::Cover::Run(section, offset) = crate::inplace::cover(from, len) else {
+        return None;
+    };
+    for page in (from..from + len).step_by(BLOCK) {
+        if !(1..=crate::watch::MANY_VIEWS).contains(&crate::inplace::pages_of(page).len()) {
+            return None;
+        }
+    }
+    let spans = crate::inplace::views_of_section(section, offset, len);
+    let own = spans.iter().any(|&(a, n)| a <= from && from + len <= a + n);
+    (own && spans.iter().all(|&(a, n)| mapped(a, a + n))).then_some(spans)
+}
+
+/// Whether `[from, to)` is committed view memory, read-write or read-only.
+fn mapped(from: usize, to: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    let mut at = from;
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Type != MEM_MAPPED
+            || !matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY)
+        {
+            return false;
+        }
+        at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    }
+    true
+}
+
+/// Lets `[from, from + len)` in again: read-write, or for view memory
+/// read-only where the guards guard it (they took it for read-only).
+fn let_in(from: usize, len: usize, view: bool) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    if !view {
+        let _ = protect(from, len, PAGE_READWRITE);
+        return;
+    }
+    for block in (from..from + len).step_by(BLOCK) {
+        let n = BLOCK.min(from + len - block);
+        let guarded = crate::watch::guarded(block, block + n);
+        let _ = protect(block, n, if guarded { PAGE_READONLY } else { PAGE_READWRITE });
+    }
 }
 
 /// Whether `[from, to)` is whole kernel pages of the title's own committed
@@ -364,7 +449,7 @@ fn count_left(bytes: usize) {
 
 /// [`leave`] with `VICTORY_WC_LAZY=1`, for a piece of write-combining memory.
 fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     let (from, len) = (shadow.span().0 as usize + lo, hi - lo);
     let id = shadow.id();
     let mut t = table();
@@ -380,10 +465,20 @@ fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
         NOT[UNALIGNED].fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if !plain(from, from + len) {
-        NOT[NOT_PLAIN].fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
+    let _reading;
+    let (spans, view) = if plain(from, from + len) {
+        (vec![(from, len)], false)
+    } else {
+        // (No view is mapped or unmapped meanwhile.)
+        _reading = crate::watch::title_memory_reading_now();
+        match (level() >= 2 && _reading.is_some()).then(|| view_spans(from, len)).flatten() {
+            Some(spans) => (spans, true),
+            None => {
+                NOT[NOT_PLAIN].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+    };
     #[cfg(not(test))]
     if t.gpu.is_none() {
         if t.no_gpu {
@@ -393,30 +488,34 @@ fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
             Some(Ok(gpu)) => t.gpu = Some(gpu),
             failed => {
                 let error = failed.and_then(|r| r.err()).map(|e| e.to_string()).unwrap_or_default();
-                tracing::warn!(%error, "VICTORY_WC_LAZY=1: no copy queue to fetch pieces with; they are fetched as before");
+                tracing::warn!(%error, "VICTORY_WC_LAZY: no copy queue to fetch pieces with; they are fetched as before");
                 t.no_gpu = true;
                 return false;
             }
         }
     }
-    match protect(from, len, PAGE_NOACCESS) {
-        Some(PAGE_READWRITE) => {}
-        Some(old) => {
+    for (k, &(a, n)) in spans.iter().enumerate() {
+        let fine = match protect(a, n, PAGE_NOACCESS) {
+            Some(old) => old == PAGE_READWRITE || (view && old == PAGE_READONLY),
+            None => false,
+        };
+        if !fine {
             // Changed between the look and the change: as it was.
-            let _ = protect(from, len, old);
-            NOT[REFUSED].fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        None => {
+            for &(a, n) in &spans[..=k] {
+                let_in(a, n, view);
+            }
             NOT[REFUSED].fetch_add(1, Ordering::Relaxed);
             return false;
         }
     }
-    t.left.insert((from, id), Piece { shadow: shadow.clone(), lo, len });
-    t.longest = t.longest.max(len);
-    for block in from / BLOCK..(from + len).div_ceil(BLOCK) {
-        t.ever.insert(block);
+    for &(a, n) in &spans {
+        t.index.insert((a, from, id), n);
+        t.widest = t.widest.max(n);
+        for block in a / BLOCK..(a + n).div_ceil(BLOCK) {
+            t.ever.insert(block);
+        }
     }
+    t.left.insert((from, id), Piece { shadow: shadow.clone(), lo, len, spans, view });
     COUNT.fetch_add(1, Ordering::Relaxed);
     EVER.store(true, Ordering::Release);
     count_left(len);
@@ -428,24 +527,33 @@ fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
 /// table's lock, inside [`Inside`]. `at` and `code`: the address wanted and
 /// the instruction that wanted it, for the notes.
 fn take_back_keys(t: &mut Table, keys: &[(usize, u64)], why: Why, at: usize, code: usize) {
-    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let began = std::time::Instant::now();
     let pieces: Vec<(usize, Piece)> = keys.iter().filter_map(|k| t.left.remove(k).map(|p| (k.0, p))).collect();
     if pieces.is_empty() {
         return;
+    }
+    for (from, p) in &pieces {
+        for &(a, _) in &p.spans {
+            t.index.remove(&(a, *from, p.shadow.id()));
+        }
     }
     COUNT.fetch_sub(pieces.len(), Ordering::Relaxed);
     let mut card = Vec::new();
     let fetched = fetch(t, &pieces, &mut card);
     let (mut put, mut bytes, mut title) = (0usize, 0u64, Vec::new());
     let mut offset = 0;
+    // All let in before any is merged: they may share pages.
+    for (_, p) in &pieces {
+        for &(a, n) in &p.spans {
+            let_in(a, n, p.view);
+        }
+    }
     for (from, p) in &pieces {
-        let _ = protect(*from, p.len, PAGE_READWRITE);
         if fetched {
             put += p.shadow.lazy_merge(p.lo, &card[offset..offset + p.len], &mut title).unwrap_or(0);
             t.landed.push((*from, p.len));
         } else if LOST.fetch_add(1, Ordering::Relaxed) == 0 {
-            tracing::warn!(at = format_args!("{from:#x}"), "VICTORY_WC_LAZY=1: a piece could not be fetched from the card");
+            tracing::warn!(at = format_args!("{from:#x}"), "VICTORY_WC_LAZY: a piece could not be fetched from the card");
         }
         offset += p.len;
         bytes += p.len as u64;
@@ -516,7 +624,7 @@ pub(crate) fn on_fault(at: usize, write: bool, code: usize) -> bool {
         return false;
     };
     let mut t = table();
-    let keys = together(&t.left, |p| p.len, t.longest, &[(at, at + 1)]);
+    let keys = together_in(&t, &[(at, at + 1)]);
     if !keys.is_empty() {
         take_back_keys(&mut t, &keys, if write { Why::Write } else { Why::Read }, at, code);
         return true;
@@ -534,7 +642,7 @@ pub(crate) fn take_back(at: usize, len: usize, why: Why) {
         return;
     };
     let mut t = table();
-    let keys = together(&t.left, |p| p.len, t.longest, &[(at, at.saturating_add(len.max(1)))]);
+    let keys = together_in(&t, &[(at, at.saturating_add(len.max(1)))]);
     if !keys.is_empty() {
         take_back_keys(&mut t, &keys, why, at, 0);
     }
@@ -552,17 +660,32 @@ pub(crate) fn take_back_for(asker: Option<u64>, from: usize, to: usize) {
         return;
     };
     let mut t = table();
-    let others: Vec<(usize, usize)> = together(&t.left, |p| p.len, t.longest, &[(from, to)])
-        .into_iter()
-        .filter(|k| Some(k.1) != asker && k.0 < to)
-        .filter_map(|k| t.left.get(&k).map(|p| (k.0, k.0 + p.len)))
-        .filter(|&(a, b)| a < to && b > from)
+    // The pieces of other copies with a span there, and with them what
+    // shares their pages.
+    let others: Vec<(usize, usize)> = t
+        .index
+        .range((from.saturating_sub(t.widest), 0, 0)..(to, 0, 0))
+        .filter(|&(&(at, _, id), &n)| at + n > from && Some(id) != asker)
+        .flat_map(|(&(_, piece, id), _)| t.left.get(&(piece, id)).map(|p| p.spans.clone()).unwrap_or_default())
+        .map(|(a, n)| (a, a + n))
         .collect();
     if others.is_empty() {
         return;
     }
-    let keys = together(&t.left, |p| p.len, t.longest, &others);
+    let keys = together_in(&t, &others);
     take_back_keys(&mut t, &keys, Why::Copy, from, 0);
+}
+
+/// A view of the physical bytes `[offset, offset + len)` of `section` was
+/// just mapped: pieces left whose bytes those are, made inaccessible at the
+/// other views only, are taken back.
+pub(crate) fn view_mapped(section: usize, offset: u64, len: usize) {
+    if COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    for (at, n) in crate::inplace::views_of_section(section, offset, len) {
+        take_back(at, n, Why::Copy);
+    }
 }
 
 /// Whether pieces are left on the card now.
@@ -593,14 +716,14 @@ fn tend() {
     {
         let mut t = table();
         let keys: Vec<(usize, u64)> = t.left.keys().filter(|k| orphans.contains(&k.1)).copied().collect();
-        let keys = together(&t.left, |p| p.len, t.longest, &keys.iter().map(|k| (k.0, k.0 + 1)).collect::<Vec<_>>());
+        let keys = together_in(&t, &keys.iter().map(|k| (k.0, k.0 + 1)).collect::<Vec<_>>());
         take_back_keys(&mut t, &keys, Why::Orphan, 0, 0);
     }
     for (at, len) in landed {
         crate::watch::landing(at, len);
     }
     for note in notes {
-        tracing::info!("VICTORY_WC_LAZY=1: {note}");
+        tracing::info!("VICTORY_WC_LAZY: {note}");
     }
     drop(grave);
 }
@@ -615,7 +738,7 @@ pub(crate) fn meter(frames: f64) {
     tracing::info!(
         "write-combining title memory not copied back, per frame ({}): {n:.0} pieces of copies in the card's \
          memory left there ({:.1} MB)",
-        if lazy() { "VICTORY_WC_LAZY=1" } else { "VICTORY_SKIP_WC_BACK=1" },
+        if lazy() { "VICTORY_WC_LAZY" } else { "VICTORY_SKIP_WC_BACK=1" },
         bytes / 1e6
     );
     if lazy() {
@@ -623,7 +746,7 @@ pub(crate) fn meter(frames: f64) {
         let why = WHY.each_ref().map(take);
         let not = NOT.each_ref().map(take);
         tracing::info!(
-            "write-combining pieces taken back on demand, per frame (VICTORY_WC_LAZY=1): {:.2} pieces ({:.2} MB, \
+            "write-combining pieces taken back on demand, per frame (VICTORY_WC_LAZY): {:.2} pieces ({:.2} MB, \
              {:.3} ms) at {:.2} times: {:.2} reads, {:.2} writes, {:.2} for the kernel, {:.2} for other copies, \
              {:.2} orphans; fetched as before: {:.0} hot, {:.0} not whole pages, {:.0} not plain memory, {:.0} \
              refused; {} left now, {} lost since the start",
@@ -838,21 +961,30 @@ mod lazy_tests {
     fn pieces_that_share_pages_are_taken_back_together() {
         let k = KERNEL_PAGE;
         let base = 0x10_0000;
-        let mut left: BTreeMap<(usize, u64), usize> = BTreeMap::new();
-        left.insert((base, 1), 16 * k);
-        // Another copy's piece over the second half of the first.
-        left.insert((base + 8 * k, 2), 16 * k);
-        // And a third over the end of that one.
-        left.insert((base + 20 * k, 3), 16 * k);
-        // Apart.
-        left.insert((0x20_0000, 1), 16 * k);
-        let len = |n: &usize| *n;
-        let all = vec![(base, 1), (base + 8 * k, 2), (base + 20 * k, 3)];
-        assert_eq!(together(&left, len, 16 * k, &[(base + 5, base + 6)]), all);
-        assert_eq!(together(&left, len, 16 * k, &[(base + 35 * k, base + 35 * k + 1)]), all);
-        assert_eq!(together(&left, len, 16 * k, &[(0x20_0000 + 16 * k - 1, 0x20_0000 + 16 * k)]), vec![(0x20_0000, 1)]);
-        assert!(together(&left, len, 16 * k, &[(0x20_0000 + 16 * k, 0x20_0000 + 17 * k)]).is_empty());
-        assert!(together(&left, len, 16 * k, &[(base, base)]).is_empty());
+        let alias = 0x80_0000;
+        // Pieces by key, with their spans.
+        let pieces: BTreeMap<(usize, u64), Vec<(usize, usize)>> = [
+            ((base, 1), vec![(base, 16 * k)]),
+            // Another copy's piece over the second half of the first.
+            ((base + 8 * k, 2), vec![(base + 8 * k, 16 * k)]),
+            // And a third over the end of that one, shown at `alias` too.
+            ((base + 20 * k, 3), vec![(base + 20 * k, 16 * k), (alias, 16 * k)]),
+            // A piece at another view of the third's pages.
+            ((alias + 4 * k, 4), vec![(alias + 4 * k, 4 * k)]),
+            // Apart.
+            ((0x20_0000, 1), vec![(0x20_0000, 16 * k)]),
+        ]
+        .into_iter()
+        .collect();
+        let index: BTreeMap<(usize, usize, u64), usize> =
+            pieces.iter().flat_map(|(&(f, id), spans)| spans.iter().map(move |&(a, n)| ((a, f, id), n))).collect();
+        let spans_of = |key: &(usize, u64)| pieces[key].clone();
+        let all = vec![(base, 1), (base + 8 * k, 2), (base + 20 * k, 3), (alias + 4 * k, 4)];
+        assert_eq!(together(&index, 16 * k, spans_of, &[(base + 5, base + 6)]), all);
+        assert_eq!(together(&index, 16 * k, spans_of, &[(alias + 5 * k, alias + 5 * k + 1)]), all);
+        assert_eq!(together(&index, 16 * k, spans_of, &[(0x20_0000 + 16 * k - 1, 0x20_0000 + 16 * k)]), vec![(0x20_0000, 1)]);
+        assert!(together(&index, 16 * k, spans_of, &[(0x20_0000 + 16 * k, 0x20_0000 + 17 * k)]).is_empty());
+        assert!(together(&index, 16 * k, spans_of, &[(base, base)]).is_empty());
     }
 
     /// Title memory of the title's own, read-write.
@@ -969,5 +1101,80 @@ mod lazy_tests {
         let _ = protect(memory.0 + BLOCK, KERNEL_PAGE, windows_sys::Win32::System::Memory::PAGE_READONLY);
         assert!(!plain(memory.0, memory.0 + 2 * BLOCK));
         assert!(plain(memory.0, memory.0 + BLOCK));
+    }
+
+    /// A pagefile section of `bytes` mapped at `views` addresses, each told to
+    /// the runtime's record: the section and the addresses.
+    fn section(bytes: usize, views: usize) -> (usize, Vec<usize>) {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::CreateFileMappingW;
+        // SAFETY: a fresh pagefile section, mapped; the views keep it alive.
+        unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, bytes as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let at = (0..views).map(|_| map(section as usize, bytes)).collect();
+            (section as usize, at)
+        }
+    }
+
+    /// Another view of all of `section`, told to the runtime's record.
+    fn map(section: usize, bytes: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a view of a section of ours.
+        let at = unsafe { MapViewOfFile(section as *mut _, FILE_MAP_WRITE, 0, 0, bytes) }.Value as usize;
+        assert_ne!(at, 0);
+        crate::inplace::title_memory_view(at, bytes, section, 0);
+        at
+    }
+
+    #[test]
+    fn a_piece_of_a_view_is_kept_from_every_view_and_comes_back_at_either() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        crate::watch::install();
+        let (section, views) = section(2 * BLOCK, 2);
+        let (one, two) = (views[0], views[1]);
+        // SAFETY: inside the views.
+        unsafe { std::ptr::write_bytes(one as *mut u8, 0x44, 2 * BLOCK) };
+        let mut card = vec![0x44u8; 2 * BLOCK];
+        card[7] = 0xcd;
+        card[BLOCK + 7] = 0xab;
+        let copy = copy(one, 2 * BLOCK, card);
+        assert!(view_spans(one, BLOCK).is_some());
+        // (Other tests change mappings meanwhile: nothing is left then.)
+        let left = |lo: usize| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < until {
+                if leave_lazy(&copy, lo, lo + BLOCK) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        };
+        assert!(left(0));
+        assert!(left(BLOCK));
+        for at in [one, two, one + BLOCK, two + BLOCK] {
+            assert_eq!(protection(at), PAGE_NOACCESS, "{at:#x}");
+        }
+        // A read at the other view.
+        // SAFETY: inside the view.
+        assert_eq!(unsafe { std::ptr::read_volatile((two + BLOCK + 7) as *const u8) }, 0xab);
+        assert_eq!(protection(one + BLOCK), PAGE_READWRITE);
+        assert_eq!(protection(two + BLOCK), PAGE_READWRITE);
+        assert_eq!(protection(one), PAGE_NOACCESS, "the other piece is still left");
+        // A third view of the bytes: the other piece comes back.
+        let three = map(section, 2 * BLOCK);
+        assert_eq!(protection(one), PAGE_READWRITE);
+        assert_eq!(protection(two), PAGE_READWRITE);
+        assert_eq!(bytes(three + 6, 2), [0x44, 0xcd]);
+        for view in [one, two, three] {
+            crate::watch::title_memory_remapped(view, 2 * BLOCK);
+            // SAFETY: a view of the section.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        }
+        // SAFETY: the section's handle.
+        unsafe { CloseHandle(section as *mut std::ffi::c_void) };
     }
 }
