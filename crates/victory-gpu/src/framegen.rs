@@ -467,6 +467,8 @@ unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
     // SAFETY: as above.
     let code = unsafe { (g.context.api.dispatch)(&mut { g.context.handle }, desc.cast()) };
     if code == OK {
+        // SAFETY: the description is live for this call.
+        unsafe { restore_hud(&*desc) };
         // SAFETY: the description is live for this call; the SDK may update
         // the generated-frame count in it.
         let count = unsafe { std::ptr::addr_of!((*desc).count).read() };
@@ -476,6 +478,133 @@ unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
         g.error.store(code, Ordering::Relaxed);
     }
     code
+}
+
+/// The title gives the upscaler 0 for metres per view-space unit (its default
+/// "unset"); frame generation takes it at face value, which flattens every
+/// depth it compares in metres, near the camera first. 1 stands for unset.
+/// VICTORY_FG_CAMERA=1 turns it on (off by default until seen in play).
+fn fixed_camera(mut camera: [f32; 4]) -> [f32; 4] {
+    if std::env::var("VICTORY_FG_CAMERA").as_deref() != Ok("1") && !(camera[3] > 0.0) {
+        camera[3] = 1.0;
+    }
+    camera
+}
+
+/// VICTORY_FG_HUDLESS=1: the rectangles of the screen (fractions x0,y0,x1,y1)
+/// that are interface the scene's motion must not move (the title's
+/// mini-map by default). VICTORY_FG_HUD_RECTS="x0,y0,x1,y1;..." sets them.
+/// shortcut: stands in for a HUD-less colour, which the title does not give.
+fn hud_rects() -> &'static [[f32; 4]] {
+    static RECTS: OnceLock<Vec<[f32; 4]>> = OnceLock::new();
+    RECTS.get_or_init(|| {
+        if std::env::var("VICTORY_FG_HUDLESS").as_deref() != Ok("1") {
+            return Vec::new();
+        }
+        let text = std::env::var("VICTORY_FG_HUD_RECTS").unwrap_or_else(|_| "0.0,0.62,0.24,1.0".into());
+        text.split(';')
+            .filter_map(|r| {
+                let v: Vec<f32> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 4 && v[0] < v[2] && v[1] < v[3]).then(|| [v[0], v[1], v[2], v[3]])
+            })
+            .collect()
+    })
+}
+
+/// The D3D12 state of a FidelityFX resource state.
+fn d3d_state(state: u32) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES {
+    use windows::Win32::Graphics::Direct3D12::*;
+    match state {
+        s if s & (1 << 1) != 0 => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        s if s & (1 << 5) != 0 => D3D12_RESOURCE_STATE_COPY_DEST,
+        s if s & (1 << 4) != 0 && s & (1 << 2) != 0 => D3D12_RESOURCE_STATE_GENERIC_READ,
+        s if s & (1 << 4) != 0 => D3D12_RESOURCE_STATE_COPY_SOURCE,
+        s if s & (1 << 2) != 0 && s & (1 << 3) != 0 => {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        }
+        s if s & (1 << 2) != 0 => D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        s if s & (1 << 3) != 0 => D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        s if s & (1 << 7) != 0 => D3D12_RESOURCE_STATE_PRESENT,
+        s if s & (1 << 8) != 0 => D3D12_RESOURCE_STATE_RENDER_TARGET,
+        _ => D3D12_RESOURCE_STATE_COMMON,
+    }
+}
+
+/// After the SDK recorded the generated frames: the interface rectangles of
+/// the rendered frame copied over each of them, in the SDK's own list.
+///
+/// # Safety
+/// `desc` is the live description the SDK gave the callback.
+unsafe fn restore_hud(desc: &Generate) {
+    use std::mem::{ManuallyDrop, transmute_copy};
+    use windows::Win32::Graphics::Direct3D12::*;
+    let rects = hud_rects();
+    if rects.is_empty() || desc.list.is_null() || desc.color.resource.is_null() || desc.count == 0 {
+        return;
+    }
+    // SAFETY: the SDK's live command list and resources, borrowed for this call.
+    let (Some(list), Some(color)) = (unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&desc.list) }, unsafe {
+        ID3D12Resource::from_raw_borrowed(&desc.color.resource)
+    }) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let size = unsafe { color.GetDesc() };
+    let (w, h) = (size.Width as f32, size.Height as f32);
+    let color_state = d3d_state(desc.color.state);
+    // Borrowed copies of the pointers: no reference is added, none released.
+    let barrier = |r: &ID3D12Resource, from, to| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                // SAFETY: a bitwise copy of a live interface, never dropped.
+                pResource: unsafe { transmute_copy(r) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: from,
+                StateAfter: to,
+            }),
+        },
+    };
+    let location = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let change = |r: &ID3D12Resource, from, to| {
+        if from != to {
+            // SAFETY: an open list.
+            unsafe { list.ResourceBarrier(&[barrier(r, from, to)]) };
+        }
+    };
+    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let generic = color_state == D3D12_RESOURCE_STATE_GENERIC_READ;
+    if !generic {
+        change(color, color_state, source);
+    }
+    for out in desc.output.iter().take(desc.count as usize) {
+        // SAFETY: as above.
+        let Some(target) = (unsafe { ID3D12Resource::from_raw_borrowed(&out.resource) }) else { continue };
+        let state = d3d_state(out.state);
+        change(target, state, D3D12_RESOURCE_STATE_COPY_DEST);
+        for r in rects {
+            let bx = D3D12_BOX {
+                left: (r[0] * w) as u32,
+                top: (r[1] * h) as u32,
+                front: 0,
+                right: ((r[2] * w) as u32).min(size.Width as u32),
+                bottom: ((r[3] * h) as u32).min(size.Height),
+                back: 1,
+            };
+            // SAFETY: subresource 0 of two live textures of one format.
+            unsafe { list.CopyTextureRegion(&location(target), bx.left, bx.top, 0, &location(color), Some(&bx)) };
+        }
+        change(target, D3D12_RESOURCE_STATE_COPY_DEST, state);
+    }
+    if !generic {
+        change(color, source, color_state);
+    }
 }
 
 /// Frame generation for one presenter: the proxy swap chain's context and
@@ -662,7 +791,7 @@ impl Presentation {
             scale: input.frame.motion_scale,
             time_ms: input.frame.frame_time_ms,
             reset,
-            camera: input.frame.camera,
+            camera: fixed_camera(input.frame.camera),
             depth,
             motion,
             camera_position: pose.position,
@@ -682,7 +811,7 @@ impl Presentation {
         self.continuous += u64::from(!reset);
         if self.next_id == 1 {
             let screen = display;
-            tracing::info!(frame, render = ?input.frame.render, ?screen, camera_pose = ml_enabled(), "FidelityFX frame generation: first upscaled frame's depth and motion given to it");
+            tracing::info!(frame, render = ?input.frame.render, ?screen, camera_pose = ml_enabled(), camera_near_far_fov_scale = ?input.frame.camera, flags = input.frame.flags, frame_time_ms = input.frame.frame_time_ms, motion_scale = ?input.frame.motion_scale, hud_rects = ?hud_rects(), "FidelityFX frame generation: first upscaled frame's depth and motion given to it");
         }
         true
     }
