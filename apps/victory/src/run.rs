@@ -146,6 +146,8 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // VICTORY_SKIP_BINK: the title's imports of its Bink player's exports.
+    let with_dlls = victory_hle::bink::SkipMovies { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -434,6 +436,7 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                let resolver = victory_hle::bink::SkipMovies { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

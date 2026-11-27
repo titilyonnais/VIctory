@@ -41,6 +41,8 @@ It started at 280 ms a frame in the same scenes three days earlier.
 | `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
 
+`VICTORY_SKIP_BINK=1` skips the title's movies that play once (logos, the intro); `all` skips looping ones too (menu backgrounds stay dark).
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.
