@@ -332,21 +332,61 @@ pub(crate) fn backs() -> (u64, usize) {
     (BACKS_MADE.load(Relaxed), held(&BACKS).len())
 }
 
+/// With `VICTORY_THIN_THREADS=alt` (or `alt<n>`): how many of the eight
+/// threads translate now, `n` (4) and all of them in turn, twenty seconds
+/// each, so that both are measured in the same scene. `usize::MAX` without.
+fn working() -> usize {
+    static FEWER: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let Some(fewer) = *FEWER.get_or_init(|| {
+        let asked = std::env::var("VICTORY_THIN_THREADS").ok()?;
+        let n = asked.trim().strip_prefix("alt")?;
+        Some(n.parse().unwrap_or(4usize).clamp(1, 8))
+    }) else {
+        return usize::MAX;
+    };
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+        tracing::info!(
+            "threads that translate lists from now (VICTORY_THIN_THREADS=alt): {}",
+            if on { format!("ON, {fewer} of them") } else { "off, all 8".to_owned() },
+        );
+    }
+    if on { fewer } else { usize::MAX }
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let asked = std::env::var("VICTORY_THIN_THREADS").ok();
+    let threads = match asked.as_deref().map(str::trim) {
+        Some(v) if v.starts_with("alt") => 8,
+        v => v.and_then(|v| v.parse().ok()).unwrap_or(8usize).clamp(1, 32),
+    };
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
             loop {
+                // (Not one of those that work now: `working`.)
+                while i >= working() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
                 let recording = {
                     let mut ready = held(&READY);
                     loop {
+                        if i >= working() {
+                            break None;
+                        }
                         match ready.pop_front() {
-                            Some(r) => break r,
+                            Some(r) => break Some(r),
                             None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
                         }
                     }
+                };
+                let Some(recording) = recording else {
+                    // Woken for work it leaves to those that work now.
+                    WORK.notify_one();
+                    continue;
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
