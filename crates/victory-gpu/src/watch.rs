@@ -2617,11 +2617,22 @@ pub fn title_memory_remapping() -> Remapping {
 /// Changes of mapping ([`title_memory_remapping`]): how many, the
 /// microseconds they waited for readers, the microseconds they took, and
 /// the longest one.
-static REMAPPING: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+///
+/// Then, in nanoseconds, what a change spends on our side of it: telling
+/// the placed textures, the views in place, what stays in place, then
+/// waiting for the guards, and the texture read-backs' tickets.
+static REMAPPING: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 /// [`REMAPPING`] since it was last asked for (the landing's line).
-pub(crate) fn remapping_taken() -> [u64; 4] {
-    [0, 1, 2, 3].map(|i| REMAPPING[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn remapping_taken() -> [u64; 9] {
+    std::array::from_fn(|i| REMAPPING[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Counts what went by since `since` as step `i` of [`REMAPPING`]; now.
+fn remapping_step(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    REMAPPING[i].fetch_add((now - since).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    now
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -2667,7 +2678,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    let step = std::time::Instant::now();
     crate::texback::remapped(at, len);
+    remapping_step(8, step);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
         CHANGING.set((true, true));
@@ -2746,12 +2759,17 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
+    let step = std::time::Instant::now();
     crate::descriptor::host::remapped(at, len);
+    let step = remapping_step(4, step);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
+    let step = remapping_step(5, step);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    let step = remapping_step(6, step);
     let mut g = guards();
+    remapping_step(7, step);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
