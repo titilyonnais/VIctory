@@ -348,24 +348,6 @@ pub(crate) fn show_after() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
 }
 
-/// Whether a slot [`show_after`] holds back goes on showing the texture it
-/// showed if that one is of the same dimension, whatever its kind, size or
-/// the room left on the card (`VICTORY_SHOW_KEEPS`, on; 0: only as
-/// [`keep_shown`] says, as before). Otherwise it shows the neutral texture,
-/// whose 0x80 alpha (0.502) a draw with an alpha test above it discards:
-/// the object is not drawn for that frame, as before.
-///
-/// Why: some 14 slots a frame are held back with the camera still (run
-/// soir-base) and many more on the move (tour-base: 49,000 in four
-/// minutes), for 0.4 frames on average and up to 3, about two thirds of
-/// them with the neutral texture. Trees, fences and palisades are drawn
-/// with an alpha test: they came and went from one frame to the next.
-/// The old texture is held for that frame or so only.
-fn show_keeps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_KEEPS").is_none_or(|v| v != "0"))
-}
-
 /// Whether a title slot that would show a texture made while submissions
 /// begun before it may still run shows it only once those have finished
 /// (`VICTORY_SHOW_NEW_LATER`, on; 0: at once, as before; A/B-able).
@@ -2430,9 +2412,6 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                // (Shown for the frame or so of the upload: no room needed.)
-                Kin::None => false,
-                _ if show_keeps() => true,
                 kin => crate::resource::room_lately() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
