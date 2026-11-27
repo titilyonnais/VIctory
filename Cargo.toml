@@ -70,6 +70,8 @@ undocumented_unsafe_blocks = "allow"
 opt-level = 2
 
 [profile.release]
+lto = "fat"
+codegen-units = 1
 debug = "line-tables-only"
 
 # The development build: release code generation plus the `diagnostics`
