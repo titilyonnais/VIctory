@@ -9407,7 +9407,8 @@ impl Meter {
         // ([`meter_lines`]), not by the presenting thread, the lane: about
         // 3 ms each second there (run ask-1), and 30 ms each 5 s (lane2-0).
         // Their counters are taken there, a moment after the frames counted.
-        let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        let window = self.logged.elapsed();
+        let five = window >= std::time::Duration::from_secs(5);
         if five {
             self.logged = std::time::Instant::now();
         }
@@ -9508,6 +9509,7 @@ impl Meter {
             if !five {
                 return;
             }
+            crate::framegen::window_line(window.as_secs_f64());
                 tracing::info!(
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10007,6 +10009,9 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             // The proxy paces generated frames against the display.
             let status = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            if status.is_ok() && let Some(fg) = &mut p.framegen {
+                fg.counted(&p.swap_chain);
+            }
             if generated && let Some(fg) = &mut p.framegen {
                 if status.is_ok() {
                     fg.presented(&p.swap_chain, frame);

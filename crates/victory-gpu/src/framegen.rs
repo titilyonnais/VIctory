@@ -420,6 +420,32 @@ struct Generator {
     error: AtomicU32,
 }
 
+/// Since the last [`window_line`]: frames the host presented through the
+/// proxy swap chain, presents the proxy made of them (rendered and
+/// generated), and frames generated.
+static WINDOW: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Rates of one window: (displayed fps, rendered fps).
+fn rates(presents: u64, rendered: u64, seconds: f64) -> (f64, f64) {
+    if seconds <= 0.0 {
+        return (0.0, 0.0);
+    }
+    (presents as f64 / seconds, rendered as f64 / seconds)
+}
+
+/// The line of the frames displayed over the last `seconds` (the 5 s of the
+/// frame meter); nothing when no frame went through a proxy swap chain.
+pub(crate) fn window_line(seconds: f64) {
+    let [rendered, presents, generated] = [0, 1, 2].map(|i| WINDOW[i].swap(0, Ordering::Relaxed));
+    if rendered == 0 && presents == 0 {
+        return;
+    }
+    let (displayed, rendered_fps) = rates(presents, rendered, seconds);
+    tracing::info!(
+        "framegen: {presents} presents for {rendered} rendered frames in the last {seconds:.1} s (displayed fps          {displayed:.1}, rendered fps {rendered_fps:.1}; {generated} frames generated)"
+    );
+}
+
 /// The proxy's call during Present: generate the frames.
 unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
     // SAFETY: the configured callback gets our boxed generator and a live
@@ -432,6 +458,7 @@ unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
         // the generated-frame count in it.
         let count = unsafe { std::ptr::addr_of!((*desc).count).read() };
         g.generated.fetch_add(u64::from(count), Ordering::Relaxed);
+        WINDOW[2].fetch_add(u64::from(count), Ordering::Relaxed);
     } else {
         g.error.store(code, Ordering::Relaxed);
     }
@@ -451,6 +478,8 @@ pub(crate) struct Presentation {
     continuous: u64,
     last_frame: u64,
     base_presents: u32,
+    /// The proxy's present count at the last [`Presentation::counted`].
+    counted_presents: u32,
     logged: bool,
     missing_camera_warning: camera::MissingCameraWarning,
 }
@@ -514,7 +543,7 @@ impl Presentation {
         tracing::info!(provider = proxy_provider, "FidelityFX frame generation: proxy swap chain");
         Some((
             swap_chain,
-            Self { api, generator_provider: providers.generator, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false, missing_camera_warning: camera::MissingCameraWarning::default() },
+            Self { api, generator_provider: providers.generator, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, counted_presents: 0, logged: false, missing_camera_warning: camera::MissingCameraWarning::default() },
         ))
     }
 
@@ -678,6 +707,17 @@ impl Presentation {
         }
     }
 
+    /// After each successful present through the proxy swap chain: the
+    /// frame and the proxy's new presents counted for [`window_line`].
+    pub(crate) fn counted(&mut self, chain: &IDXGISwapChain3) {
+        // SAFETY: the proxy swap chain is live; the presenter serializes us.
+        // The proxy's own counter, read without waiting for its queue.
+        let count = unsafe { chain.GetLastPresentCount() }.unwrap_or(self.counted_presents);
+        WINDOW[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW[1].fetch_add(u64::from(count.saturating_sub(self.counted_presents)), Ordering::Relaxed);
+        self.counted_presents = count;
+    }
+
     /// After presenting frame `frame`: a failed generation switches it off;
     /// the first steady stretch is logged with the presents it made.
     pub(crate) fn presented(&mut self, chain: &IDXGISwapChain3, frame: u64) {
@@ -714,6 +754,13 @@ fn read(list: &HostList, copy: &Arc<HostTexture>, description: [u32; 8], barrier
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_rates_count_presents_and_rendered_frames() {
+        // 5 s of 60 rendered frames a second, each followed by one generated.
+        assert_eq!(rates(600, 300, 5.0), (120.0, 60.0));
+        assert_eq!(rates(0, 0, 0.0), (0.0, 0.0));
+    }
 
     #[test]
     fn without_the_dll_frame_generation_stays_off() {
