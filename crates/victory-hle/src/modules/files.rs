@@ -270,6 +270,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let flags = host_flags("CreateFileW", access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -281,6 +282,58 @@ pub extern "system" fn CreateFileW(
     )
 }
 
+/// Whether a title's read-only opens lose `FILE_FLAG_NO_BUFFERING` on the way
+/// to the host (`VICTORY_FILE_CACHE=0`: they keep it, as before). After
+/// Marvisak/VIctory#2667 (imjustprism's #2427): on the host the flag keeps
+/// every read out of the system file cache, so a title that opens its packs
+/// with it reads the same bytes from the drive on every launch.
+fn file_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FILE_CACHE").is_none_or(|v| v != "0");
+        tracing::info!(on, "files: read-only opens go through the host file cache (VICTORY_FILE_CACHE)");
+        on
+    })
+}
+
+/// The flags the host's open does not get: an open with `GENERIC_READ` and
+/// no other access loses `FILE_FLAG_NO_BUFFERING`. A buffered handle returns
+/// the same bytes for the same aligned reads, and takes reads that are not
+/// aligned, which an unbuffered one refuses. An overlapped open keeps the
+/// flag: the host's `ReadFileScatter` takes only a handle with both, and a
+/// buffered handle may finish an overlapped read inside the call.
+fn dropped_flags(access: u32, flags: u32) -> u32 {
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
+    if access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 { FILE_FLAG_NO_BUFFERING } else { 0 }
+}
+
+/// `flags` as the host's open gets them ([`dropped_flags`], when
+/// [`file_cache`] is on). Counts the title's unbuffered opens, so a log
+/// says whether the switch can change anything: the first 8 and every
+/// 256th are logged.
+fn host_flags(call: &str, access: u32, flags: u32) -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    static UNBUFFERED: AtomicU64 = AtomicU64::new(0);
+    if flags & FILE_FLAG_NO_BUFFERING == 0 {
+        return flags;
+    }
+    let dropped = if file_cache() { dropped_flags(access, flags) } else { 0 };
+    let n = UNBUFFERED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_multiple_of(256) {
+        tracing::info!(
+            call,
+            opens = n,
+            access = format_args!("{access:#x}"),
+            flags = format_args!("{flags:#x}"),
+            cached = dropped != 0,
+            "files: the title opened a file unbuffered (VICTORY_FILE_CACHE)"
+        );
+    }
+    flags & !dropped
+}
+
 pub extern "system" fn CreateFileA(
     path: *const c_char,
     access: u32,
@@ -290,6 +343,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let flags = host_flags("CreateFileA", access, flags);
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -767,6 +821,19 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a read-only open that is not overlapped loses the flag.
+    #[test]
+    fn read_only_opens_lose_no_buffering() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
+        let unbuffered = FILE_FLAG_NO_BUFFERING;
+        assert_eq!(dropped_flags(GENERIC_READ, unbuffered), FILE_FLAG_NO_BUFFERING);
+        assert_eq!(dropped_flags(GENERIC_READ, 0), FILE_FLAG_NO_BUFFERING, "a flag not set stays unset");
+        assert_eq!(dropped_flags(GENERIC_READ, unbuffered | FILE_FLAG_OVERLAPPED), 0);
+        assert_eq!(dropped_flags(GENERIC_READ | GENERIC_WRITE, unbuffered), 0);
+        assert_eq!(unbuffered & !dropped_flags(GENERIC_READ, unbuffered), 0);
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
