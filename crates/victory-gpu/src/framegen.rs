@@ -442,7 +442,7 @@ pub(crate) fn window_line(seconds: f64) {
     }
     let (displayed, rendered_fps) = rates(presents, rendered, seconds);
     tracing::info!(
-        "framegen: {presents} presents for {rendered} rendered frames in the last {seconds:.1} s (displayed fps          {displayed:.1}, rendered fps {rendered_fps:.1}; {generated} frames generated)"
+        "framegen: {presents} presents for {rendered} rendered frames in the last {seconds:.1} s (displayed fps {displayed:.1}, rendered fps {rendered_fps:.1}; {generated} frames generated)"
     );
 }
 
