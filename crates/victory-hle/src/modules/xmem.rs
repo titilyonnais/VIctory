@@ -972,11 +972,18 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
 /// milliseconds in all, the longest one's and waiting for the lock; the same
 /// of the GPU's page-mapping copies ([`map_alias`]; calls and milliseconds);
 /// and by system call (unmap, split, map, commit) how many and their
-/// milliseconds.
-static MAPPING: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+/// milliseconds. Then pages the GPU's copies were to show somewhere and
+/// those of them the address showed already, pages they were to take away,
+/// and the same two of the title's own calls.
+static MAPPING: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+
+/// Whether `[at, at + PAGE)` shows `slice` already.
+fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
+    physical.slice_at(at).is_some_and(|there| Arc::ptr_eq(&there.section, &slice.section) && there.index == slice.index)
+}
 
 pub(crate) fn map_costs() -> Option<String> {
-    let n: [u64; 15] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
+    let n: [u64; 20] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
     let time = |i: usize| matches!(i, 2 | 3 | 4 | 6 | 8 | 10 | 12 | 14);
     (n[0] + n[5] > 0).then(|| {
         let all: Vec<String> = n
@@ -1212,6 +1219,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
+    if super::dstorage::stream_log::on()
+        && let Some(pages) = &pages
+    {
+        let table = page_table();
+        let same = pages
+            .iter()
+            .enumerate()
+            .filter(|(i, page)| table.pages.get(page).is_some_and(|slice| shows(&physical, base + i * PAGE, slice)))
+            .count();
+        MAPPING[18].fetch_add(n as u64, Ordering::Relaxed);
+        MAPPING[19].fetch_add(same as u64, Ordering::Relaxed);
+    }
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
@@ -1296,6 +1315,18 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+    if super::dstorage::stream_log::on() {
+        if from == 0 {
+            MAPPING[17].fetch_add((len / PAGE) as u64, Ordering::Relaxed);
+        } else {
+            let same = (0..len)
+                .step_by(PAGE)
+                .filter(|k| physical.slice_at(from + k).is_some_and(|slice| shows(&physical, to + k, &slice)))
+                .count();
+            MAPPING[15].fetch_add((len / PAGE) as u64, Ordering::Relaxed);
+            MAPPING[16].fetch_add(same as u64, Ordering::Relaxed);
+        }
+    }
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
