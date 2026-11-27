@@ -232,7 +232,7 @@ pub(crate) fn log(frames: f64) {
          (the longest one {:.1} ms); small read-backs {:.2} ms; the card's plan done {:.2} ms ({:.2} reading its looks); the \
          flight's own list {:.2} ms; the lists' tables {:.2} ms; {:.2} landings left their texture read-backs for a later \
          one and {:.2} read-backs were covered by a later one (VICTORY_TEXTURE_BACK_LATER=1); the runtime changed title \
-         memory's mapping {:.1} times, {:.2} ms waiting for readers and {:.2} ms changing (the longest change {:.1} ms)",
+         memory's mapping {:.1} times, {:.2} ms waiting for readers and {:.2} ms changing (the longest change {:.1} ms); of the changing, on our          side: {:.2} ms telling the placed textures, {:.2} the views in place, {:.2} what stays in place, {:.2} waiting for          the guards, {:.2} the read-backs' tickets",
         p[part::TEX],
         p[part::TEX_BYTES] / 1024.0,
         pms(part::TEX_HELD),
@@ -252,6 +252,11 @@ pub(crate) fn log(frames: f64) {
         remaps[1] as f64 / 1000.0 / frames,
         remaps[2] as f64 / 1000.0 / frames,
         remaps[3] as f64 / 1000.0,
+        remaps[4] as f64 / 1e6 / frames,
+        remaps[5] as f64 / 1e6 / frames,
+        remaps[6] as f64 / 1e6 / frames,
+        remaps[7] as f64 / 1e6 / frames,
+        remaps[8] as f64 / 1e6 / frames,
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \
