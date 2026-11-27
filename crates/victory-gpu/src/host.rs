@@ -5109,6 +5109,12 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        // Write-combining title memory stays on the card
+                        // (`VICTORY_SKIP_WC_BACK=1`).
+                        let title = r.shadow.span().0 as usize;
+                        if lo < hi && crate::wcback::leave(title + lo, title + hi) {
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -5486,6 +5492,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                let title = r.shadow.span().0 as usize;
+                if lo < hi && crate::wcback::leave(title + lo, title + hi) {
+                    continue;
+                }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
@@ -9587,6 +9597,17 @@ impl Meter {
                     slow[1] as f64 / 1e3 / frames,
                     slow[2] as f64 / 1e3
                 );
+                if crate::wcback::on() {
+                    let [n, bytes, ranges, kept] =
+                        [0, 1, 2, 3].map(|i| crate::wcback::LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    tracing::info!(
+                        "write-combining title memory not copied back, per frame (VICTORY_SKIP_WC_BACK): {n:.0} pieces \
+                         of copies in the card's memory left there ({:.1} MB); {ranges:.0} ranges of copies in the PC's \
+                         memory not snapshotted ({:.1} MB)",
+                        bytes / 1e6,
+                        kept / 1e6
+                    );
+                }
                 if crate::shadow::cards() {
                     let per_frame = |i: usize| card[i] as f64 / frames;
                     tracing::info!(

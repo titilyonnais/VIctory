@@ -3287,6 +3287,12 @@ impl Shadow {
             pending.push(range);
             return;
         }
+        // Write-combining title memory in a copy in the PC's memory
+        // (`VICTORY_SKIP_WC_BACK=2`): no snapshot, nothing compared or
+        // copied back; what shaders wrote stays in the copy.
+        if crate::wcback::leave_snapshot(range.0, range.1) {
+            return;
+        }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
