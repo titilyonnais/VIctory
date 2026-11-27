@@ -270,8 +270,9 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let asked = flags;
     let flags = host_flags("CreateFileW", access, flags);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let handle = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -279,7 +280,9 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    unbuffered_opened(asked, handle);
+    handle
 }
 
 /// Whether a title's read-only opens lose `FILE_FLAG_NO_BUFFERING` on the way
@@ -343,8 +346,9 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let asked = flags;
     let flags = host_flags("CreateFileA", access, flags);
-    match narrow(path) {
+    let handle = match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
@@ -367,6 +371,53 @@ pub extern "system" fn CreateFileA(
                 template,
             )
         }
+    };
+    unbuffered_opened(asked, handle);
+    handle
+}
+
+/// The handles the title opened with `FILE_FLAG_NO_BUFFERING` (a handful of
+/// packs), and the bytes its `ReadFile` has asked of them: a log then says
+/// whether the title reads those packs while it plays, not only at launch,
+/// so whether [`file_cache`] can matter for loads in play too. A closed
+/// handle's value may come back for another file; this only counts.
+static UNBUFFERED_HANDLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static ANY_UNBUFFERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn unbuffered_opened(asked: u32, handle: Handle) {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    if asked & FILE_FLAG_NO_BUFFERING == 0 || handle.is_null() || handle as isize == -1 {
+        return;
+    }
+    let mut handles = UNBUFFERED_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if handles.len() < 64 && !handles.contains(&(handle as usize)) {
+        handles.push(handle as usize);
+    }
+    ANY_UNBUFFERED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts a read of `len` bytes from `file` if the title opened it
+/// unbuffered; logs every 256 MiB.
+fn unbuffered_read(file: *mut c_void, len: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static READS: AtomicU64 = AtomicU64::new(0);
+    if !ANY_UNBUFFERED.load(Ordering::Relaxed)
+        || !UNBUFFERED_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(file as usize))
+    {
+        return;
+    }
+    const STEP: u64 = 256 << 20;
+    let reads = READS.fetch_add(1, Ordering::Relaxed) + 1;
+    let before = BYTES.fetch_add(u64::from(len), Ordering::Relaxed);
+    let after = before + u64::from(len);
+    if reads == 1 || before / STEP != after / STEP {
+        tracing::info!(
+            reads,
+            mib = after >> 20,
+            cached = file_cache(),
+            "files: the title's reads from the files it opened unbuffered (VICTORY_FILE_CACHE)"
+        );
     }
 }
 
@@ -589,6 +640,7 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    unbuffered_read(file, len);
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
