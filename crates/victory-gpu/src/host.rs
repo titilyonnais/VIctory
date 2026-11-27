@@ -2897,6 +2897,9 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// What those flights wrote through host copies is in title memory, and
+    /// their ranges are done with (`relay_land`): a refresh takes it there.
+    merged: bool,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2913,6 +2916,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    merged: false,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3827,6 +3831,7 @@ fn relay_worker() {
                     .collect();
                 if card_steps::stage() > 0 {
                     line.landing = card_steps::writers(&items);
+                    line.merged = false;
                 }
                 break Ok(items);
             }
@@ -5379,6 +5384,9 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        if card_steps::stage() > 0 {
+            line().merged = true;
+        }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
         let mut last = 0;
@@ -5432,11 +5440,13 @@ impl Host {
                 landed: kept,
                 in_hand,
                 landing,
+                merged,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
             landing.clear();
+            *merged = false;
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
