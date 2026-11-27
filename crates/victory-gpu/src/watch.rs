@@ -2444,10 +2444,13 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        let took = self.1.elapsed().as_micros() as u64;
+        REMAPPING[2].fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+        REMAPPING[3].fetch_max(took, std::sync::atomic::Ordering::Relaxed);
         // The change is done: what is there now may be guarded.
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
@@ -2601,10 +2604,24 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    let asked = std::time::Instant::now();
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let began = std::time::Instant::now();
+    REMAPPING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    REMAPPING[1].fetch_add((began - asked).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, began)
+}
+
+/// Changes of mapping ([`title_memory_remapping`]): how many, the
+/// microseconds they waited for readers, the microseconds they took, and
+/// the longest one.
+static REMAPPING: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`REMAPPING`] since it was last asked for (the landing's line).
+pub(crate) fn remapping_taken() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| REMAPPING[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
