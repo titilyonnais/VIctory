@@ -164,13 +164,56 @@ fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
 /// process goes (`VICTORY_LANE_CORE=1`): nothing else of it runs on the
 /// core's two threads. It was the one a frame waited for (94 % of it in a
 /// street), and shared its core's units with whatever ran beside it.
+/// (Also where all cores are alike, a Ryzen 5 5600's six: there no thread
+/// asked for anything, and the switch did nothing.)
 fn lane_core() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
+    match lane_mode() {
+        0 => false,
+        1 => true,
+        _ => LANE_TURN.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// `VICTORY_LANE_CORE`: 0 off, 1 on (`1`), 2 on and off in turn, twenty
+/// seconds each (`alt`: both sides measured in the same scene).
+fn lane_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LANE_CORE").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether [`lane_core`] is on now, where it is on and off in turn.
+static LANE_TURN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the turns of [`lane_mode`] 2, once.
+fn lane_turns() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let turn = || loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            LANE_TURN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            settle();
+        };
+        if let Err(error) = std::thread::Builder::new().name("victory-lane-turn".into()).spawn(turn) {
+            tracing::warn!(%error, "VICTORY_LANE_CORE=alt: no thread to take the turns");
+        }
+    });
+}
+
+/// Whether [`lane_core`] is on, or may come to be while the title runs.
+fn lane_asked() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_LANE_CORE").is_some() {
+        return true;
+    }
+    lane_mode() != 0
 }
 
 /// Threads that asked: a handle of each, and whether it is the submitting one.
@@ -260,8 +303,11 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but for the
+    // submitting thread where it is given a core of its own ([`lane_core`]:
+    // the process's other threads are then kept off that core, whatever
+    // their kind).
+    if fast.is_empty() && !(what == "victory-submit" && lane_asked() && one_core(&cpu_sets()).is_some()) {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -272,6 +318,9 @@ fn ask(what: &str, from: u32) {
     }
     ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit"));
     settle();
+    if what == "victory-submit" && lane_mode() == 2 {
+        lane_turns();
+    }
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
 
