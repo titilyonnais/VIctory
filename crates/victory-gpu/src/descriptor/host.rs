@@ -3991,7 +3991,7 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(own_twin_slot(twin, false) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4000,6 +4000,43 @@ fn buffer_srv(
         }
     }
     Some(Some(shadow.buffer.clone()))
+}
+
+/// Whether the raw twin at `twin` is a slot [`move_raw`] may change: this
+/// thread's own, in a heap the card does not see, where the handle points at
+/// the descriptor: the slot views are made in before they are copied
+/// ([`staged`]), or one of this thread's list views ([`ListViews`]).
+///
+/// The list views were not, and every twin made there that did not begin on
+/// 16 bytes was a null view: the culling dispatches make theirs there, and
+/// the tree culling (`InstanceCulling:CS_Tree_BatchCull`, 55679a0547649d0b)
+/// runs in two dispatches a frame whose second batch list begins right after
+/// the first one's entries; off 16 bytes it read zeros and its trees were not
+/// drawn that frame (whole trees and fences dropping out; some 850 null twins
+/// a frame walking in jouable7, 70 moved). A raw view made at the view's own
+/// dword instead (avatarmanz/VIctory-7900XTX#437) is a call D3D12 refuses
+/// (device removed, `DXGI_ERROR_INVALID_CALL`, branch distance2): the view is
+/// made on 16 bytes and moved. `VICTORY_TWIN_OFFSET=0`: list views' twins
+/// null, as before (`srv` or `uav`: only those of shader resource views, or
+/// of unordered access views). Read once.
+///
+/// With the list views' twins moved: 0 null twins a frame, no device loss,
+/// the island's far trees all there, and as many frames a second (runs
+/// d3-court2 and d3-court-off: 9.9 and 7.9, 21 and 26 ms on the card).
+fn own_twin_slot(twin: D3D12_CPU_DESCRIPTOR_HANDLE, uav: bool) -> bool {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    if staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) {
+        return true;
+    }
+    let (start, end) = LIST_SLOTS.get();
+    // (`srv` or `uav`: only those views' twins.)
+    let on = *ON.get_or_init(|| match std::env::var("VICTORY_TWIN_OFFSET").as_deref() {
+        Ok("0") => 0,
+        Ok("srv") => 1,
+        Ok("uav") => 2,
+        _ => 3,
+    });
+    on & (1 << u8::from(uav)) != 0 && (start..end).contains(&twin.ptr)
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4115,7 +4152,7 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(own_twin_slot(twin, true) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -5446,6 +5483,38 @@ mod tests {
         } else {
             assert_eq!(words(), before);
         }
+        // An unordered access view's twin, and one made in a list's views.
+        let views = ListViews::new().unwrap();
+        let at = views.slot(7);
+        assert!(own_twin_slot(at, true) && own_twin_slot(staged(false, 1).unwrap(), false));
+        let past = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: views.start + ListViews::SLOTS as usize * views.step };
+        assert!(!own_twin_slot(past, true), "past the list's views");
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 8,
+                    NumElements: 100,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: this thread's list views, a live buffer.
+        unsafe { host.device.CreateUnorderedAccessView(&buffer, None::<&ID3D12Resource>, Some(&desc), at) };
+        let mut before = [0u8; 16];
+        assert!(crate::host::read_into(at.ptr as *const u8, &mut before));
+        if move_raw(at, start, 400, 12) {
+            let mut moved = [0u8; 16];
+            assert!(crate::host::read_into(at.ptr as *const u8, &mut moved));
+            assert_eq!(moved[..8], (start + 12).to_le_bytes());
+            assert_eq!(moved[8..12], 388u32.to_le_bytes());
+            assert_eq!(moved[12..], before[12..]);
+        } else {
+            eprintln!("an unordered access view's descriptor is not moved here");
+        }
     }
 
     /// Views that begin where no host view can: raw ones off 16 bytes,
@@ -6139,6 +6208,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            LIST_SLOTS.set((start, start + Self::SLOTS as usize * step));
             Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
         }
     }
@@ -6151,6 +6221,8 @@ impl ListViews {
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+    /// The handles of this thread's [`ListViews`] slots (see [`own_twin_slot`]).
+    static LIST_SLOTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.
