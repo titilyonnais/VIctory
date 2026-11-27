@@ -2249,9 +2249,6 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
-    // (The kernel does not fault into the handler that takes pieces left on
-    // the card back.)
-    crate::wcback::take_back(at, len, crate::wcback::Why::Kernel);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2268,6 +2265,10 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
             g.kernel.push((first, last));
         }
     }
+    // The kernel does not fault into the handler that takes pieces left on
+    // the card back: they come back first (after the range is noted, which
+    // keeps new ones from being left there).
+    crate::wcback::take_back(at, len, crate::wcback::Why::Kernel);
     crate::descriptor::host::remapped(at, len);
     KernelWrite(first, if len == 0 { first } else { last })
 }
@@ -2908,6 +2909,12 @@ fn not_rearmed(at: Option<usize>) {
             "guard not re-armed: a copy of title memory took a guard page and it could not be set again (0: no address)"
         );
     }
+}
+
+/// Whether the kernel is writing some of `[from, to)` ([`kernel_writing`]).
+pub(crate) fn kernel_busy(from: usize, to: usize) -> bool {
+    let (first, last) = (from / BLOCK, to.div_ceil(BLOCK));
+    guards().kernel.iter().any(|&(a, b)| a < last && b > first)
 }
 
 /// Whether `at` is committed read-write memory now.

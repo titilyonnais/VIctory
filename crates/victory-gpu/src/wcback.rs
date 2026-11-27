@@ -261,8 +261,92 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Whether a piece was ever left (faults are looked at from then on).
 static EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn table() -> std::sync::MutexGuard<'static, Table> {
-    TABLE.lock().unwrap_or_else(|e| e.into_inner())
+/// What holds the table's lock, for the watchdog: the phase (0: nothing),
+/// the thread, and since when (milliseconds since the start).
+static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Threads waiting for the table's lock.
+static WAITING: AtomicU64 = AtomicU64::new(0);
+/// Faults let go on because their memory was let in meanwhile, and the last
+/// such address: a storm of them is an access that cannot be made.
+static AGAIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Set when fetching from the card failed or took too long: nothing more is
+/// left on the card.
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn millis() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// The table's lock, held for `phase` (1 leaving, 2 a fault, 3 taking back,
+/// 4 for another copy, 5 tending).
+struct Held(std::sync::MutexGuard<'static, Table>);
+
+impl std::ops::Deref for Held {
+    type Target = Table;
+    fn deref(&self) -> &Table {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD[0].store(0, Ordering::Release);
+    }
+}
+
+fn table(phase: u64) -> Held {
+    WAITING.fetch_add(1, Ordering::Relaxed);
+    let guard = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    WAITING.fetch_sub(1, Ordering::Relaxed);
+    // SAFETY: no arguments.
+    HELD[1].store(u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }), Ordering::Relaxed);
+    HELD[2].store(millis(), Ordering::Relaxed);
+    HELD[0].store(phase, Ordering::Release);
+    Held(guard)
+}
+
+/// Once: a thread that says, twice a second, when the table's lock has been
+/// held for more than a second (which phase, which thread, how many wait),
+/// or when faults keep being let go on at one address.
+fn watchdog() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("wc-lazy watchdog".into()).spawn(|| {
+            let (mut said, mut again) = (0u64, 0u64);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let (phase, since) = (HELD[0].load(Ordering::Acquire), HELD[2].load(Ordering::Relaxed));
+                let held = millis().saturating_sub(since);
+                if phase != 0 && held > 1000 && since != said {
+                    said = since;
+                    tracing::error!(
+                        phase,
+                        thread = HELD[1].load(Ordering::Relaxed),
+                        held_ms = held,
+                        waiting = WAITING.load(Ordering::Relaxed),
+                        "VICTORY_WC_LAZY: the table's lock is held for long (1 leaving, 2 a fault, 3 taking back, \
+                         4 for another copy, 5 tending)"
+                    );
+                }
+                let now = AGAIN[0].load(Ordering::Relaxed);
+                if now - again > 5000 {
+                    tracing::error!(
+                        faults = now - again,
+                        at = format_args!("{:#x}", AGAIN[1].load(Ordering::Relaxed)),
+                        "VICTORY_WC_LAZY: faults let go on again and again in half a second"
+                    );
+                }
+                again = now;
+            }
+        });
+    });
 }
 
 thread_local! {
@@ -350,14 +434,17 @@ fn mapped(from: usize, to: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        // (Read-only where the guards made it so, not where it is meant to be.)
+        let guarded = || crate::watch::guarded(at, end.min(to));
         if n == 0
             || info.State != MEM_COMMIT
             || info.Type != MEM_MAPPED
-            || !matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY)
+            || !(info.Protect == PAGE_READWRITE || (info.Protect == PAGE_READONLY && guarded()))
         {
             return false;
         }
-        at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        at = end;
     }
     true
 }
@@ -373,7 +460,10 @@ fn let_in(from: usize, len: usize, view: bool) {
     for block in (from..from + len).step_by(BLOCK) {
         let n = BLOCK.min(from + len - block);
         let guarded = crate::watch::guarded(block, block + n);
-        let _ = protect(block, n, if guarded { PAGE_READONLY } else { PAGE_READWRITE });
+        if protect(block, n, if guarded { PAGE_READONLY } else { PAGE_READWRITE }).is_none() {
+            // (A view that cannot be made writable: readable at least.)
+            let _ = protect(block, n, PAGE_READONLY);
+        }
     }
 }
 
@@ -438,7 +528,11 @@ pub(crate) fn leave(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
         count_left(hi - lo);
         return true;
     }
+    watchdog();
     tend();
+    if DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
     leave_lazy(shadow, lo, hi)
 }
 
@@ -452,7 +546,10 @@ fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     let (from, len) = (shadow.span().0 as usize + lo, hi - lo);
     let id = shadow.id();
-    let mut t = table();
+    let Some(_inside) = Inside::enter() else {
+        return false;
+    };
+    let mut t = table(1);
     if t.left.contains_key(&(from, id)) {
         count_left(len);
         return true;
@@ -493,6 +590,11 @@ fn leave_lazy(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
                 return false;
             }
         }
+    }
+    // (The kernel does not fault: what it is writing stays as it is.)
+    if spans.iter().any(|&(a, n)| crate::watch::kernel_busy(a, a + n)) {
+        NOT[REFUSED].fetch_add(1, Ordering::Relaxed);
+        return false;
     }
     for (k, &(a, n)) in spans.iter().enumerate() {
         let fine = match protect(a, n, PAGE_NOACCESS) {
@@ -553,7 +655,11 @@ fn take_back_keys(t: &mut Table, keys: &[(usize, u64)], why: Why, at: usize, cod
             put += p.shadow.lazy_merge(p.lo, &card[offset..offset + p.len], &mut title).unwrap_or(0);
             t.landed.push((*from, p.len));
         } else if LOST.fetch_add(1, Ordering::Relaxed) == 0 {
-            tracing::warn!(at = format_args!("{from:#x}"), "VICTORY_WC_LAZY: a piece could not be fetched from the card");
+            DISABLED.store(true, Ordering::Relaxed);
+            tracing::error!(
+                at = format_args!("{from:#x}"),
+                "VICTORY_WC_LAZY: a piece could not be fetched from the card (in time): nothing more is left there"
+            );
         }
         offset += p.len;
         bytes += p.len as u64;
@@ -623,13 +729,18 @@ pub(crate) fn on_fault(at: usize, write: bool, code: usize) -> bool {
     let Some(_inside) = Inside::enter() else {
         return false;
     };
-    let mut t = table();
+    let mut t = table(2);
     let keys = together_in(&t, &[(at, at + 1)]);
     if !keys.is_empty() {
         take_back_keys(&mut t, &keys, if write { Why::Write } else { Why::Read }, at, code);
         return true;
     }
-    t.ever.contains(&(at / BLOCK)) && accessible(at, write)
+    let again = t.ever.contains(&(at / BLOCK)) && accessible(at, write);
+    if again {
+        AGAIN[0].fetch_add(1, Ordering::Relaxed);
+        AGAIN[1].store(at as u64, Ordering::Relaxed);
+    }
+    again
 }
 
 /// Something other than the title's CPU is about to touch `[at, at + len)`
@@ -641,7 +752,7 @@ pub(crate) fn take_back(at: usize, len: usize, why: Why) {
     let Some(_inside) = Inside::enter() else {
         return;
     };
-    let mut t = table();
+    let mut t = table(3);
     let keys = together_in(&t, &[(at, at.saturating_add(len.max(1)))]);
     if !keys.is_empty() {
         take_back_keys(&mut t, &keys, why, at, 0);
@@ -659,7 +770,7 @@ pub(crate) fn take_back_for(asker: Option<u64>, from: usize, to: usize) {
     let Some(_inside) = Inside::enter() else {
         return;
     };
-    let mut t = table();
+    let mut t = table(4);
     // The pieces of other copies with a span there, and with them what
     // shares their pages.
     let others: Vec<(usize, usize)> = t
@@ -698,8 +809,11 @@ pub(crate) fn any_left() -> bool {
 /// back and are let go, and the first notes are said.
 fn tend() {
     let frame = crate::frame::current();
+    let Some(inside) = Inside::enter() else {
+        return;
+    };
     let (landed, notes, grave, orphans) = {
-        let mut t = table();
+        let mut t = table(5);
         if t.frame == frame {
             return;
         }
@@ -711,14 +825,13 @@ fn tend() {
         let orphans: HashSet<u64> = held.into_iter().filter(|(_, (n, all))| n == all).map(|(id, _)| id).collect();
         (std::mem::take(&mut t.landed), std::mem::take(&mut t.notes), std::mem::take(&mut t.grave), orphans)
     };
-    if !orphans.is_empty()
-        && let Some(_inside) = Inside::enter()
-    {
-        let mut t = table();
+    if !orphans.is_empty() {
+        let mut t = table(5);
         let keys: Vec<(usize, u64)> = t.left.keys().filter(|k| orphans.contains(&k.1)).copied().collect();
         let keys = together_in(&t, &keys.iter().map(|k| (k.0, k.0 + 1)).collect::<Vec<_>>());
         take_back_keys(&mut t, &keys, Why::Orphan, 0, 0);
     }
+    drop(inside);
     for (at, len) in landed {
         crate::watch::landing(at, len);
     }
@@ -868,7 +981,11 @@ impl Gpu {
                 self.queue.Signal(&self.fence, self.value)?;
                 if self.fence.GetCompletedValue() < self.value {
                     self.fence.SetEventOnCompletion(self.value, self.event)?;
-                    windows::Win32::System::Threading::WaitForSingleObject(self.event, windows::Win32::System::Threading::INFINITE);
+                    // Not forever: a fault waits on this.
+                    let waited = windows::Win32::System::Threading::WaitForSingleObject(self.event, 2000);
+                    if waited != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                        return Err(windows::core::Error::empty());
+                    }
                 }
                 out.extend_from_slice(std::slice::from_raw_parts(self.data, bytes));
             }
