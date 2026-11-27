@@ -28,9 +28,8 @@ pub mod structure;
 /// how many came out different: if any did, the bump was due.
 /// 7: d16 accesses of a typed view in a table ask the host's word for its
 /// kind too (an integer view's halves are integers, not f16); 4 to 6 are
-/// other branches'. 11: renderer port 5's constant buffers read as raw
-/// bytes (`VICTORY_PORT_CBV=1`); 8 to 10 are other branches'.
-pub const TRANSLATOR_VERSION: u32 = 11;
+/// other branches'.
+pub const TRANSLATOR_VERSION: u32 = 7;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
