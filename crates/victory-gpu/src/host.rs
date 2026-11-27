@@ -3939,6 +3939,7 @@ impl RelayBack {
         land::spent(land::stat::BACK, merging);
         for ((_, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            crate::wc::back(*from, written);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -4347,6 +4348,7 @@ fn hand_back(back: &[Declared]) {
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(*from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -4379,6 +4381,7 @@ fn hand_back(back: &[Declared]) {
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }
@@ -5269,7 +5272,9 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    let landed = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
+                    crate::wc::back(run[0].0.span().0 as usize + run[0].1, landed);
+                    put.fetch_add(landed, Ordering::Relaxed);
                 }
                 notes.flush();
                 land::spent(land::stat::CARD_ALL, working);
@@ -5288,6 +5293,7 @@ impl Host {
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
+                crate::wc::back(shadow.span().0 as usize + *lo, merged as u64);
                 written += merged as u64;
             }
         }
@@ -5582,6 +5588,7 @@ impl Host {
         for (r, written) in plan.ranges.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
+            crate::wc::back(from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
             let _ = (from, to);
@@ -6164,7 +6171,18 @@ impl Host {
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
-        let picked = crate::picked::declare(runs);
+        let mut picked = crate::picked::declare(runs);
+        // Into write-combined title memory: the card keeps it
+        // (`VICTORY_WC_NO_BACK`), as with `HostList::defer_gpu_write`.
+        if crate::wc::no_back() {
+            picked.written.retain(|(shadow, at, len)| {
+                let keep = !crate::wc::skip_back(*at, *len, shadow.carded(), shadow.watched_known());
+                if !keep {
+                    shadow.card_owns(*at, *len);
+                }
+                keep
+            });
+        }
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
@@ -7502,6 +7520,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // Into write-combined title memory: the card keeps it, nothing is
+        // declared (`VICTORY_WC_NO_BACK`).
+        if crate::wc::skip_back(address, len, shadow.carded(), shadow.watched_known()) {
+            shadow.card_owns(address, len);
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
@@ -7919,6 +7943,7 @@ impl HostList {
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
+                        crate::wc::up(src, len as u64);
                         continue;
                     }
                     let started = std::time::Instant::now();
@@ -8000,6 +8025,15 @@ impl HostList {
             };
             us += started.elapsed();
             bytes += copied as u64;
+            if crate::wc::on() {
+                let at = match step {
+                    &Step::Copy(dst, ..) => dst,
+                    &Step::Fill(_, src, ..) => src,
+                    Step::Placed(p) => p.src,
+                    _ => 0,
+                };
+                crate::wc::up(at, copied as u64);
+            }
         }
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
@@ -8529,6 +8563,7 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
+        crate::wc::up(from, copied as u64);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
@@ -8833,6 +8868,7 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let _census = crate::census::tag();
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8964,6 +9000,7 @@ fn zero(to: *mut u8, n: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    let _census = crate::census::tag();
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -9426,6 +9463,8 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
+            let wc_sample = crate::wc::take(frames);
+            crate::census::arm();
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9605,6 +9644,8 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                crate::wc::log(wc_sample);
+                crate::census::log();
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
