@@ -9704,7 +9704,14 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // With frame generation, the frames shown (generated ones included)
+        // first, then the frames the title rendered.
+        let text = match crate::framegen::displayed_fps() {
+            Some(shown) => format!(
+                " | VIctory {shown:.0} fps affichées ({fps:.0} calculées) {ms:.1} ms/frame {draws:.0} draws/frame"
+            ),
+            None => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

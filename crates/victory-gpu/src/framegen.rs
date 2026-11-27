@@ -433,14 +433,27 @@ fn rates(presents: u64, rendered: u64, seconds: f64) -> (f64, f64) {
     (presents as f64 / seconds, rendered as f64 / seconds)
 }
 
+/// The displayed rate of the last window (f64 bits; 0 when no frame went
+/// through a proxy swap chain), for the window caption.
+static LAST_DISPLAYED: AtomicU64 = AtomicU64::new(0);
+
+/// Frames displayed per second over the last window, generated ones
+/// included; `None` while frame generation is not presenting.
+pub(crate) fn displayed_fps() -> Option<f64> {
+    let v = f64::from_bits(LAST_DISPLAYED.load(Ordering::Relaxed));
+    (v > 0.0).then_some(v)
+}
+
 /// The line of the frames displayed over the last `seconds` (the 5 s of the
 /// frame meter); nothing when no frame went through a proxy swap chain.
 pub(crate) fn window_line(seconds: f64) {
     let [rendered, presents, generated] = [0, 1, 2].map(|i| WINDOW[i].swap(0, Ordering::Relaxed));
     if rendered == 0 && presents == 0 {
+        LAST_DISPLAYED.store(0f64.to_bits(), Ordering::Relaxed);
         return;
     }
     let (displayed, rendered_fps) = rates(presents, rendered, seconds);
+    LAST_DISPLAYED.store(displayed.to_bits(), Ordering::Relaxed);
     tracing::info!(
         "framegen: {presents} presents for {rendered} rendered frames in the last {seconds:.1} s (displayed fps {displayed:.1}, rendered fps {rendered_fps:.1}; {generated} frames generated)"
     );
