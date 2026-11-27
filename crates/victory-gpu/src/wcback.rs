@@ -22,42 +22,21 @@ use std::sync::{Mutex, OnceLock};
 /// The console protection's write-combining bit.
 const WRITE_COMBINE: u32 = 0x400;
 
-/// `VICTORY_SKIP_WC_BACK`: 0 (unset) copies everything back; 1 leaves the
-/// pieces of copies in the card's memory there; 2 also takes no snapshot of
-/// copies in the PC's memory, so nothing of them is compared or copied back.
-fn level() -> u8 {
-    static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        let level = match std::env::var("VICTORY_SKIP_WC_BACK").as_deref() {
-            Ok("1") => 1,
-            Ok("2") => 2,
-            _ => 0,
-        };
-        if level > 0 {
+/// Whether pieces of write-combining title memory stay on the card. (Leaving
+/// copies in the PC's memory alone as well, with no snapshot and no compare,
+/// was tried: the picture went black.)
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SKIP_WC_BACK").is_some_and(|v| v == "1");
+        if on {
             tracing::warn!(
-                "VICTORY_SKIP_WC_BACK={level}: what shaders wrote to copies of write-combining title memory is not \
-                 copied back ({}; experiment)",
-                if level == 1 { "copies in the card's memory" } else { "copies in the card's memory and in the PC's" }
+                "VICTORY_SKIP_WC_BACK=1: what shaders wrote to copies in the card's memory of write-combining title \
+                 memory is not copied back (experiment)"
             );
         }
-        level
+        on
     })
-}
-
-/// Whether pieces of write-combining title memory stay on the card.
-pub(crate) fn on() -> bool {
-    level() >= 1
-}
-
-/// Whether a range shaders write of a copy in the PC's memory, `[from, to)`
-/// of title memory, is left to the copy: no snapshot, no copy-back.
-pub(crate) fn leave_snapshot(from: usize, to: usize) -> bool {
-    if level() < 2 || !runs().all_wc(from, to) {
-        return false;
-    }
-    LEFT[2].fetch_add(1, Ordering::Relaxed);
-    LEFT[3].fetch_add((to - from) as u64, Ordering::Relaxed);
-    true
 }
 
 /// Title memory known to be write-combining, by start: the end of each run.
@@ -150,9 +129,8 @@ pub fn title_memory_released(at: usize, len: usize) {
     r.cut(at, at.saturating_add(len));
 }
 
-/// Per frame: pieces left on the card and their bytes; ranges of copies in
-/// the PC's memory left to them and their bytes.
-pub(crate) static LEFT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Per frame: pieces left on the card and their bytes.
+pub(crate) static LEFT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the piece `[from, to)` of title memory stays on the card: the
 /// switch is on and it is all write-combining.
