@@ -197,14 +197,85 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// Whether a read-back that meets a change of title memory's mapping is left
+/// for a later landing instead of waited with (`VICTORY_TEXTURE_BACK_LATER=1`;
+/// off by default).
+///
+/// While the title loads, the runtime maps and unmaps its pages all the time,
+/// and each of the sixteen or so read-backs of a frame waited its turn behind
+/// one of those changes: 40 to 650 ms a frame of the landing thread, with
+/// every flight behind it. The texels are a frame late in title memory then,
+/// which is what a title read before the list has run sees anyway.
+pub(crate) fn later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_BACK_LATER"))
+}
+
+/// Read-backs left for a later landing, oldest first, and since when the
+/// oldest is.
+static LEFT: Mutex<(Vec<Back>, Option<std::time::Instant>)> = Mutex::new((Vec::new(), None));
+
+/// How long read-backs are left at most: then the landing waits for the
+/// mapping to hold still, as without the switch.
+const LEFT_AT_MOST: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// [`land`] for all of a list's read-backs, behind the ones left before
+/// ([`later`]): at once if no mapping is being changed, at a later landing
+/// otherwise. One hold of the mapping for all of them, and of several into
+/// one allocation only the last is tiled, which is what they would leave.
+pub(crate) fn land_later(backs: Vec<Back>) {
+    use crate::land::part;
+    let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    if backs.is_empty() && left.0.is_empty() {
+        return;
+    }
+    let began = std::time::Instant::now();
+    left.0.extend(backs);
+    let _mapping = match crate::watch::title_memory_reading_now() {
+        Some(reading) => reading,
+        None if left.1.is_none_or(|since| since.elapsed() < LEFT_AT_MOST) => {
+            left.1.get_or_insert(began);
+            crate::land::part_count(part::TEX_LEFT, 1);
+            return;
+        }
+        None => {
+            let reading = crate::watch::title_memory_reading();
+            crate::land::part(part::TEX_HELD, began);
+            reading
+        }
+    };
+    left.1 = None;
+    let backs = std::mem::take(&mut left.0);
+    for (i, back) in backs.iter().enumerate() {
+        let covered = backs[i + 1..].iter().any(|last| {
+            last.ticket.owner == back.ticket.owner
+                && last.range() == back.range()
+                && last.footprints.len() == back.footprints.len()
+                && last.ticket.valid.load(Ordering::Acquire)
+        });
+        if covered {
+            crate::land::part_count(part::TEX_COVERED, 1);
+        } else {
+            land_held(back, std::time::Instant::now());
+        }
+    }
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
+    let began = std::time::Instant::now();
+    let _mapping = crate::watch::title_memory_reading();
+    crate::land::part(crate::land::part::TEX_HELD, began);
+    land_held(back, began);
+}
+
+/// [`land`], by a thread that holds the mapping
+/// ([`crate::watch::title_memory_reading`]).
+fn land_held(back: &Back, began: std::time::Instant) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     use crate::land::part;
-    let began = std::time::Instant::now();
-    let _mapping = crate::watch::title_memory_reading();
-    let at_part = crate::land::part(part::TEX_HELD, began);
+    let at_part = std::time::Instant::now();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     let at_part = crate::land::part(part::TEX_TICKETS, at_part);
     if !back.ticket.valid.load(Ordering::Acquire) {

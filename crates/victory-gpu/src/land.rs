@@ -154,7 +154,12 @@ pub(crate) mod part {
     pub(crate) const OWN: usize = 10;
     /// The lists' tables given back.
     pub(crate) const TABLES: usize = 11;
-    pub(crate) const COUNT: usize = 12;
+    /// With `VICTORY_TEXTURE_BACK_LATER=1`: landings that left their texture
+    /// read-backs for a later one, and read-backs not tiled as a later one
+    /// into the same allocation was.
+    pub(crate) const TEX_LEFT: usize = 12;
+    pub(crate) const TEX_COVERED: usize = 13;
+    pub(crate) const COUNT: usize = 14;
 }
 
 static PARTS: [AtomicU64; part::COUNT] = [const { AtomicU64::new(0) }; part::COUNT];
@@ -220,11 +225,14 @@ pub(crate) fn log(frames: f64) {
     );
     let p: Vec<f64> = PARTS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let pms = |i: usize| p[i] / 1000.0;
+    let remaps = crate::watch::remapping_taken();
     tracing::info!(
         "read-backs and lists of the landing, per frame: {:.1} texture read-backs of {:.0} KB: {:.2} ms waiting for title memory \
          to hold still, {:.2} waiting for the tickets, {:.2} reading the title's bytes, {:.2} tiling, {:.2} writing them back \
          (the longest one {:.1} ms); small read-backs {:.2} ms; the card's plan done {:.2} ms ({:.2} reading its looks); the \
-         flight's own list {:.2} ms; the lists' tables {:.2} ms",
+         flight's own list {:.2} ms; the lists' tables {:.2} ms; {:.2} landings left their texture read-backs for a later \
+         one and {:.2} read-backs were covered by a later one (VICTORY_TEXTURE_BACK_LATER=1); the runtime changed title \
+         memory's mapping {:.1} times, {:.2} ms waiting for readers and {:.2} ms changing (the longest change {:.1} ms)",
         p[part::TEX],
         p[part::TEX_BYTES] / 1024.0,
         pms(part::TEX_HELD),
@@ -238,6 +246,12 @@ pub(crate) fn log(frames: f64) {
         pms(part::LOOKS),
         pms(part::OWN),
         pms(part::TABLES),
+        p[part::TEX_LEFT],
+        p[part::TEX_COVERED],
+        remaps[0] as f64 / frames,
+        remaps[1] as f64 / 1000.0 / frames,
+        remaps[2] as f64 / 1000.0 / frames,
+        remaps[3] as f64 / 1000.0,
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \

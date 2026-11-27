@@ -4289,8 +4289,13 @@ pub(crate) fn walls_trace() -> bool {
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
+    if crate::texback::later() {
+        let backs = std::mem::take(&mut list.deferred().texture_backs);
+        crate::texback::land_later(backs);
+    } else {
+        for back in &list.deferred().texture_backs {
+            crate::texback::land(back);
+        }
     }
     let small = std::time::Instant::now();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
