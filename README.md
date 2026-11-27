@@ -9,6 +9,8 @@
 
 | Branch | What it has | Checked in game |
 |---|---|---|
+| `jouable7` | `jouable4` + texture occlusion refresh (objects no longer vanish with distance), cross-copy refreshes copied on the card (`VICTORY_REFRESH_WAIT=2`, steadier shadows), Belobug 5d6bd84, faces that move (avatarmanz #114), live video textures (#390), dynamic descriptor slots back to the heap that gave them (#392), avatarmanz #383 #404 #405 #410 #412 #402, PC FSR 4.1.2 to 4K (Belobug cd8dfc0) and FidelityFX frame generation 3 (#53), scripted keys in release | automated release runs (fixed daytime save, city): 0 crash, 11.6 fps median (p10 10.8, worst frame 95 ms) without FSR; with FSR 4 + frame generation: 10.4 fps rendered, **20.9 fps displayed** (median over 5 min) |
+| `rt-materiel` | `jouable6` + avatarmanz 77137b9 (`VICTORY_AMBIENT_RT`) + hardware BVH node test (#317, `VICTORY_HW_BVH=1`) | ray tracing on (`VICTORY_BVH_BUILDER=1`): 0 crash, 6.6 fps (11.2 without), card time 55 ms |
 | `jouable4` | `pipelines-rdna4` + `indirect` (a landed flight's descriptor table slots go back when it lands, not after the bury lag; `VICTORY_EARLY_TABLES=0` restores the old behaviour) + `rendu` (avatarmanz/VIctory-7900XTX #353 early depth, #354 killed lanes of a live quad, #314 reflection stand-in; `TRANSLATOR_VERSION` 3) | played outdoors at Jason's house: no more sky/texture glitches, no black character, no ghosting; 0 indirect executions dropped (1,000-1,700 a frame before), 0 compiler crash; about 8.5 fps on average (1.6 to 11.9) |
 | `pipelines-rdna4` | `jouable` + the AMD compiler-crash fixes: resource handles reused within their block only, a raw view's size through a handle of its own (avatarmanz/VIctory-7900XTX #357), RDNA 4 detected by both the game host and `victory translate`; `TRANSLATOR_VERSION` 2 | 43 of 43 compute programs that crashed `amdxc64.dll` (+0x861b9f, read of 0x8) now build (0 of 43 before); a 10-minute run: no compiler crash, no pipeline left out, stable picture indoors. Outdoors not checked yet |
 | `jouable` | `avatar-maj` + `memoire-32g` + smooth input (Raw Input, cursor kept in the window) + stretched-triangle fix (`VICTORY_REFRESH_WAIT`) | two runs with camera turns (25 and 15 min), no crash; with the triangle fix off (`VICTORY_REFRESH_WAIT=0`): 11.8 fps median, 11 at worst, worst frame 180 ms; with it on: 6.9 median. One device removal after 26 minutes of play in the release build |
@@ -20,7 +22,7 @@ Before this change of base, the older branch (official main + ~45 pull requests,
 ### Build and run
 
 ```powershell
-git switch jouable4           # or pipelines-rdna4, jouable, memoire-32g, avatar-maj
+git switch jouable7           # or jouable4, rt-materiel, pipelines-rdna4
 copy victory.example.toml victory.toml   # then set game_dir, cache_dir, data_dir
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders   # translate every shader once per translator version
@@ -28,6 +30,9 @@ scripts\play.ps1 -Exe <path to game_scarlett_master.exe>
 ```
 
 To avoid hitches when a scene is met again: play once with `VICTORY_PIPELINE_BOOK=1` (the game's pipelines are written down in the cache), then run `victory warm --used` before the next session (3,850 pipelines in about 2 minutes here).
+
+
+FSR 4 and frame generation (`jouable7`): download the official AMD FidelityFX SDK 2.4.0 `signedbin` DLLs yourself, then set `VICTORY_FIDELITYFX_DIR=<folder>`, `VICTORY_FSR_4K=quality` and `VICTORY_FIDELITYFX_FRAMEGEN=1`. `VICTORY_SKIP_BINK=1` skips the intro movies.
 
 ### Keyboard (branches `clavier`, `avatar-maj`, `memoire-32g`, `jouable`, `pipelines-rdna4`)
 
