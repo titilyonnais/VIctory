@@ -1272,6 +1272,9 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
+        // (Pieces of buffers' copies left on the card there are taken back
+        // first, else it would not find them written.)
+        crate::wcback::take_back_for(None, start, start + size);
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;

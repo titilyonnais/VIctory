@@ -2249,6 +2249,9 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    // (The kernel does not fault into the handler that takes pieces left on
+    // the card back.)
+    crate::wcback::take_back(at, len, crate::wcback::Why::Kernel);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2634,6 +2637,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    crate::wcback::take_back(at, len, crate::wcback::Why::Copy);
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -2658,6 +2662,11 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    if crate::wcback::any_left() {
+        // (If the call fails, the memory stays, with the card's bytes.)
+        let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+        crate::wcback::take_back(at, len, crate::wcback::Why::Copy);
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2754,6 +2763,19 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // Title memory of pieces left on the card (`crate::wcback`), read or
+        // written, by anyone: they are taken back first.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && matches!(r.ExceptionInformation[0], READ | WRITE)
+            && crate::wcback::on_fault(
+                r.ExceptionInformation[1],
+                r.ExceptionInformation[0] == WRITE,
+                r.ExceptionAddress as usize,
+            )
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);

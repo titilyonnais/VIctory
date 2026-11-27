@@ -5110,9 +5110,8 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         // Write-combining title memory stays on the card
-                        // (`VICTORY_SKIP_WC_BACK=1`).
-                        let title = r.shadow.span().0 as usize;
-                        if lo < hi && crate::wcback::leave(title + lo, title + hi) {
+                        // (`VICTORY_SKIP_WC_BACK=1`, `VICTORY_WC_LAZY=1`).
+                        if lo < hi && crate::wcback::leave(&r.shadow, lo, hi) {
                             continue;
                         }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
@@ -5492,8 +5491,7 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                let title = r.shadow.span().0 as usize;
-                if lo < hi && crate::wcback::leave(title + lo, title + hi) {
+                if lo < hi && crate::wcback::leave(&r.shadow, lo, hi) {
                     continue;
                 }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
@@ -9597,14 +9595,7 @@ impl Meter {
                     slow[1] as f64 / 1e3 / frames,
                     slow[2] as f64 / 1e3
                 );
-                if crate::wcback::on() {
-                    let [n, bytes] = [0, 1].map(|i| crate::wcback::LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                    tracing::info!(
-                        "write-combining title memory not copied back, per frame (VICTORY_SKIP_WC_BACK=1): {n:.0} pieces \
-                         of copies in the card's memory left there ({:.1} MB)",
-                        bytes / 1e6
-                    );
-                }
+                crate::wcback::meter(frames);
                 if crate::shadow::cards() {
                     let per_frame = |i: usize| card[i] as f64 / frames;
                     tracing::info!(

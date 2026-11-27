@@ -671,6 +671,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
         }
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         // (What it finds written stays noted for the next refresh.)
+        crate::wcback::take_back_for(Some(shadow.id), start, end);
         let Some((_, written)) = crate::watch::writes(start, end, true) else {
             continue;
         };
@@ -2310,6 +2311,12 @@ fn under_wide() -> bool {
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
+    put_changed_quiet(at, title, merged)
+}
+
+/// [`put_changed`] without telling the guards first (`crate::wcback` tells
+/// them afterwards, from a thread of its own: it may be serving a fault).
+fn put_changed_quiet(at: usize, title: &[u8], merged: &[u8]) -> usize {
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
         return merged.len();
@@ -3762,6 +3769,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
+            crate::wcback::take_back_for(Some(self.id), a, e);
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 note_stale(1);
                 return true;
@@ -4047,6 +4055,8 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // Other copies' pieces left on the card there (`crate::wcback`).
+            crate::wcback::take_back_for(Some(self.id), from, to);
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
@@ -4700,6 +4710,58 @@ impl Shadow {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+}
+
+impl Shadow {
+    /// [`crate::wcback`] (`VICTORY_WC_LAZY=1`): a piece of a copy in the
+    /// card's memory that was left there, its title memory kept from the
+    /// title meanwhile, is taken back. `gpu` is what the card's side holds at
+    /// offset `at` on now. As [`Shadow::card_merge_relay`], with every send
+    /// still noted left out (the card may not have run it yet), but without
+    /// the snapshot's lock (title memory is read under it, and the fault this
+    /// serves may be such a read) and without telling the guards (the
+    /// caller does, later, from a thread of its own). The CPU's side takes
+    /// what shaders wrote. The bytes written to title memory; None if the
+    /// copy has no card side or the piece is not inside it.
+    pub(crate) fn lazy_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> Option<usize> {
+        let start = self.start as usize;
+        let card = self.card.as_ref()?;
+        if at + gpu.len() > self.len as usize {
+            return None;
+        }
+        // SAFETY: inside the mapping (checked above). No refresh wrote these
+        // offsets since the piece was left: its title memory could not be
+        // touched, so none of it was found written.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let Some(first) = first_difference(gpu, held) else {
+            return Some(0);
+        };
+        let last = last_difference(gpu, held).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
+            sent.near(0, at, at + n, &mut skip);
+            skip
+        };
+        title.clear();
+        title.resize(n, 0);
+        if !crate::host::read_into((start + at) as *const u8, title) {
+            return Some(0);
+        }
+        let was = title.clone();
+        let mut changed = false;
+        for (a, b) in outside(at, at + n, skip) {
+            let (a, b) = (a - at, b - at);
+            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+        }
+        if !changed {
+            return Some(0);
+        }
+        Some(put_changed_quiet(start + at, &was, title))
     }
 }
 
