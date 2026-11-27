@@ -6010,7 +6010,13 @@ impl Host {
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
         stage.next("submit: the sweep");
-        let behind = late && flying();
+        let mut behind = late && flying();
+        // A texture slot due to change waits for a moment with nothing in
+        // the air (`VICTORY_SLOT_FENCE`): one is made, at most every so often.
+        if behind && crate::descriptor::host::slot_fence_wants_rest() {
+            self.settle(&mut submitted, WHY_SYNC);
+            behind = flying();
+        }
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
         // sweep waits for a submission that finds none in the air: there is
@@ -6021,6 +6027,7 @@ impl Host {
                 upcheck::at_rest(self);
             }
             sweep();
+            crate::descriptor::host::flip_at_rest();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
@@ -6030,6 +6037,7 @@ impl Host {
                 upcheck::at_rest(self);
             }
             sweep();
+            crate::descriptor::host::flip_at_rest();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
@@ -9544,6 +9552,7 @@ impl Meter {
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                tracing::info!("{}", crate::descriptor::host::in_air_line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
                 }

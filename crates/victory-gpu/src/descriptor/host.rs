@@ -335,6 +335,101 @@ struct Flip {
     late: Option<u64>,
     /// When it was asked (`crate::host::now_ms`), for `crate::texlate`.
     asked: u64,
+    /// The submissions begun when it was asked ([`IN_AIR`]).
+    sent: u64,
+}
+
+/// Whether the slots [`HostHeap::texture_slots_flip`] makes are written only
+/// at a moment with no submission in the air, under the submission lock
+/// (`VICTORY_SLOT_FENCE=1`; off). The heap is indexed directly: any list
+/// sent and not finished may read any slot, so a slot written while one is
+/// in the air changes under it (Belobug #545), and a frame's passes may see
+/// two textures in it. With this, a submission waits for those in the air
+/// at most every [`slot_fence_ms`] while a flip is due, and the due flips
+/// are made then.
+pub(crate) fn slot_fence() -> bool {
+    slot_fence_ms() > 0
+}
+
+/// How often at most a submission waits for those in the air for
+/// [`slot_fence`]: `VICTORY_SLOT_FENCE=1`, 33 ms; another number, that many
+/// milliseconds; 0 or unset, off.
+fn slot_fence_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| match std::env::var("VICTORY_SLOT_FENCE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(1) => 33,
+        Some(ms) => ms,
+        None => 0,
+    })
+}
+
+/// Whether a slot shown when its texture's upload has run
+/// ([`HostHeap::texture_slot_show_ahead`]) also waits for the submissions
+/// begun when it was asked (`VICTORY_SLOT_AFTER_SENT=1`; off: at once, as
+/// before). Those read the slot in its state then; no wait of everything in
+/// the air, unlike [`slot_fence`].
+fn slot_after_sent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_AFTER_SENT").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: slots [`HostHeap::texture_slots_flip`] wrote; of those,
+/// written while a submission begun after the one the flip waited for was
+/// in the air; written while one begun before the flip was asked was;
+/// slots made neutral at once (`show_later`, [`show_new_later`]); of those,
+/// with a submission in the air; moments with nothing in the air the flips
+/// were made at ([`slot_fence`]); flips made then.
+pub(crate) static IN_AIR: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// [`IN_AIR`] as a line.
+pub(crate) fn in_air_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [w, newer, older, neutral, neutral_air, rests, at_rest] = [0, 1, 2, 3, 4, 5, 6].map(|i| IN_AIR[i].load(Relaxed));
+    format!(
+        "slots written under lists in the air (VICTORY_SLOT_FENCE={}), since the start: {w} flips, {newer} of them with a list begun after the one waited for in the air, {older} with one begun before the flip was asked; {neutral} made neutral at once, {neutral_air} with a list in the air; {rests} moments with nothing in the air, {at_rest} flips made then",
+        slot_fence_ms()
+    )
+}
+
+/// Counts a slot neutral at once ([`IN_AIR`]).
+fn note_neutral_in_air() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (started, finished) = crate::host::submissions();
+    IN_AIR[3].fetch_add(1, Relaxed);
+    IN_AIR[4].fetch_add(u64::from(started > finished), Relaxed);
+}
+
+/// When [`slot_fence`] last had a submission wait (`crate::host::now_ms`).
+static LAST_REST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a submission about to be sent waits for those in the air
+/// first ([`slot_fence`]): a flip is due and the last wait is old enough.
+pub(crate) fn slot_fence_wants_rest() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !slot_fence() {
+        return false;
+    }
+    let now = crate::host::now_ms();
+    if now < LAST_REST.load(Relaxed) + slot_fence_ms() {
+        return false;
+    }
+    let finished = crate::host::submissions().1;
+    let due = FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|f| f.after <= finished);
+    if due {
+        LAST_REST.store(now, Relaxed);
+    }
+    due
+}
+
+/// The due flips are made now: nothing is in the air and the caller holds
+/// the submission lock, so no list reads the slots while they change
+/// ([`slot_fence`]).
+pub(crate) fn flip_at_rest() {
+    if !slot_fence() {
+        return;
+    }
+    IN_AIR[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = super::with_view_heap(|heap| heap.texture_slots_flip_at(true));
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
@@ -483,6 +578,27 @@ fn neutral() -> Option<&'static ID3D12Resource> {
         .as_ref()
 }
 
+/// How the neutral texture's components reach the shader: as they are
+/// (0x80 each, so an alpha of 0.502, under which foliage tested on alpha
+/// may go whole); magenta and opaque (`VICTORY_SHOW_NEUTRAL_DEBUG=1`, to
+/// see where it is shown); or its grey with an alpha of 1
+/// (`VICTORY_NEUTRAL_OPAQUE=1`).
+fn neutral_mapping() -> u32 {
+    static MAPPING: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAPPING.get_or_init(|| {
+        // D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING: 0-3 a component, 4 zero, 5 one.
+        let encode = |r: u32, g: u32, b: u32, a: u32| r | g << 3 | b << 6 | a << 9 | 1 << 12;
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        if on("VICTORY_SHOW_NEUTRAL_DEBUG") {
+            encode(5, 4, 5, 5)
+        } else if on("VICTORY_NEUTRAL_OPAQUE") {
+            encode(0, 1, 2, 5)
+        } else {
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        }
+    })
+}
+
 /// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
 /// view is a 2D texture's or an array's; else a null one of its kind.
 fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -497,7 +613,7 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
         TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: neutral_mapping(),
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
             },
@@ -505,7 +621,7 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
         TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: neutral_mapping(),
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
             },
@@ -2417,6 +2533,7 @@ impl HostHeap {
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
+                note_neutral_in_air();
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 let kept = neutral_for(&view, self.at(index));
@@ -2440,8 +2557,12 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let late = Some(crate::frame::current());
         let asked = crate::host::now_ms();
+        let sent = crate::host::submissions().0;
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late, asked };
+            // (`VICTORY_SLOT_AFTER_SENT=1`: not before the lists sent when it
+            // was asked have run, as a flip from a list waits for that list.)
+            let after = if slot_after_sent() { sent } else { 0 };
+            let flip = Flip { after, heap, index, handle, key, late, asked, sent };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2469,7 +2590,7 @@ impl HostHeap {
         let asked = crate::host::now_ms();
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late, asked };
+            let flip = Flip { after, heap, index, handle, key, late, asked, sent: after };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2477,7 +2598,17 @@ impl HostHeap {
     /// Makes the slots whose new view's upload has run
     /// ([`HostHeap::texture_slot_flip`]); returns how many.
     pub(crate) fn texture_slots_flip(&self) -> usize {
+        self.texture_slots_flip_at(false)
+    }
+
+    /// [`HostHeap::texture_slots_flip`]; `at_rest`: with nothing in the air,
+    /// under the submission lock ([`flip_at_rest`]). With [`slot_fence`]
+    /// only then.
+    fn texture_slots_flip_at(&self, at_rest: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        if slot_fence() && !at_rest {
+            return 0;
+        }
         let finished = crate::host::submissions().1;
         let ready: Vec<Flip> = {
             let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2530,6 +2661,13 @@ impl HostHeap {
             if let Some(kept) = make(&view, self.at(f.index)) {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
+                {
+                    let (started, finished) = crate::host::submissions();
+                    IN_AIR[0].fetch_add(1, Relaxed);
+                    IN_AIR[1].fetch_add(u64::from(started > f.after.max(finished)), Relaxed);
+                    IN_AIR[2].fetch_add(u64::from(f.sent > finished), Relaxed);
+                    IN_AIR[6].fetch_add(u64::from(at_rest), Relaxed);
+                }
                 self.put(f.index);
                 #[cfg(feature = "diagnostics")]
                 let was = shown;
@@ -3399,6 +3537,7 @@ impl HostHeap {
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
                     note_before(index, shown, "neutral, new texture");
+                    note_neutral_in_air();
                     self.quick_is(index, 0);
                     self.made.set(index, 0);
                     let kept = neutral_for(&view, self.at(index));
@@ -3407,7 +3546,8 @@ impl HostHeap {
                     self.keep(index, kept);
                 }
                 let late = Some(crate::frame::current());
-                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
+                let sent = crate::host::submissions().0;
+                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms(), sent };
                 FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
