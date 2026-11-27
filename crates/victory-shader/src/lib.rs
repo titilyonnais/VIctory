@@ -30,7 +30,8 @@ pub mod structure;
 /// kind too (an integer view's halves are integers, not f16); 4 to 6 are
 /// other branches'. 9: `s_min`/`s_max` set SCC, `v_readlane`/`v_writelane`
 /// lanes wrap, and scalars written in lane-divergent branches reach every
-/// lane after the join (avatarmanz #404, #405); 8 is another branch's.
+/// lane after the join, operandless VOP1 and VOP3 CMPX's EXEC destination
+/// decode right (avatarmanz #404, #405, #410); 8 is another branch's.
 pub const TRANSLATOR_VERSION: u32 = 9;
 
 pub use dxbc::{Container, FourCC, Part};
