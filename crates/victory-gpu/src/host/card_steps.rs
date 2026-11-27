@@ -393,6 +393,10 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
     })
 }
 
+const TWO_COPIES: &str = "flights write it through two host copies";
+const MEETS_A_STEP: &str = "a refresh through another host copy meets a step done on the card";
+const NO_OTHER_COPY: &str = "a refresh through another host copy has no other copy to take it from";
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
@@ -401,7 +405,26 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
         match (&w.shadow, found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
-            (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
+            (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => {
+                let first = writers.iter().find(|x| x.shadow.as_ref().is_some_and(|x| Arc::ptr_eq(x, f)) && meet((x.from, x.to), (from, to)));
+                note(|| {
+                    format!(
+                        "two host copies: asked {from:#x}+{:#x}; one of {:#x}+{:#x} writes {:#x}+{:#x} (a copy done here: {}), another of {:#x}+{:#x} writes {:#x}+{:#x} (a copy done here: {})",
+                        to - from,
+                        f.span().0,
+                        f.span().1,
+                        first.map_or(0, |x| x.from),
+                        first.map_or(0, |x| x.to - x.from),
+                        first.is_some_and(|x| x.copy),
+                        s.span().0,
+                        s.span().1,
+                        w.from,
+                        w.to - w.from,
+                        w.copy,
+                    )
+                });
+                return Err(TWO_COPIES);
+            }
             (Some(s), _) => found = Some(s),
         }
     }
@@ -414,6 +437,63 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// Whether a read of title memory that flights write through more than one
+/// host copy is done piece by piece, each piece from the host copy that
+/// holds it, and a refresh through another host copy takes only the pieces
+/// that another copy holds (`VICTORY_CARD_STEPS_SPLIT=1`; off by default).
+///
+/// Why: what the flights write is kept joined where the ranges touch
+/// (`join_ranges`), and the title's buffers lie side by side, each with a
+/// host copy of its own. A fill of 0x30 bytes over two of them (0x20 and
+/// 0x10), or a refresh whose part of the joined range ends in bytes written
+/// through the refreshed copy itself, was refused whole: two submissions a
+/// frame in the game stood until the flights had landed, 10 ms each (run
+/// soum-base-1: 1.00 a frame "flights write it through two host copies",
+/// 0.88 "a refresh through another host copy has no other copy to take it
+/// from", every one of the latter held by the refreshed copy itself).
+fn split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_SPLIT"))
+}
+
+/// Since the last frame-rate line ([`split`]): reads done piece by piece,
+/// and pieces of refreshes through another host copy left to the refresh
+/// (written through the refreshed copy itself, or by nothing in the air).
+static SPLIT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `[from, to)` cut where what `writers` write of it begins and ends, and
+/// where the host copies they write it through do: each piece (from, to,
+/// whether anything writes it) is written whole or not at all, and lies
+/// in such a copy or outside it.
+fn pieces(writers: &[Writer], from: usize, to: usize) -> Vec<(usize, usize, bool)> {
+    let mut cuts = vec![from, to];
+    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
+        let span = w.shadow.as_ref().map(|s| s.span()).map(|(start, len)| [start as usize, (start + len) as usize]);
+        cuts.extend([w.from, w.to].into_iter().chain(span.into_iter().flatten()).filter(|&c| from < c && c < to));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2).map(|c| (c[0], c[1], writers.iter().any(|w| meet((w.from, w.to), (c[0], c[1]))))).collect()
+}
+
+/// [`holder`] of `[from, to)` piece by piece ([`pieces`]), in order, the
+/// pieces of one host copy that lie side by side joined. `unwritten`: also
+/// of the pieces that nothing writes.
+fn holders(writers: &[Writer], from: usize, to: usize, unwritten: bool) -> Result<Vec<(Arc<Shadow>, usize, usize)>, &'static str> {
+    let mut out: Vec<(Arc<Shadow>, usize, usize)> = Vec::new();
+    for (a, b, written) in pieces(writers, from, to) {
+        if !written && !unwritten {
+            continue;
+        }
+        let shadow = holder(writers, a, b)?;
+        match out.last_mut() {
+            Some(last) if last.2 == a && Arc::ptr_eq(&last.0, &shadow) => last.2 = b,
+            _ => out.push((shadow, a, b)),
+        }
+    }
+    Ok(out)
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,
@@ -526,6 +606,7 @@ struct Op {
     at: u64,
     level: u32,
     to: To,
+    reads: Reads,
 }
 
 enum To {
@@ -535,6 +616,20 @@ enum To {
     Slot(usize, u32),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
+    /// Nowhere: a piece of a read done piece by piece ([`split`]), for the
+    /// step behind it.
+    Nothing,
+}
+
+/// How a step's bytes come into the buffer between.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// Read once for all the steps of its place.
+    Place,
+    /// Read for itself: a piece of a read done piece by piece.
+    Piece,
+    /// By the pieces ahead of it, each from the host copy that holds it.
+    Pieces,
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -616,6 +711,26 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// through another host copy done on the card.
 static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line: why submissions were refused, and how
+/// often (two or three a frame at most: a list is enough).
+static WHYS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// Since the last frame-rate line: the last refusal of each kind, in words
+/// (`VICTORY_CARD_STEPS_WHY=1`: looking into why they are refused).
+static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Notes `what` for the frame-rate line, a few of them at most.
+fn note(what: impl FnOnce() -> String) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_WHY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if notes.len() < 6 {
+        notes.push(what());
+    }
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -695,6 +810,12 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                let mut whys = WHYS.lock().unwrap_or_else(|e| e.into_inner());
+                match whys.iter_mut().find(|w| w.0 == why) {
+                    Some(w) => w.1 += 1,
+                    None => whys.push((why, 1)),
+                }
+                drop(whys);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
                 let _ = why;
@@ -720,14 +841,18 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
-        let mut writers = {
+        // (`landed`: those of flights being landed whose bytes are in title
+        // memory already.)
+        let (mut writers, in_line, landed) = {
             let line = line();
             let mut all = writers(&line.line);
+            let in_line = all.len();
             all.extend(line.landing.iter().map(|w| Writer {
                 shadow: w.shadow.clone(),
                 ..*w
             }));
-            all
+            let landed = if line.merged { in_line..all.len() } else { 0..0 };
+            (all, in_line, landed)
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
@@ -738,6 +863,9 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
+        // Reads done piece by piece ([`split`]): level, the pieces (host
+        // copy, from, to), where in the buffer between.
+        let mut split_places: Vec<(u32, Vec<(usize, usize, usize)>, u64)> = Vec::new();
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -749,28 +877,63 @@ impl Host {
                 return Err("nothing to read");
             }
             let from = match held.get(&(src, len)) {
-                Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
+                Some(from) => Ok(from.clone()),
+                None => holder(&writers, src, src + len).inspect(|from| {
                     held.insert((src, len), from.clone());
-                    from
-                }
+                }),
             };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
+            let (from, at, reads) = match from {
+                Ok(from) => {
+                    let place = (Arc::as_ptr(&from) as usize, src, len, level);
+                    let at = match places.get(&place) {
+                        Some(&at) => at,
+                        None => {
+                            if end + len as u64 > BETWEEN {
+                                return Err("too much at once");
+                            }
+                            if !mapped(src, src + len, &mut room) {
+                                return Err("not all of what it reads is mapped");
+                            }
+                            let at = end;
+                            end = (end + len as u64).next_multiple_of(256);
+                            places.insert(place, at);
+                            at
+                        }
+                    };
+                    (from, at, Reads::Place)
                 }
+                // Piece by piece, side by side in the buffer between: what
+                // the step writes or shows is one run of bytes there.
+                Err(TWO_COPIES) if split() => {
+                    let parts = holders(&writers, src, src + len, true)?;
+                    let key: Vec<(usize, usize, usize)> = parts.iter().map(|(s, a, b)| (Arc::as_ptr(s) as usize, *a, *b)).collect();
+                    let at = match split_places.iter().find(|p| p.0 == level && p.1 == key) {
+                        Some(p) => p.2,
+                        None => {
+                            if end + len as u64 > BETWEEN {
+                                return Err("too much at once");
+                            }
+                            if !mapped(src, src + len, &mut room) {
+                                return Err("not all of what it reads is mapped");
+                            }
+                            let at = end;
+                            end = (end + len as u64).next_multiple_of(256);
+                            ops.extend(parts.iter().map(|(shadow, a, b)| Op {
+                                from: (shadow.clone(), *a),
+                                len: b - a,
+                                at: at + (a - src) as u64,
+                                level,
+                                to: To::Nothing,
+                                reads: Reads::Piece,
+                            }));
+                            SPLIT[0].fetch_add(1, Ordering::Relaxed);
+                            split_places.push((level, key, at));
+                            at
+                        }
+                    };
+                    (parts[0].0.clone(), at, Reads::Pieces)
+                }
+                Err(why) => return Err(why),
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
@@ -804,6 +967,7 @@ impl Host {
                 at,
                 level,
                 to,
+                reads,
             });
         }
         // Refreshes that read what flights write through another host copy
@@ -814,6 +978,8 @@ impl Host {
         // the same bytes from the flights' own landing.
         let mut seen: HashMap<(usize, usize, usize), ()> = HashMap::default();
         let mut refreshed = Vec::new();
+        // (The steps from here on are these refreshes.)
+        let refreshes = ops.len();
         for (to, a, b) in crossed {
             let (a, b, len) = (*a, *b, *b - *a);
             if len == 0 || seen.insert((Arc::as_ptr(to) as usize, a, b), ()).is_some() {
@@ -822,41 +988,141 @@ impl Host {
             let meets = |op: &Op| {
                 meet((op.from.1, op.from.1 + op.len), (a, b)) || matches!(&op.to, To::Copy(_, dst) if meet((*dst, *dst + op.len), (a, b)))
             };
-            if ops.iter().any(meets) {
-                return Err("a refresh through another host copy meets a step done on the card");
+            // (With [`split`]: piece by piece, below.)
+            if !split() && ops.iter().any(meets) {
+                return Err(MEETS_A_STEP);
             }
-            let from = holder(&writers, a, b)?;
-            if Arc::ptr_eq(&from, to) || to.in_place() {
-                return Err("a refresh through another host copy has no other copy to take it from");
-            }
-            let (start, span) = to.span();
-            if (a as u64) < start || b as u64 > start + span {
-                return Err("a refresh through another host copy is not all in its copy");
-            }
-            if !mapped(a, b, &mut room) {
-                return Err("not all of what a refresh reads is mapped");
-            }
-            let place = (Arc::as_ptr(&from) as usize, a, len, 0);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
-                }
+            // (Piece by piece: of a part joined from what several host
+            // copies are written, each piece from the copy that holds it;
+            // those written through the refreshed copy itself are in it
+            // already and its refresh leaves them alone, those that nothing
+            // writes any more are in title memory.)
+            let parts = if !split() {
+                vec![(holder(&writers, a, b)?, a, b)]
+            } else if to.in_place() {
+                return Err(NO_OTHER_COPY);
+            } else {
+                holders(&writers, a, b, false)?
             };
-            refreshed.push(ops.len());
-            ops.push(Op {
-                from: (from, a),
-                len,
-                at,
-                level: 0,
-                to: To::Copy(to.clone(), a),
-            });
+            SPLIT[1].fetch_add(u64::from(parts.is_empty()), Ordering::Relaxed);
+            for (from, a, b) in parts {
+                let len = b - a;
+                // Written through the refreshed copy itself. Still declared:
+                // its refresh leaves the bytes alone. Declared no more, by
+                // flights that are being landed: their bytes went into title
+                // memory before the ranges were done with (`Line::merged`),
+                // and the refresh finds them there. (The line still names
+                // them until the landing has told the title: 0.85
+                // submissions a frame stood for that, run soum-split-1.)
+                if Arc::ptr_eq(&from, to) && split() {
+                    let there = || {
+                        !to.writes_pending_in(a, b)
+                            && writers.iter().enumerate().filter(|(_, w)| meet((w.from, w.to), (a, b))).all(|(i, _)| landed.contains(&i))
+                    };
+                    if to.writes_pending_cover(a, b) || there() {
+                        SPLIT[1].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                if Arc::ptr_eq(&from, to) || to.in_place() {
+                    note(|| {
+                        let by: Vec<String> = writers
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, w)| meet((w.from, w.to), (a, b)))
+                            .map(|(i, w)| format!("{:#x}+{:#x} copy {} {}", w.from, w.to - w.from, w.copy, if i < in_line { "in the air" } else { "landing" }))
+                            .collect();
+                        let by = [by, vec![format!(
+                            "pending covers {} in {} carded {}",
+                            to.writes_pending_cover(a, b),
+                            to.writes_pending_in(a, b),
+                            to.carded()
+                        )]]
+                        .concat();
+                        format!(
+                            "no other copy: the refresh of {:#x}+{:#x} (in place: {}) reads {a:#x}+{len:#x}; held by itself: {}; written there by {} writers: {}",
+                            to.span().0,
+                            to.span().1,
+                            to.in_place(),
+                            Arc::ptr_eq(&from, to),
+                            by.len() - 1,
+                            by.join(", "),
+                        )
+                    });
+                    return Err(NO_OTHER_COPY);
+                }
+                // What stands in the way of a piece: a step that reads its
+                // bytes from the copy refreshed, a copy done here that
+                // writes them, another of these refreshes that writes them
+                // into the copy read or the copy refreshed. Not a read of
+                // them from the copy that holds them: fills read them
+                // there, and several copies are refreshed from the same
+                // bytes (the whole part was refused for those: 0.2 to 0.6
+                // submissions a frame, run soum-split2-1).
+                let in_the_way = |(i, op): (usize, &Op)| {
+                    let reads = Arc::ptr_eq(&op.from.0, to) && meet((op.from.1, op.from.1 + op.len), (a, b));
+                    let writes = match &op.to {
+                        To::Copy(copy, dst) => {
+                            meet((*dst, *dst + op.len), (a, b)) && (i < refreshes || Arc::ptr_eq(copy, to) || Arc::ptr_eq(copy, &from))
+                        }
+                        _ => false,
+                    };
+                    reads || writes
+                };
+                if split()
+                    && let Some((i, op)) = ops.iter().enumerate().find(|&step| in_the_way(step))
+                {
+                    note(|| {
+                        format!(
+                            "meets a step: the refresh of {:#x}+{:#x} takes {a:#x}+{len:#x} from the copy of {:#x}+{:#x}; step {i} (refreshes from {refreshes}) reads {:#x}+{:#x} from the copy of {:#x}+{:#x} and writes {}",
+                            to.span().0,
+                            to.span().1,
+                            from.span().0,
+                            from.span().1,
+                            op.from.1,
+                            op.len,
+                            op.from.0.span().0,
+                            op.from.0.span().1,
+                            match &op.to {
+                                To::Copy(copy, dst) => format!("{dst:#x} in the copy of {:#x}+{:#x}", copy.span().0, copy.span().1),
+                                To::Slot(..) => "a slot".into(),
+                                To::Buffer(_) => "a buffer".into(),
+                                To::Nothing => "nothing".into(),
+                            },
+                        )
+                    });
+                    return Err(MEETS_A_STEP);
+                }
+                let (start, span) = to.span();
+                if (a as u64) < start || b as u64 > start + span {
+                    return Err("a refresh through another host copy is not all in its copy");
+                }
+                if !mapped(a, b, &mut room) {
+                    return Err("not all of what a refresh reads is mapped");
+                }
+                let place = (Arc::as_ptr(&from) as usize, a, len, 0);
+                let at = match places.get(&place) {
+                    Some(&at) => at,
+                    None => {
+                        if end + len as u64 > BETWEEN {
+                            return Err("too much at once");
+                        }
+                        let at = end;
+                        end = (end + len as u64).next_multiple_of(256);
+                        places.insert(place, at);
+                        at
+                    }
+                };
+                refreshed.push(ops.len());
+                ops.push(Op {
+                    from: (from, a),
+                    len,
+                    at,
+                    level: 0,
+                    to: To::Copy(to.clone(), a),
+                    reads: Reads::Place,
+                });
+            }
         }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
@@ -872,7 +1138,8 @@ impl Host {
                 To::Copy(to, dst) => Some((to, *dst)),
                 _ => None,
             };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
+            let from = (op.reads != Reads::Pieces).then_some((&op.from.0, op.from.1));
+            for (shadow, at) in from.into_iter().chain(to) {
                 let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
                 (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
             }
@@ -899,13 +1166,18 @@ impl Host {
                 let len = op.len as u64;
                 let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
                 // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                let due = match op.reads {
+                    Reads::Place => places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some(),
+                    Reads::Piece => true,
+                    Reads::Pieces => false,
+                };
+                if due {
                     reads.push(read);
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
                     To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
-                    To::Slot(..) => {}
+                    To::Slot(..) | To::Nothing => {}
                 }
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
@@ -929,9 +1201,10 @@ impl Host {
             }
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
-        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        let pieces = ops.iter().filter(|op| op.reads == Reads::Piece).count();
+        DONE[0].fetch_add((ops.len() - copies - pieces) as u64, Ordering::Relaxed);
         DONE[1].fetch_add((copies - refreshed.len()) as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[2].fetch_add(ops.iter().filter(|op| op.reads != Reads::Piece).map(|op| op.len as u64).sum(), Ordering::Relaxed);
         DONE[4].fetch_add(refreshed.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
@@ -973,7 +1246,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(_) | To::Nothing => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
@@ -996,6 +1269,24 @@ pub(super) fn log(frames: f64) {
         d[3],
         d[4],
     );
+    let mut whys = std::mem::take(&mut *WHYS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !whys.is_empty() {
+        whys.sort_unstable_by_key(|w| std::cmp::Reverse(w.1));
+        let whys: Vec<String> = whys.iter().map(|(why, n)| format!("{:.2} {why}", *n as f64 / frames)).collect();
+        tracing::info!("submissions refused the steps on the card, per frame, by why: {}", whys.join("; "));
+    }
+    if split() {
+        let s: Vec<f64> = SPLIT.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "steps on the card piece by piece, per frame (VICTORY_CARD_STEPS_SPLIT=1): {:.2} reads over more than one host copy, {:.2} \
+             pieces of refreshes through another host copy left to the refresh",
+            s[0],
+            s[1],
+        );
+    }
+    for note in std::mem::take(&mut *NOTES.lock().unwrap_or_else(|e| e.into_inner())) {
+        tracing::info!("refused: {note}");
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1246,6 +1537,37 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// A read is cut where what flights write of it begins and ends: each
+    /// piece is written whole or not at all ([`split`]).
+    #[test]
+    fn a_read_is_cut_where_writes_begin_and_end() {
+        let writer = |from, to| Writer { shadow: None, from, to, copy: false };
+        // Two buffers side by side, each written whole: a read over both.
+        let writers = [writer(100, 132), writer(132, 148), writer(500, 600)];
+        assert_eq!(pieces(&writers, 100, 148), [(100, 132, true), (132, 148, true)]);
+        // What nothing writes is a piece of its own, ahead, between and behind.
+        let writers = [writer(110, 120), writer(130, 140)];
+        assert_eq!(
+            pieces(&writers, 100, 150),
+            [(100, 110, false), (110, 120, true), (120, 130, false), (130, 140, true), (140, 150, false)]
+        );
+        // Writes that go past the read's ends, and over one another.
+        let writers = [writer(90, 120), writer(110, 200)];
+        assert_eq!(pieces(&writers, 100, 150), [(100, 110, true), (110, 120, true), (120, 150, true)]);
+        // Nothing written there: one piece.
+        assert_eq!(pieces(&writers, 300, 340), [(300, 340, false)]);
+        assert_eq!(pieces(&[], 300, 340), [(300, 340, false)]);
+    }
+
+    /// Piece by piece, what a read-back writes is still refused, and what
+    /// nothing writes is not looked at for a refresh.
+    #[test]
+    fn pieces_keep_what_no_host_copy_holds_refused() {
+        let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
+        assert_eq!(holders(&writers, 96, 120, false).err(), Some("a read-back or a value behind a flight is written there"));
+        assert!(holders(&writers, 108, 120, false).is_ok_and(|parts| parts.is_empty()));
     }
 
     /// Texture copy-back ranges in a flight (`texture_back_ranges`) land in
