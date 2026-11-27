@@ -101,12 +101,47 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<Digest>,
     asked: u64,
+    /// The last attempted conversion failed. A new upload must wait for a retry.
+    incomplete: bool,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+}
+
+impl Last {
+    /// True when this call produced a new complete staging image.
+    /// Write-watched memory has no digest and always converts when due.
+    fn convert(&mut self, hash: Option<Digest>, convert: impl FnOnce() -> bool) -> bool {
+        if hash.is_some() && self.hash == hash {
+            return false;
+        }
+        self.incomplete = !convert();
+        if self.incomplete {
+            self.hash = None;
+            self.asked = 0;
+            return false;
+        }
+        self.hash = hash;
+        true
+    }
+
+    /// Claims an upload for the prelude only when the last conversion finished.
+    fn claim(
+        &self,
+        uploaded: &std::sync::atomic::AtomicBool,
+        dirty: &std::sync::atomic::AtomicBool,
+    ) -> Option<bool> {
+        use std::sync::atomic::Ordering::AcqRel;
+        if self.incomplete {
+            return None;
+        }
+        let was_uploaded = uploaded.swap(true, AcqRel);
+        let was_dirty = dirty.swap(false, AcqRel);
+        (!was_uploaded || was_dirty).then_some(!was_uploaded)
+    }
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -841,20 +876,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     });
 }
 
-/// Pure claim helper for [`PreludeUpload::finish_refresh`]: returns
-/// `Some(first_upload)` when the host texture has never been uploaded or the
-/// staging buffer was detiled since the last upload, and `None` when the host
-/// texture already holds the staging buffer's current contents.
-fn claim_upload(
-    uploaded: &std::sync::atomic::AtomicBool,
-    dirty: &std::sync::atomic::AtomicBool,
-) -> Option<bool> {
-    use std::sync::atomic::Ordering::AcqRel;
-    let was_uploaded = uploaded.swap(true, AcqRel);
-    let was_dirty = dirty.swap(false, AcqRel);
-    (!was_uploaded || was_dirty).then_some(!was_uploaded)
-}
-
 /// A title texture deferred to submission time so `staging.refresh()` runs
 /// before deciding whether `HostList::prelude` must record `CopyTextureRegion`.
 #[derive(Clone)]
@@ -876,11 +897,14 @@ impl PreludeUpload {
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
+        let last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first_upload) = last.claim(&self.staging.uploaded, &self.staging.dirty) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
             return None;
         };
+        let hash = last.hash;
+        drop(last);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
         // A host copy that took the place of one with fewer levels: the slots
@@ -906,7 +930,8 @@ impl PreludeUpload {
                 crate::descriptor::host::levels_waiting(self.staging.memory as u64);
             }
         } else {
-            self.staging.note_held();
+            *self.staging.holds.lock().unwrap_or_else(|e| e.into_inner()) =
+                hash.map(|hash| (self.staging.first, hash));
         }
         Some(first_upload)
     }
@@ -1222,7 +1247,8 @@ impl Staging {
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *last = Last { incomplete: last.incomplete, ..Last::default() };
     }
 
     /// The title memory the texture is read from: address and bytes.
@@ -1237,8 +1263,7 @@ impl Staging {
         (self.first + i as u32 % mips, i as u32 / mips)
     }
 
-    /// The host copy holds what the staging buffer was filled from
-    /// ([`unchanged`]).
+    /// Record the content the ahead queue uploaded into the host copy.
     fn note_held(&self) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
@@ -1278,12 +1303,13 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                if last.convert(None, || self.detile(read)) {
+                    last.asked = now;
+                }
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1308,7 +1334,9 @@ impl Staging {
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            last.asked = now;
+            if !last.incomplete {
+                last.asked = now;
+            }
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
@@ -1366,16 +1394,10 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
-                true
+                last.convert(Some(digest(read)), || self.detile(read))
             });
             #[cfg(feature = "diagnostics")]
             if changed {
@@ -1386,39 +1408,24 @@ impl Staging {
             }
             return size;
         }
-        if through_copy() {
-            return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
-                    return size;
-                }
-                last.hash = Some(hash);
+        let mut refresh_whole = |tiled: &[u8]| {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.convert(Some(digest(tiled)), || self.detile(tiled)) {
                 found_blind(last);
-                self.detile(tiled);
                 self.keep_whole(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-                size
-            });
+            }
+            size
+        };
+        if through_copy() {
+            return with_title(self.memory, size, refresh_whole);
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return size;
-        }
-        last.hash = Some(hash);
-        found_blind(last);
-        self.detile(tiled);
-        self.keep_whole(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        refresh_whole(tiled)
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
@@ -1434,10 +1441,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
+            if last.convert(Some(digest(read)), || self.detile(read)) {
                 self.keep_whole(read);
             }
             true
@@ -1477,8 +1481,7 @@ impl Staging {
                 crate::watch::change_over();
             }
             if got != 0 {
-                last.hash = Some(digest(read));
-                self.detile(read);
+                last.convert(Some(digest(read)), || self.detile(read));
             }
             got
         });
@@ -1521,22 +1524,10 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
-        // Levels on demand: which levels are the title's is judged here,
-        // once, for what the staging buffer holds from now on. The step
-        // that gives levels their memory goes by this answer.
-        let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
-            let judged = self.judgement();
-            self.judged[0].store(judged[0], Relaxed);
-            self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
-            self.detiled.store(held, Relaxed);
-            held
-        } else {
-            u32::MAX
-        };
+    fn detile(&self, tiled: &[u8]) -> bool {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let judged = self.on_demand.then(|| self.judgement());
+        let held = judged.map_or(u32::MAX, |judged| self.held_levels(judged));
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1545,33 +1536,73 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = self.part(i);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            // The last row of the last subresource is not padded to its pitch
-            // (VIctory 4fc9d70): to the end of the buffer at most, where a
-            // block of the pool goes on with another texture's.
-            let len = (pitch * rows as usize * f.Depth as usize)
-                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+        let parts = self.footprints.iter().zip(&self.rows).enumerate().map(
+            |(i, (footprint, &rows))| {
+                let (mip, slice) = self.part(i);
+                let f = footprint.Footprint;
+                let pitch = f.RowPitch as usize;
+                let depth_pitch = pitch * rows as usize;
+                // The last row of the last subresource is not padded to its pitch.
+                let start = footprint.Offset as usize;
+                let end = start
+                    .saturating_add(depth_pitch.saturating_mul(f.Depth as usize))
+                    .min(self.bytes as usize);
+                DetilePart { mip, slice, range: start..end, pitch, depth_pitch }
+            },
+        );
+        // SAFETY: the mapped staging allocation (or its pool piece) holds
+        // exactly this byte range. Refreshes are serialized by `last`.
+        let staging = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
+        if let Err((e, mip, slice)) = detile_parts(&self.layout, tiled, staging, parts, held) {
+            tracing::warn!(?e, mip, slice, "texture not detiled");
+            return false;
+        }
+        if let Some(judged) = judged {
+            self.judged[0].store(judged[0], Relaxed);
+            self.judged[1].store(judged[1], Relaxed);
+            self.detiled.store(held, Relaxed);
+        }
+        self.dirty.store(true, Release);
+        true
+    }
+}
+
+struct DetilePart {
+    mip: u32,
+    slice: u32,
+    range: std::ops::Range<usize>,
+    pitch: usize,
+    depth_pitch: usize,
+}
+
+fn detile_parts(
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    staging: &mut [u8],
+    parts: impl Iterator<Item = DetilePart> + Clone,
+    held: u32,
+) -> Result<(), (victory_formats::texture::Error, u32, u32)> {
+    use victory_formats::texture::Error;
+    // An already recorded copy can still read these bytes. Validate every
+    // part before changing any, including the zeros written for absent mips.
+    for check in [true, false] {
+        for DetilePart { mip, slice, range, pitch, depth_pitch } in parts.clone() {
+            let linear = staging.get_mut(range).ok_or((Error::TooSmall, mip, slice))?;
             if mip < 32 && held & (1 << mip) == 0 {
-                // Not the title's: zeros, not what lies in that memory.
-                linear.fill(0);
+                if !check {
+                    linear.fill(0);
+                }
                 continue;
             }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
-            }
+            let result = if check {
+                layout.check_detile(tiled.len(), mip, slice, linear.len(), pitch, depth_pitch)
+            } else {
+                layout.detile(tiled, mip, slice, linear, pitch, depth_pitch)
+            };
+            result.map_err(|e| (e, mip, slice))?;
         }
     }
+    Ok(())
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -2131,36 +2162,157 @@ mod title_memory_tests {
 }
 
 #[cfg(test)]
+mod detile_retry {
+    use super::{DetilePart, Last, detile_parts, digest};
+    use victory_formats::texture::{Desc, Dimension, Error, Layout, Swizzle};
+
+    fn layout() -> Layout {
+        Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 1,
+            depth: 1,
+            mips: 2,
+            element_bytes: 1,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap()
+    }
+
+    // The output rows occupy four and two bytes. Truncating the second row
+    // lets the first detile finish before the second reports TooSmall.
+    fn refresh(
+        last: &mut Last,
+        layout: &Layout,
+        input: &[u8],
+        output: &mut [u8],
+        calls: &mut usize,
+    ) -> bool {
+        last.convert(Some(digest(input)), || {
+            *calls += 1;
+            let (first, second) = output.split_at_mut(4);
+            layout.detile(input, 0, 0, first, 4, 4).unwrap();
+            layout.detile(input, 1, 0, second, 2, 2).is_ok()
+        })
+    }
+
+    #[test]
+    fn unchanged_input_retries_a_failed_detile_then_skips_a_completed_one() {
+        let layout = layout();
+        let input = vec![0x42; layout.size as usize];
+        let mut output = [0; 6];
+        let mut last = Last::default();
+        let mut calls = 0;
+        assert!(!refresh(&mut last, &layout, &input, &mut output[..5], &mut calls));
+        assert_eq!(output, [0x42, 0x42, 0x42, 0x42, 0, 0]);
+        assert!(refresh(&mut last, &layout, &input, &mut output, &mut calls));
+        assert_eq!(output, [0x42; 6]);
+        assert!(!last.incomplete);
+        assert_eq!(last.hash, Some(digest(&input)));
+        assert!(!refresh(&mut last, &layout, &input, &mut output, &mut calls));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_partial_replacement_cannot_skip_restoring_the_last_complete_input() {
+        let layout = layout();
+        let a = vec![0xa1; layout.size as usize];
+        let b = vec![0xb2; layout.size as usize];
+        let mut output = [0; 6];
+        let mut last = Last::default();
+        let mut calls = 0;
+        assert!(refresh(&mut last, &layout, &a, &mut output, &mut calls));
+        assert_eq!(output, [0xa1; 6]);
+        last.asked = 7;
+        assert!(!refresh(&mut last, &layout, &b, &mut output[..5], &mut calls));
+        assert_eq!(output, [0xb2, 0xb2, 0xb2, 0xb2, 0xa1, 0xa1]);
+        assert!(last.incomplete);
+        assert_eq!(last.hash, None);
+        assert_eq!(last.asked, 0);
+
+        assert!(refresh(&mut last, &layout, &a, &mut output, &mut calls));
+        assert_eq!(output, [0xa1; 6]);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn keeps_staging_intact_when_a_later_mip_is_short() {
+        let layout = layout();
+        let tiled = vec![0x42; layout.size as usize];
+        let parts = |end| {
+            [(0, 0..4, 4), (1, 4..end, 2)].into_iter().map(|(mip, range, pitch)| {
+                DetilePart { mip, slice: 0, range, pitch, depth_pitch: pitch }
+            })
+        };
+        // The earlier mip would be overwritten on ordinary textures or zeroed
+        // when only mip 1 is held. Neither write may reach a queued upload.
+        for held in [u32::MAX, 0b10] {
+            let mut staging = [0xa1; 6];
+            assert_eq!(
+                detile_parts(&layout, &tiled, &mut staging, parts(5), held),
+                Err((Error::TooSmall, 1, 0))
+            );
+            assert_eq!(staging, [0xa1; 6]);
+            detile_parts(&layout, &tiled, &mut staging, parts(6), held).unwrap();
+            assert_eq!(staging[..4], [if held == u32::MAX { 0x42 } else { 0 }; 4]);
+            assert_eq!(staging[4..], [0x42; 2]);
+        }
+    }
+
+    #[test]
+    fn failed_watched_conversion_preserves_the_pending_upload_for_a_retry() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        let mut last = Last { asked: 7, ..Last::default() };
+        let uploaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(true);
+        assert!(!last.convert(None, || false));
+        assert_eq!(last.asked, 0);
+        assert_eq!(last.claim(&uploaded, &dirty), None);
+        assert!(!uploaded.load(Relaxed));
+        assert!(dirty.load(Relaxed));
+
+        assert!(last.convert(None, || true));
+        assert_eq!(last.claim(&uploaded, &dirty), Some(true));
+        assert_eq!(last.claim(&uploaded, &dirty), None);
+    }
+}
+
+#[cfg(test)]
 mod prelude_upload_tests {
-    use super::claim_upload;
+    use super::Last;
     use std::sync::atomic::{AtomicBool, Ordering::Release};
 
     #[test]
     fn first_upload_clean_skip_and_immediate_same_frame_reupload() {
+        let last = Last::default();
         let uploaded = AtomicBool::new(false);
         let dirty = AtomicBool::new(true);
 
         // Frame 1: first upload runs after refresh() detiled into staging.
-        assert_eq!(claim_upload(&uploaded, &dirty), Some(true));
+        assert_eq!(last.claim(&uploaded, &dirty), Some(true));
         // Second list in the same submission skips redundant copy.
-        assert_eq!(claim_upload(&uploaded, &dirty), None);
+        assert_eq!(last.claim(&uploaded, &dirty), None);
 
         // Frame 2: texture unchanged — refresh() does not detile, prelude skips.
-        assert_eq!(claim_upload(&uploaded, &dirty), None);
+        assert_eq!(last.claim(&uploaded, &dirty), None);
 
         // Frame 3: texture changed — refresh()/detile() runs BEFORE claim_upload,
         // so upload is claimed on the exact same frame (0 frames late).
         dirty.store(true, Release);
-        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+        assert_eq!(last.claim(&uploaded, &dirty), Some(false));
 
         // Frame 4: consecutive change (e.g. refresh_front() on every frame)
         // must also upload immediately, never alternating upload/skip.
         dirty.store(true, Release);
-        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+        assert_eq!(last.claim(&uploaded, &dirty), Some(false));
     }
 
     #[test]
     fn three_buffer_ring_never_displays_stale_frame() {
+        let last = Last::default();
         let ring: [(AtomicBool, AtomicBool); 3] =
             std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
         let mut gpu_frame = [0u32; 3];
@@ -2187,7 +2339,7 @@ mod prelude_upload_tests {
             if changed {
                 dirty.store(true, Release);
             }
-            if claim_upload(uploaded, dirty).is_some() {
+            if last.claim(uploaded, dirty).is_some() {
                 gpu_frame[slot] = video_frame;
             }
             assert_eq!(
